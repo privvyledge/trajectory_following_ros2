@@ -15,6 +15,7 @@ Todo:
     * setup do-mpc update
     * setup parameter type
     * setup point stabilization, i.e go to goal from RVIz pose
+    * set default reference speed to 0 and set velocity cost weight to close to 0
     * change model input to velocity instead of acceleration or use a model
     * speed up do-mpc
     * install HSL MA27 solver
@@ -627,6 +628,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         """
         Publish markers and path.
         Todo: check if mpc is initialized first
+        Todo: publish car path travelled as a Path message
         """
         if (not self.mpc_initialized) or self.run_count == 0:
             return

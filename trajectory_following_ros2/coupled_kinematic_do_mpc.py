@@ -15,6 +15,7 @@ Todo:
     * setup do-mpc update
     * setup parameter type
     * setup point stabilization, i.e go to goal from RVIz pose
+    * set default reference speed to 0 and set velocity cost weight to close to 0
     * change model input to velocity instead of acceleration or use a model
     * speed up do-mpc
     * install HSL MA27 solver
