@@ -13,9 +13,11 @@ Todo:
     * don't hardcode model into do-mpc, instead use vectors
     * setup do-mpc to return the mpc object only.
     * setup do-mpc update
-    * setup parameter type
+    * setup parameter types (https://github.com/ros2/rclpy/blob/5285e61f02ab87f8b84f11ee33e608ff118a8f06/rclpy/test/test_parameter.py). Types (https://roboticsbackend.com/ros2-rclpy-parameter-callback/#Check_the_parameters_type)
+        * See saturate_inputs parameter below
     * setup point stabilization, i.e go to goal from RVIz pose
     * set default reference speed to 0 and set velocity cost weight to close to 0
+    * Fix/detect time jump, e.g when using ROSBags (https://github.com/ros2/geometry2/issues/606#issuecomment-1589927587 | https://github.com/ros2/geometry2/pull/608#discussion_r1229877511)
     * change model input to velocity instead of acceleration or use a model
     * speed up do-mpc
     * install HSL MA27 solver
@@ -51,7 +53,7 @@ from rclpy.node import Node
 from rclpy.duration import Duration
 
 # TF
-from tf2_ros import TransformException, LookupException
+from tf2_ros import TransformException, LookupException, ConnectivityException, ExtrapolationException
 from tf2_ros.transform_listener import TransformListener
 from tf2_ros.buffer import Buffer
 import tf_transformations
@@ -622,7 +624,7 @@ class KinematicCoupledDoMPCNode(Node):
         twist_stamped_cmd.header.frame_id = 'base_link'  # self.frame_id
         twist_stamped_cmd.twist.linear.x = self.velocity_cmd
         twist_stamped_cmd.twist.linear.y = lateral_velocity
-        twist_stamped_cmd.twist.angular = (self.velocity_cmd / self.WHEELBASE) * math.tan(self.delta_cmd)
+        twist_stamped_cmd.twist.angular.z = (self.velocity_cmd / self.WHEELBASE) * math.tan(self.delta_cmd)
         self.twist_cmd_pub.publish(twist_stamped_cmd)
 
 
@@ -634,7 +636,6 @@ def main(args=None):
     # # Destroy the node explicitly
     # # (optional - otherwise it will be done automatically
     # # when the garbage collector destroys the node object)
-    mpc_node.waypoint_file.close()  # todo: remove
     mpc_node.destroy_node()
     rclpy.shutdown()
 

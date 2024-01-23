@@ -11,9 +11,12 @@ Tips:
     5. ROS2 Nav2 Controller plugin explanation (https://navigation.ros.org/plugin_tutorials/docs/writing_new_nav2controller_plugin.html)
     6. For an interesting cost function, see (https://discourse.acados.org/t/how-to-set-weights-of-costs-according-to-the-time-interval-in-mpc-prediction-horizon/1001)
 Todo:
-    * setup parameter type
+    * declare/initialize arrays and update instead of redeclaring each iteration
+    * setup parameter types (https://github.com/ros2/rclpy/blob/5285e61f02ab87f8b84f11ee33e608ff118a8f06/rclpy/test/test_parameter.py). Types (https://roboticsbackend.com/ros2-rclpy-parameter-callback/#Check_the_parameters_type).
+        * See saturate_inputs parameter below
     * setup point stabilization, i.e go to goal from RVIz pose
     * set default reference speed to 0 and set velocity cost weight to close to 0
+    * Fix/detect time jump, e.g when using ROSBags (https://github.com/ros2/geometry2/issues/606#issuecomment-1589927587 | https://github.com/ros2/geometry2/pull/608#discussion_r1229877511)
     * change model input to velocity instead of acceleration or use a model
     * get goal/reference states using ROS actions
     * update goals using ROS actions (goal checker, etc should be done via actions). See (2) above
@@ -42,10 +45,11 @@ import scipy
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.duration import Duration
 
 # TF
-from tf2_ros import TransformException, LookupException
+from tf2_ros import TransformException, LookupException, ConnectivityException, ExtrapolationException
 from tf2_ros.transform_listener import TransformListener
 from tf2_ros.buffer import Buffer
 import tf_transformations
@@ -91,8 +95,6 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('min_speed', -1.5)  # in m/s
         self.declare_parameter('max_accel', 3.0)  # in m/s^2
         self.declare_parameter('max_decel', -3.0)  # in m/s^2, i.e min_accel
-        self.declare_parameter('saturate_input',
-                               True)  # whether or not to saturate the input sent to the car. MPC will still use the constraints even if this is false.
         self.declare_parameter('allow_reversing',
                                True)  # whether or not to allow reversing. Will set min_speed as 0 if False
         self.declare_parameter('n_states', 4)  # todo: remove and get from import model
@@ -138,7 +140,9 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.MIN_SPEED = self.get_parameter('min_speed').value
         self.MAX_ACCEL = self.get_parameter('max_accel').value
         self.MAX_DECEL = self.get_parameter('max_decel').value
-        self.saturate_input = self.get_parameter('saturate_input').value
+        # whether or not to saturate the input sent to the car.
+        # MPC will still use the constraints even if this is false.
+        self.saturate_input = Parameter('saturate_input', Parameter.Type.BOOL, True).value
         self.allow_reversing = self.get_parameter('allow_reversing').value
 
         if not self.allow_reversing:
@@ -364,12 +368,28 @@ class KinematicCoupledAcadosMPCNode(Node):
                                                                                  code_export_directory=build_path
                                                                                  )
         # todo: move weight setting and initialization to my AcadosMPC class
-        # create a new uniform grid for timesteps if the horizon is different.
-        new_time_steps = np.linspace(0, self.prediction_time, self.horizon)  # np.arange(0, self.prediction_time, self.horizon)
-        # new_time_steps = np.arange(0, self.prediction_time, self.horizon)
+        if self.generate_mpc_model:
+            if not self.build_with_cython:
+                # create a new uniform grid for timesteps if the horizon is different.
+                new_time_steps = np.linspace(0, self.prediction_time, self.horizon)
+                # new_time_steps = np.arange(0, self.prediction_time, self.horizon)
 
-        # recreate the solver if self.horizon or self.prediction time is different from the compiled version without regenerating.
-        self.controller.set_new_time_steps(new_time_steps)
+                # recreate the solver if self.horizon or self.prediction time is different from the compiled version
+                # without regenerating the entire solver.
+                self.controller.set_new_time_steps(new_time_steps)
+
+            # set weights
+            unscale = 1.0
+            if scale_cost:
+                unscale = self.horizon / self.prediction_time  # (Tf/horizon)
+
+            if (self.Q is not None) and (self.R is not None):
+                W = unscale * scipy.linalg.block_diag(self.Q, self.R)
+                for k in range(self.horizon):
+                    self.controller.cost_set(k, 'W', W)
+
+            if self.Qf is not None:
+                self.controller.cost_set(self.horizon, 'W', self.Qf / unscale)
 
         # initialize solver
         for i in range(self.horizon + 1):
@@ -378,26 +398,10 @@ class KinematicCoupledAcadosMPCNode(Node):
         for i in range(self.horizon):
             self.controller.set(i, "u", self.uk.flatten())
 
-        # constrain x0
+        # constrain x0. todo: switch to constraints_set instead
         self.controller.set(0, "lbx",
                             self.zk.flatten())  # can only be set if x0 was provided. Otherwise set 'x'. Raises Exception
         self.controller.set(0, "ubx", self.zk.flatten())
-
-        # set weights
-        unscale = 1.0
-        if scale_cost:
-            unscale = self.horizon / self.prediction_time  # (Tf/horizon)
-
-        if (self.Q is not None) and (self.R is not None):
-            Q = np.diag(self.Q)
-            R = np.diag(self.R)
-            W = unscale * scipy.linalg.block_diag(Q, R)
-            for k in range(self.horizon):
-                self.controller.cost_set(k, 'W', W)
-
-        if self.Qf is not None:
-            Qf = np.diag(self.Qf)
-            self.controller.cost_set(self.horizon, 'W', Qf / unscale)
 
         # solve/get initial guess
         status = self.controller.solve()
@@ -519,13 +523,16 @@ class KinematicCoupledAcadosMPCNode(Node):
                             [xref[0, j], xref[1, j], xref[2, j], xref[3, j], 0, 0])  # reference state and input
 
                     if self.stage_cost_type in ['LINEAR_LS', 'NONLINEAR_LS']:
-                        self.controller.cost_set(j, "yref", yref)  # update reference, cost_set(j, "yref", yref)
+                        self.controller.cost_set(j, "yref", yref.flatten())  # update reference, cost_set(j, "yref", yref)
 
                     '''
                     set the value of parameters
                                                     wheelbase, zref, uref, z_k, u_prev
                     '''
-                    self.controller.set(j, "p", np.array([0.256, *yref, *self.zk, *self.u_prev]))
+                    self.controller.set(j, "p", np.array([0.256,
+                                                          *yref.flatten(),
+                                                          *self.zk.flatten(),
+                                                          *self.u_prev.flatten()]))
                     u_prev = self.controller.get(0, "u").flatten()
 
                     # # warmstart. Optional as Acados does this Automatically
@@ -539,10 +546,14 @@ class KinematicCoupledAcadosMPCNode(Node):
                                    xref[2, self.horizon],
                                    xref[3, self.horizon]])  # terminal state
                 if self.terminal_cost_type in ['LINEAR_LS', 'NONLINEAR_LS']:
-                    self.controller.set(self.horizon, "yref", yref_N)
+                    self.controller.set(self.horizon, "yref", yref_N.flatten())
                 self.controller.set(self.horizon,
                                   "p",
-                                  np.array([0.256, *yref_N, *np.zeros(2), *self.zk, *self.u_prev]))
+                                  np.array([0.256,
+                                            *yref_N.flatten(),
+                                            *np.zeros(2),
+                                            *self.zk.flatten(),
+                                            *self.u_prev.flatten()]))
 
                 # if len(warmstart_variables) > 0:
                 #     self.controller.set(self.horizon,
@@ -585,7 +596,6 @@ class KinematicCoupledAcadosMPCNode(Node):
 
                 cost = self.controller.get_cost()
                 # print(f'Cost: {cost}')
-                time_taken = self.controller.get_stats('time_tot')
                 num_iter = self.controller.get_stats('sqp_iter')
                 stats = self.controller.get_stats('statistics')
                 solve_time_ = self.controller.get_stats('time_tot')
@@ -596,12 +606,12 @@ class KinematicCoupledAcadosMPCNode(Node):
 
                 warmstart_variables = {'z_ws': solution_dict['z_mpc'], 'u_ws': solution_dict['u_mpc'],
                                        'sl_ws': solution_dict['sl_mpc']}
-                predicted_x_state = solution_dict['z_mpc'][0, :]
-                predicted_y_state = solution_dict['z_mpc'][1, :]
-                predicted_vel_state = solution_dict['z_mpc'][2, :]
-                predicted_psi_state = solution_dict['z_mpc'][3, :]
-                predicted_acc = solution_dict['u_mpc'][0, :]
-                predicted_delta = solution_dict['u_mpc'][1, :]
+                predicted_x_state = solution_dict['z_mpc'][0, :].reshape(-1, 1)
+                predicted_y_state = solution_dict['z_mpc'][1, :].reshape(-1, 1)
+                predicted_vel_state = solution_dict['z_mpc'][2, :].reshape(-1, 1)
+                predicted_psi_state = solution_dict['z_mpc'][3, :].reshape(-1, 1)
+                predicted_acc = solution_dict['u_mpc'][0, :].reshape(-1, 1)
+                predicted_delta = solution_dict['u_mpc'][1, :].reshape(-1, 1)
                 self.mpc_predicted_states[:, :] = np.hstack([predicted_x_state, predicted_y_state,
                                                              predicted_vel_state, predicted_psi_state])
                 self.mpc_predicted_inputs[:, :] = np.hstack([predicted_acc, predicted_delta])
@@ -612,7 +622,7 @@ class KinematicCoupledAcadosMPCNode(Node):
                 1: Predicted velocity[k+1], i.e predicted_vel_state[1, 0]
                 2: Current_velocity + integrate(acceleration), i.e current_speed + self.acc_cmd * self.sample_time
                 '''
-                self.velocity_cmd = predicted_vel_state[1]
+                self.velocity_cmd = predicted_vel_state[1, 0]  # float(predicted_vel_state[1])
                 if self.saturate_input:
                     self.input_saturation()
 
@@ -632,10 +642,10 @@ class KinematicCoupledAcadosMPCNode(Node):
                 self.target_point = self.xref[0, :].tolist()  # todo: refactor
 
                 # todo: initialize solution_dict above and modify values
-                self.solution_time = self.Controller.mpc.solver_stats['t_wall_total']
+                self.solution_time = solve_time_  # or dt
 
-                self.solver_iteration_count = self.Controller.mpc.solver_stats['iter_count']
-                self.solution_status = self.Controller.mpc.solver_stats['success']
+                self.solver_iteration_count = num_iter
+                self.solution_status = not bool(status)
 
                 self.run_count += 1
                 return
@@ -749,7 +759,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         twist_stamped_cmd.header.frame_id = 'base_link'  # self.frame_id
         twist_stamped_cmd.twist.linear.x = self.velocity_cmd
         twist_stamped_cmd.twist.linear.y = lateral_velocity
-        twist_stamped_cmd.twist.angular = (self.velocity_cmd / self.WHEELBASE) * math.tan(self.delta_cmd)
+        twist_stamped_cmd.twist.angular.z = (self.velocity_cmd / self.WHEELBASE) * math.tan(self.delta_cmd)
         self.twist_cmd_pub.publish(twist_stamped_cmd)
 
 
@@ -761,7 +771,6 @@ def main(args=None):
     # # Destroy the node explicitly
     # # (optional - otherwise it will be done automatically
     # # when the garbage collector destroys the node object)
-    mpc_node.waypoint_file.close()  # todo: remove
     mpc_node.destroy_node()
     rclpy.shutdown()
 

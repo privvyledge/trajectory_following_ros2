@@ -1,5 +1,5 @@
 /**:
-  ros_parameters:
+  ros__parameters:
     use_sim_time: False
 
     wheelbase: 0.256

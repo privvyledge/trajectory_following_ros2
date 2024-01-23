@@ -71,9 +71,9 @@ def generate_launch_description():
     speed_tolerance = LaunchConfiguration('speed_tolerance')
 
     # Declare default launch arguments
-    config_file_path = os.path.join(trajectory_following_ros2_pkg_prefix, 'mpc_parameters.yaml')
+    config_file_path = os.path.join(trajectory_following_ros2_pkg_prefix, 'config/mpc_parameters.yaml')
     waypoints_csv_path = os.path.join(trajectory_following_ros2_pkg_prefix, 'data/waypoints.csv')
-    mpc_model_path = os.path.join(trajectory_following_ros2_pkg_prefix, 'data/model')
+    mpc_model_path = os.path.join(trajectory_following_ros2_pkg_prefix, 'data/mpc')
 
     # declare launch arguments
     declare_use_sim_time_cmd = DeclareLaunchArgument(
@@ -226,7 +226,7 @@ def generate_launch_description():
     )
     generate_mpc_model_la = DeclareLaunchArgument(
             'generate_mpc_model',
-            default_value='True',
+            default_value='False',
             description='Whether to generate the MPC model.'
     )
     build_with_cython_la = DeclareLaunchArgument(
@@ -288,7 +288,7 @@ def generate_launch_description():
         )
 
     acados_mpc_node = Node(
-                condition=LaunchConfigurationEquals(mpc_toolbox, 'acados'),
+                condition=LaunchConfigurationEquals('mpc_toolbox', 'acados'),
                 package='trajectory_following_ros2',
                 executable='coupled_kinematic_acados',
                 name='acados_mpc_node',
@@ -333,7 +333,7 @@ def generate_launch_description():
         )
 
     do_mpc_node = Node(
-                condition=LaunchConfigurationEquals(mpc_toolbox, 'do_mpc'),
+                condition=LaunchConfigurationEquals('mpc_toolbox', 'do_mpc'),
                 package='trajectory_following_ros2',
                 executable='coupled_kinematic_do_mpc',
                 name='do_mpc_node',
