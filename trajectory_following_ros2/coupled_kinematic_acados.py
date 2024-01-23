@@ -9,22 +9,15 @@ Tips:
         i. Path utilities: https://github.com/ros-planning/navigation2/blob/humble/nav2_mppi_controller/src/path_handler.cpp
         ii. Controller: https://github.com/ros-planning/navigation2/blob/humble/nav2_mppi_controller/src/controller.cpp
     5. ROS2 Nav2 Controller plugin explanation (https://navigation.ros.org/plugin_tutorials/docs/writing_new_nav2controller_plugin.html)
+    6. For an interesting cost function, see (https://discourse.acados.org/t/how-to-set-weights-of-costs-according-to-the-time-interval-in-mpc-prediction-horizon/1001)
 Todo:
-    * don't hardcode model into do-mpc, instead use vectors
-    * setup do-mpc to return the mpc object only.
-    * setup do-mpc update
     * setup parameter type
     * setup point stabilization, i.e go to goal from RVIz pose
     * set default reference speed to 0 and set velocity cost weight to close to 0
     * change model input to velocity instead of acceleration or use a model
-    * speed up do-mpc
-    * install HSL MA27 solver
-    * load compiled model
-    * publish cmd_vel, i.e yaw rate
     * get goal/reference states using ROS actions
     * update goals using ROS actions (goal checker, etc should be done via actions). See (2) above
     * use ROS services or action servers to smooth stuff. See (3) above
-    * add allow reversing flag
     * get global frame from costmap and transform to odom frame in odom callback. Also transform goal/path frame to common frame
         i. Get costmap: global (map frame), local (odom frame). Either is good but local is recommended since it also includes dynamic obstacles
         ii. Get path and path frame_id: e.g map frame (whatever the paths global frame id is)
@@ -100,6 +93,8 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('max_decel', -3.0)  # in m/s^2, i.e min_accel
         self.declare_parameter('saturate_input',
                                True)  # whether or not to saturate the input sent to the car. MPC will still use the constraints even if this is false.
+        self.declare_parameter('allow_reversing',
+                               True)  # whether or not to allow reversing. Will set min_speed as 0 if False
         self.declare_parameter('n_states', 4)  # todo: remove and get from import model
         self.declare_parameter('n_inputs', 2)  # todo: remove and get from import model
         self.declare_parameter('horizon', 25)
@@ -114,17 +109,22 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('Q', [1.0, 1.0, 1.0, 0.01])
         self.declare_parameter('Qf', [0.04, 0.04, 0.1, 0.01])
 
-        self.declare_parameter('path_topic', '/waypoint_loader/path')  # todo: replace with custom message or action
-        self.declare_parameter('speed_topic', '/waypoint_loader/speed')  # todo: replace with custom message or action
-        self.declare_parameter('odom_topic', '/vehicle/odometry/filtered')
-        self.declare_parameter('acceleration_topic', '/vehicle/accel/filtered')
+        self.declare_parameter('path_topic', '/trajectory/path')  # todo: replace with custom message or action
+        self.declare_parameter('speed_topic', '/trajectory/speed')  # todo: replace with custom message or action
+        self.declare_parameter('odom_topic', '/odometry/local')
+        self.declare_parameter('acceleration_topic', '/accel/local')
         self.declare_parameter('ackermann_cmd_topic', '/drive')
+        self.declare_parameter('publish_twist_topic', True)
+        self.declare_parameter('twist_topic', '/cmd_vel')
 
         self.declare_parameter('desired_speed')  # todo: get from topic/trajectory message
         self.declare_parameter('loop', False)  # todo: remove and pass to waypoint publisher
         self.declare_parameter('n_ind_search', 10)  # the number of points to check for when searching for the closest
         self.declare_parameter('smooth_yaw', False)
         self.declare_parameter('debug', False)  # displays solver output
+        self.declare_parameter('generate_mpc_model', True)  # generate and build model
+        self.declare_parameter('build_with_cython', True)  # whether to use cython (recommended) or ctypes
+        self.declare_parameter('model_directory', '/f1tenth_ws/src/trajectory_following_ros2/data/model')  # don't use absolute paths
 
         self.control_rate = self.get_parameter('control_rate').value
         self.distance_tolerance = self.get_parameter('distance_tolerance').value
@@ -139,6 +139,10 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.MAX_ACCEL = self.get_parameter('max_accel').value
         self.MAX_DECEL = self.get_parameter('max_decel').value
         self.saturate_input = self.get_parameter('saturate_input').value
+        self.allow_reversing = self.get_parameter('allow_reversing').value
+
+        if not self.allow_reversing:
+            self.MIN_SPEED = 0.0
 
         self.NX = self.get_parameter('n_states').value
         self.NU = self.get_parameter('n_inputs').value
@@ -150,10 +154,10 @@ class KinematicCoupledAcadosMPCNode(Node):
             self.Qf = np.diag(self.get_parameter('Qf').value)
         else:
             self.Qf = self.Q
-        self.horizon = self.get_parameter('horizon').value
+        self.horizon = int(self.get_parameter('horizon').value)
         self.prediction_time = self.get_parameter('prediction_time').value
 
-        self.max_iter = self.get_parameter('max_iter').value
+        self.max_iter = int(self.get_parameter('max_iter').value)
         self.termination_condition = self.get_parameter('termination_condition').value
 
         # initialize variables
@@ -165,12 +169,17 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.odom_topic = self.get_parameter('odom_topic').value
         self.acceleration_topic = self.get_parameter('acceleration_topic').value
         self.ackermann_cmd_topic = self.get_parameter('ackermann_cmd_topic').value
+        self.publish_twist_topic = self.get_parameter('publish_twist_topic').value
+        self.twist_topic = self.get_parameter('twist_topic').value
 
         self.desired_speed = self.get_parameter('desired_speed').value
         self.loop = self.get_parameter('loop').value
         self.n_ind_search = self.get_parameter('n_ind_search').value
         self.smooth_yaw = self.get_parameter('smooth_yaw').value
         self.debug = self.get_parameter('debug').value
+        self.generate_mpc_model = self.get_parameter('generate_mpc_model').value
+        self.build_with_cython = self.get_parameter('build_with_cython').value
+        self.model_directory = self.get_parameter('model_directory').value
 
         self.dt = self.sample_time = 1 / self.control_rate  # [s] sample time. # todo: get from ros Duration
         if self.prediction_time is None:
@@ -248,6 +257,8 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.steer_pub = self.create_publisher(Float32, '/mpc/des_steer', 1)
         self.speed_pub = self.create_publisher(Float32, '/mpc/des_speed', 1)
         self.yaw_rate_pub = self.create_publisher(Float32, '/mpc/des_yaw_rate', 1)
+        if self.publish_twist_topic:
+            self.twist_cmd_pub = self.create_publisher(TwistStamped, self.twist_topic, 1)
 
         self.mpc_goal_pub = self.create_publisher(PointStamped, '/mpc/goal_point', 1)
         self.waypoint_path_pub = self.create_publisher(Path, '/mpc/path_remaining', 1)
@@ -338,19 +349,28 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.desired_speed_received = True
 
     def initialize_mpc(self):
-        # todo: initiailize build variables above
-        # todo: specify file paths via ROS otherwise its stored wherever the node is called from, e.g home
+        scale_cost = True
+        config_path = os.path.join(self.model_directory, "kinematic_bicycle_acados_ocp.json")
+        build_path = os.path.join(self.model_directory, "c_generated_code")
         self.constraint, self.model, self.controller, self.ocp = acados_settings(Tf=self.prediction_time,
                                                                                  N=self.horizon,
-                                                                                 x0=self.zk, scale_cost=True,
+                                                                                 x0=self.zk, scale_cost=scale_cost,
                                                                                  cost_module=self.stage_cost_type,
                                                                                  cost_module_e=self.terminal_cost_type,
-                                                                                 generate=False, build=False,
-                                                                                 with_cython=True,
-                                                                                 mpc_config_file="kinematic_bicycle_acados_ocp.json",
-                                                                                 code_export_directory="c_generated_code"
+                                                                                 generate=self.generate_mpc_model,
+                                                                                 build=self.generate_mpc_model,
+                                                                                 with_cython=self.build_with_cython,
+                                                                                 mpc_config_file=config_path,
+                                                                                 code_export_directory=build_path
                                                                                  )
-        # todo: set weights
+        # todo: move weight setting and initialization to my AcadosMPC class
+        # create a new uniform grid for timesteps if the horizon is different.
+        new_time_steps = np.linspace(0, self.prediction_time, self.horizon)  # np.arange(0, self.prediction_time, self.horizon)
+        # new_time_steps = np.arange(0, self.prediction_time, self.horizon)
+
+        # recreate the solver if self.horizon or self.prediction time is different from the compiled version without regenerating.
+        self.controller.set_new_time_steps(new_time_steps)
+
         # initialize solver
         for i in range(self.horizon + 1):
             self.controller.set(i, "x", self.zk.flatten())
@@ -362,6 +382,22 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.controller.set(0, "lbx",
                             self.zk.flatten())  # can only be set if x0 was provided. Otherwise set 'x'. Raises Exception
         self.controller.set(0, "ubx", self.zk.flatten())
+
+        # set weights
+        unscale = 1.0
+        if scale_cost:
+            unscale = self.horizon / self.prediction_time  # (Tf/horizon)
+
+        if (self.Q is not None) and (self.R is not None):
+            Q = np.diag(self.Q)
+            R = np.diag(self.R)
+            W = unscale * scipy.linalg.block_diag(Q, R)
+            for k in range(self.horizon):
+                self.controller.cost_set(k, 'W', W)
+
+        if self.Qf is not None:
+            Qf = np.diag(self.Qf)
+            self.controller.cost_set(self.horizon, 'W', Qf / unscale)
 
         # solve/get initial guess
         status = self.controller.solve()
@@ -577,7 +613,15 @@ class KinematicCoupledAcadosMPCNode(Node):
                 2: Current_velocity + integrate(acceleration), i.e current_speed + self.acc_cmd * self.sample_time
                 '''
                 self.velocity_cmd = predicted_vel_state[1]
+                if self.saturate_input:
+                    self.input_saturation()
+
+                self.uk[0, 0] = self.acc_cmd
+                self.uk[1, 0] = self.delta_cmd
+
                 self.publish_command()
+                if self.publish_twist_topic:
+                    self.publish_twist(lateral_velocity=predicted_y_state[1])
 
                 # debugging data. Query mpc results and compare tvp ref to xref. # todo: initialize solution_dict above and modify values
                 x_state_ref = xref[0, :].reshape(-1, 1)  # solution_dict['z_ref'][:, 0]
@@ -599,17 +643,15 @@ class KinematicCoupledAcadosMPCNode(Node):
         if self.path_received and self.desired_speed_received and not self.mpc_initialized:
             self.initialize_mpc()
 
-    def publish_command(self):
-        # filter inputs using a low-pass (or butterworth) filter. Todo
-
+    def input_saturation(self):
         # saturate inputs
         if self.saturate_input:
             self.acc_cmd = np.clip(self.acc_cmd, self.MAX_DECEL, self.MAX_ACCEL)
             self.delta_cmd = np.clip(self.delta_cmd, self.MIN_STEER_ANGLE, self.MAX_STEER_ANGLE)
             self.velocity_cmd = np.clip(self.velocity_cmd, self.MIN_SPEED, self.MAX_SPEED)
 
-        self.uk[0, 0] = self.acc_cmd
-        self.uk[1, 0] = self.delta_cmd
+    def publish_command(self):
+        # filter inputs using a low-pass (or butterworth) filter. Todo
 
         # Publish Ackermann command
         ackermann_cmd = AckermannDriveStamped()
@@ -700,6 +742,15 @@ class KinematicCoupledAcadosMPCNode(Node):
 
             path_msg.poses.append(predicted_pose)
         self.mpc_path_pub.publish(path_msg)
+
+    def publish_twist(self, lateral_velocity=0.0):
+        twist_stamped_cmd = TwistStamped()
+        twist_stamped_cmd.header.stamp = self.get_clock().now().to_msg()
+        twist_stamped_cmd.header.frame_id = 'base_link'  # self.frame_id
+        twist_stamped_cmd.twist.linear.x = self.velocity_cmd
+        twist_stamped_cmd.twist.linear.y = lateral_velocity
+        twist_stamped_cmd.twist.angular = (self.velocity_cmd / self.WHEELBASE) * math.tan(self.delta_cmd)
+        self.twist_cmd_pub.publish(twist_stamped_cmd)
 
 
 def main(args=None):

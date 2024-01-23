@@ -1,0 +1,31 @@
+/**:
+  ros_parameters:
+    use_sim_time: False
+
+    wheelbase: 0.256
+
+    horizon: 25
+    sample_time: 0.05
+    prediction_time: 1.5
+    control_rate: 20.0
+    sature_input: True
+    allow_reversing: True
+
+    max_speed: 1.5
+    min_speed: -1.5
+    max_acce: 3.0
+    max_decel: -3.0
+    max_steer: 27.0
+    min_steer: -27.0
+    max_steer_rate: 352.9411764706
+
+    max_iter: 15
+    terminattion_condition: 0.1
+
+    R: [0.01, 0.01]
+    Rd: [10., 100.]
+    Q: [1.0, 1.0, 1.0, 0.01]
+    Qf: [0.04, 0.04, 0.1, 0.01]
+
+    generate_mpc_model: True
+    build_with_cython: True

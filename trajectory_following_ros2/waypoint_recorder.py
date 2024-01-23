@@ -50,13 +50,13 @@ class WaypointRecorderNode(Node):
         super(WaypointRecorderNode, self).__init__('waypoint_recorder')
 
         # declare parameters
-        self.declare_parameter('file_path', '/f1tenth_ws/data/waypoints.csv')
+        self.declare_parameter('file_path')
         self.declare_parameter('waypoint_source', 'odometry')
         self.declare_parameter('save_frequency', 20)  # Hz
         self.declare_parameter('save_interval', 0.1)  # seconds
         self.declare_parameter('target_frame_id', 'odom',
                                ParameterDescriptor(description='The static frame to save the waypoints in.'))  # map
-        self.declare_parameter('odom_topic', '/vehicle/odometry/filtered')
+        self.declare_parameter('odom_topic', '/odometry/local')
         self.declare_parameter('pose_topic', 'pose')
         self.declare_parameter('twist_topic', 'twist')
         self.declare_parameter('path_topic', '/waypoint_recorder/path')

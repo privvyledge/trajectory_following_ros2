@@ -20,11 +20,9 @@ Todo:
     * speed up do-mpc
     * install HSL MA27 solver
     * load compiled model
-    * publish cmd_vel, i.e yaw rate
     * get goal/reference states using ROS actions
     * update goals using ROS actions (goal checker, etc should be done via actions). See (2) above
     * use ROS services or action servers to smooth stuff. See (3) above
-    * add allow reversing flag
     * get global frame from costmap and transform to odom frame in odom callback. Also transform goal/path frame to common frame
         i. Get costmap: global (map frame), local (odom frame). Either is good but local is recommended since it also includes dynamic obstacles
         ii. Get path and path frame_id: e.g map frame (whatever the paths global frame id is)
@@ -98,6 +96,8 @@ class KinematicCoupledDoMPCNode(Node):
         self.declare_parameter('max_decel', -3.0)  # in m/s^2, i.e min_accel
         self.declare_parameter('saturate_input',
                                True)  # whether or not to saturate the input sent to the car. MPC will still use the constraints even if this is false.
+        self.declare_parameter('allow_reversing',
+                               True)  # whether or not to allow reversing. Will set min_speed as 0 if False
         self.declare_parameter('n_states', 4)  # todo: remove and get from import model
         self.declare_parameter('n_inputs', 2)  # todo: remove and get from import model
         self.declare_parameter('horizon', 25)
@@ -116,12 +116,18 @@ class KinematicCoupledDoMPCNode(Node):
         self.declare_parameter('odom_topic', '/vehicle/odometry/filtered')
         self.declare_parameter('acceleration_topic', '/vehicle/accel/filtered')
         self.declare_parameter('ackermann_cmd_topic', '/drive')
+        self.declare_parameter('publish_twist_topic', True)
+        self.declare_parameter('twist_topic', '/cmd_vel')
 
         self.declare_parameter('desired_speed')  # todo: get from topic/trajectory message
         self.declare_parameter('loop', False)  # todo: remove and pass to waypoint publisher
         self.declare_parameter('n_ind_search', 10)  # the number of points to check for when searching for the closest
         self.declare_parameter('smooth_yaw', False)
         self.declare_parameter('debug', False)  # displays solver output
+        self.declare_parameter('generate_mpc_model', True)  # generate and build model
+        self.declare_parameter('build_with_cython', True)  # whether to use cython (recommended) or ctypes
+        self.declare_parameter('model_directory',
+                               '/f1tenth_ws/src/trajectory_following_ros2/data/model')  # don't use absolute paths
 
         self.control_rate = self.get_parameter('control_rate').value
         self.distance_tolerance = self.get_parameter('distance_tolerance').value
@@ -136,6 +142,10 @@ class KinematicCoupledDoMPCNode(Node):
         self.MAX_ACCEL = self.get_parameter('max_accel').value
         self.MAX_DECEL = self.get_parameter('max_decel').value
         self.saturate_input = self.get_parameter('saturate_input').value
+        self.allow_reversing = self.get_parameter('allow_reversing').value
+
+        if not self.allow_reversing:
+            self.MIN_SPEED = 0.0
 
         self.NX = self.get_parameter('n_states').value
         self.NU = self.get_parameter('n_inputs').value
@@ -147,8 +157,8 @@ class KinematicCoupledDoMPCNode(Node):
             self.Qf = np.diag(self.get_parameter('Qf').value)
         else:
             self.Qf = self.Q
-        self.horizon = self.get_parameter('horizon').value
-        self.max_iter = self.get_parameter('max_iter').value
+        self.horizon = int(self.get_parameter('horizon').value)
+        self.max_iter = int(self.get_parameter('max_iter').value)
         self.termination_condition = self.get_parameter('termination_condition').value
 
         # initialize variables
@@ -158,6 +168,8 @@ class KinematicCoupledDoMPCNode(Node):
         self.odom_topic = self.get_parameter('odom_topic').value
         self.acceleration_topic = self.get_parameter('acceleration_topic').value
         self.ackermann_cmd_topic = self.get_parameter('ackermann_cmd_topic').value
+        self.publish_twist_topic = self.get_parameter('publish_twist_topic').value
+        self.twist_topic = self.get_parameter('twist_topic').value
 
         self.desired_speed = self.get_parameter('desired_speed').value
         self.loop = self.get_parameter('loop').value
@@ -239,6 +251,8 @@ class KinematicCoupledDoMPCNode(Node):
         self.steer_pub = self.create_publisher(Float32, '/mpc/des_steer', 1)
         self.speed_pub = self.create_publisher(Float32, '/mpc/des_speed', 1)
         self.yaw_rate_pub = self.create_publisher(Float32, '/mpc/des_yaw_rate', 1)
+        if self.publish_twist_topic:
+            self.twist_cmd_pub = self.create_publisher(TwistStamped, self.twist_topic, 1)
 
         self.mpc_goal_pub = self.create_publisher(PointStamped, '/mpc/goal_point', 1)
         self.waypoint_path_pub = self.create_publisher(Path, '/mpc/path_remaining', 1)
@@ -471,7 +485,16 @@ class KinematicCoupledDoMPCNode(Node):
                 2: Current_velocity + integrate(acceleration), i.e current_speed + self.acc_cmd * self.sample_time
                 '''
                 self.velocity_cmd = predicted_vel_state[1, 0]
+
+                if self.saturate_input:
+                    self.input_saturation()
+
+                self.uk[0, 0] = self.acc_cmd
+                self.uk[1, 0] = self.delta_cmd
+
                 self.publish_command()
+                if self.publish_twist_topic:
+                    self.publish_twist(lateral_velocity=predicted_y_state[1])
 
                 # debugging data. Query mpc results and compare tvp ref to xref. # todo: initialize solution_dict above and modify values
                 # Controller.mpc.data.prediction(('_x', 'pos_x'), t_ind=simulation_instance.count)[0]
@@ -494,17 +517,15 @@ class KinematicCoupledDoMPCNode(Node):
         if self.path_received and self.desired_speed_received and not self.mpc_initialized:
             self.initialize_mpc()
 
-    def publish_command(self):
-        # filter inputs using a low-pass (or butterworth) filter. Todo
-
+    def input_saturation(self):
         # saturate inputs
         if self.saturate_input:
             self.acc_cmd = np.clip(self.acc_cmd, self.MAX_DECEL, self.MAX_ACCEL)
             self.delta_cmd = np.clip(self.delta_cmd, self.MIN_STEER_ANGLE, self.MAX_STEER_ANGLE)
             self.velocity_cmd = np.clip(self.velocity_cmd, self.MIN_SPEED, self.MAX_SPEED)
 
-        self.uk[0, 0] = self.acc_cmd
-        self.uk[1, 0] = self.delta_cmd
+    def publish_command(self):
+        # filter inputs using a low-pass (or butterworth) filter. Todo
 
         # Publish Ackermann command
         ackermann_cmd = AckermannDriveStamped()
@@ -594,6 +615,15 @@ class KinematicCoupledDoMPCNode(Node):
 
             path_msg.poses.append(predicted_pose)
         self.mpc_path_pub.publish(path_msg)
+
+    def publish_twist(self, lateral_velocity=0.0):
+        twist_stamped_cmd = TwistStamped()
+        twist_stamped_cmd.header.stamp = self.get_clock().now().to_msg()
+        twist_stamped_cmd.header.frame_id = 'base_link'  # self.frame_id
+        twist_stamped_cmd.twist.linear.x = self.velocity_cmd
+        twist_stamped_cmd.twist.linear.y = lateral_velocity
+        twist_stamped_cmd.twist.angular = (self.velocity_cmd / self.WHEELBASE) * math.tan(self.delta_cmd)
+        self.twist_cmd_pub.publish(twist_stamped_cmd)
 
 
 def main(args=None):
