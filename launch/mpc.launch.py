@@ -18,7 +18,7 @@ from launch.actions import (DeclareLaunchArgument, GroupAction,
 from launch.conditions import IfCondition, LaunchConfigurationEquals
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PythonExpression
-from launch_ros.actions import Node
+from launch_ros.actions import Node, SetRemap
 from launch.actions import DeclareLaunchArgument
 from launch_ros.actions import PushRosNamespace
 from launch_ros.descriptions import ParameterFile
@@ -34,6 +34,7 @@ def generate_launch_description():
     log_level = LaunchConfiguration('log_level')
     frequency = LaunchConfiguration('frequency')
     wheelbase = LaunchConfiguration('wheelbase')
+    ode_type = LaunchConfiguration('ode_type')
     load_waypoints = LaunchConfiguration('load_waypoints')
     waypoints_csv = LaunchConfiguration('waypoints_csv')
 
@@ -93,6 +94,16 @@ def generate_launch_description():
             'wheelbase',
             default_value='0.256',
             description='The cars wheelbase.'
+    )
+    ode_type_la = DeclareLaunchArgument(
+            'ode_type',
+            default_value='continuous_kinematic_coupled',
+            description='The type of ode. '
+                        'Examples: '
+                        '   continuous_kinematic_coupled, continuous_kinematic_coupled_augmented'
+                        '   discrete_kinematic_coupled, discrete_kinematic_coupled_augmented, '
+                        '   discrete_dynamic_decoupled '
+                        'Options: continuous/discrete, kinematic/dynamic, coupled/decoupled, augmented.'
     )
     load_waypoints_la = DeclareLaunchArgument(
             'load_waypoints',
@@ -244,7 +255,7 @@ def generate_launch_description():
 
     # Create Launch Description
     ld = LaunchDescription(
-            [declare_use_sim_time_cmd, params_file_la, frequency_la, wheelbase_la,
+            [declare_use_sim_time_cmd, params_file_la, frequency_la, wheelbase_la, ode_type_la,
              load_waypoints_la, waypoints_csv_la,
              saturate_inputs_la, allow_reversing_la, max_speed_la, min_speed_la, max_accel_la, max_decel_la,
              max_steer_la, min_steer_la, max_steer_rate_la,
@@ -275,18 +286,19 @@ def generate_launch_description():
                     ('/waypoint_loader/speed', '/trajectory/speed'),
                 ]
         )
-    do_mpc_node = None
+
     acados_mpc_node = Node(
                 condition=LaunchConfigurationEquals(mpc_toolbox, 'acados'),
                 package='trajectory_following_ros2',
                 executable='coupled_kinematic_acados',
-                name='acados_node',
+                name='acados_mpc_node',
                 output='screen',
                 parameters=[
                     params_file,
                     {'use_sim_time': use_sim_time},
                     {'control_rate': frequency},
                     {'wheelbase': wheelbase},
+                    {'ode_type': ode_type},
                     {'max_speed': max_speed},
                     {'min_speed': min_speed},
                     {'max_accel': max_accel},
@@ -319,9 +331,65 @@ def generate_launch_description():
                 #     ('/waypoint_loader/speed', '/trajectory/speed'),
                 # ]
         )
-    casadi_mpc_node = None
-    twist_to_ackermann_node = None
 
-    load_nodes = None
+    do_mpc_node = Node(
+                condition=LaunchConfigurationEquals(mpc_toolbox, 'do_mpc'),
+                package='trajectory_following_ros2',
+                executable='coupled_kinematic_do_mpc',
+                name='do_mpc_node',
+                output='screen',
+                parameters=[
+                    params_file,
+                    {'use_sim_time': use_sim_time},
+                    {'control_rate': frequency},
+                    {'wheelbase': wheelbase},
+                    {'ode_type': ode_type},
+                    {'max_speed': max_speed},
+                    {'min_speed': min_speed},
+                    {'max_accel': max_accel},
+                    {'max_decel': max_decel},
+                    {'max_steer': max_steer},
+                    {'min_steer': min_steer},
+                    {'max_steer_rate': max_steer_rate},
+                    {'saturate_inputs': saturate_inputs},
+                    {'allow_reversing': allow_reversing},
+                    {'horizon': horizon},
+                    {'sample_time': sample_time},
+                    {'prediction_time': prediction_time},
+                    {'R_diagonal': R_diagonal},
+                    {'Rd_diagonal': Rd_diagonal},
+                    {'Q_diagonal': Q_diagonal},
+                    {'Qf_diagonal': Qf_diagonal},
+                    {'max_iter': max_iterations},
+                    {'termination_condition': termination_condition},
+                    {'generate_mpc_model': generate_mpc_model},
+                    {'build_with_cython': build_with_cython},
+                    {'model_directory': model_directory},
+                    # {'stage_cost_type': stage_cost_type},
+                    # {'terminal_cost_type': terminal_cost_type},
+                    {'distance_tolerance': distance_tolerance},
+                    {'speed_tolerance': speed_tolerance},
+                ],
+                arguments=['--ros-args', '--log-level', log_level],
+                # remappings=[
+                #     ('/waypoint_loader/path', '/trajectory/path'),
+                #     ('/waypoint_loader/speed', '/trajectory/speed'),
+                # ]
+        )
+
+    casadi_mpc_node = None
+
+    load_nodes = GroupAction(
+            actions=[
+                # PushRosNamespace(LaunchConfiguration('chatter_ns')),
+                # SetRemap(src='/cmd_vel', dst='/cmd_vel_nav'),
+                waypoint_loader_node,
+                acados_mpc_node,
+                do_mpc_node,
+                # casadi_mpc_node,
+    ])
+
+    # Add the actions to launch all of the mpc nodes
+    ld.add_action(load_nodes)
 
     return ld

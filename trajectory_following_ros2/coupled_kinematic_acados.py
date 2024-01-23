@@ -72,10 +72,10 @@ class KinematicCoupledAcadosMPCNode(Node):
         """Constructor for KinematicCoupledAcadosMPCNode"""
         super(KinematicCoupledAcadosMPCNode, self).__init__('kinematic_coupled_acados_controller')
         # declare parameters
-        self.declare_parameter('ode_type', "continuous")  # todo: also augmented, etc
+        self.declare_parameter('ode_type', "continuous_kinematic_coupled")  # todo: also augmented, etc
         self.declare_parameter('stage_cost_type', "LINEAR_LS")  # Acados specific (LINEAR_LS, NONLINEAR_LS, EXTERNAL)
         self.declare_parameter('terminal_cost_type', "LINEAR_LS")  # Acados specific (LINEAR_LS, NONLINEAR_LS, EXTERNAL)
-        self.declare_parameter('model_type', "continuous")
+        self.declare_parameter('model_type', "continuous_kinematic_coupled")
         self.declare_parameter('control_rate', 20.0)
         self.declare_parameter('distance_tolerance', 0.2)  # todo: move to goal checker node
         self.declare_parameter('speed_tolerance', 0.5)  # todo: move to goal checker node

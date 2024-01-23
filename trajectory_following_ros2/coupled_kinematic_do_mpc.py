@@ -78,7 +78,7 @@ class KinematicCoupledDoMPCNode(Node):
         """Constructor for KinematicCoupledDoMPCNode"""
         super(KinematicCoupledDoMPCNode, self).__init__('kinematic_coupled_do_mpc_controller')
         # declare parameters
-        self.declare_parameter('ode_type', "continuous")  # todo: also augmented, etc
+        self.declare_parameter('ode_type', "continuous_kinematic_coupled")  # todo: also augmented, etc
         self.declare_parameter('control_rate', 20.0)
         self.declare_parameter('distance_tolerance', 0.2)  # todo: move to goal checker node
         self.declare_parameter('speed_tolerance', 0.5)  # todo: move to goal checker node
