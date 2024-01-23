@@ -49,8 +49,8 @@ class WaypointLoaderNode(Node):
         # declare parameters
         self.declare_parameter('file_path')
         self.declare_parameter('csv_columns', (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13))  # what columns to load
-        self.declare_parameter('publish_frequency', 20)  # Hz. todo: remove as seconds makes more sense here
-        self.declare_parameter('publish_interval', 1)  # seconds
+        self.declare_parameter('publish_frequency', 20.0)  # Hz. todo: remove as seconds makes more sense here
+        self.declare_parameter('publish_interval', 1.0)  # seconds
         self.declare_parameter('path_topic', '/waypoint_loader/path')
         self.declare_parameter('speed_topic', '/waypoint_loader/speed')
         self.declare_parameter('marker_topic', '/waypoint_loader/markers')
