@@ -113,8 +113,8 @@ def kinematic_model(symbol_type='SX'):
     model.acc_min = -3.0
     model.acc_max = 3.0
 
-    model.delta_min = -np.radians(45.0)  # minimum steering angle [rad]
-    model.delta_max = np.radians(45.0)  # maximum steering angle [rad]
+    model.delta_min = -np.radians(27.0)  # minimum steering angle [rad]
+    model.delta_max = np.radians(27.0)  # maximum steering angle [rad]
 
     # Define initial conditions
     model.x0 = np.array([0., 0., 0., 0.])

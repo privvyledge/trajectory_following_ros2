@@ -29,6 +29,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     # generate = True  # generates the OCP and stores in the json file
     # build = True  # builds/compiles the model and stores in code_export_directory
     # the cython version is faster than bare C because there is no call overhead as opposed to the C code call overhead
+    # todo: get constraints and max iterations
 
     # create render arguments
     ocp = AcadosOcp()
@@ -279,12 +280,12 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     ocp.solver_options.sim_method_num_stages = 4  # (1) RK1, (2) RK2, (4) RK4
     ocp.solver_options.sim_method_num_steps = 3
     # ocp.solver_options.nlp_solver_step_length = 0.05
-    # ocp.solver_options.nlp_solver_max_iter = 200
+    ocp.solver_options.nlp_solver_max_iter = 20
     # ocp.solver_options.tol = 1e-4
     # ocp.solver_options.nlp_solver_tol_comp = 1e-1
     ocp.solver_options.qp_solver_cond_N = int(N / 2)  # or N if scale_cost=False
     ocp.solver_options.qp_solver_warm_start = 2
-    # ocp.solver_options.qp_solver_iter_max = 200
+    ocp.solver_options.qp_solver_iter_max = 20
 
     # set prediction horizon
     ocp.solver_options.tf = Tf

@@ -406,6 +406,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         # solve/get initial guess
         status = self.controller.solve()
         self.mpc_initialized = True
+        print("########################MPC initialized##################################")
 
     def odom_callback(self, data):
         """
@@ -631,7 +632,7 @@ class KinematicCoupledAcadosMPCNode(Node):
 
                 self.publish_command()
                 if self.publish_twist_topic:
-                    self.publish_twist(lateral_velocity=predicted_y_state[1])
+                    self.publish_twist(lateral_velocity=predicted_y_state[1, 0])
 
                 # debugging data. Query mpc results and compare tvp ref to xref. # todo: initialize solution_dict above and modify values
                 x_state_ref = xref[0, :].reshape(-1, 1)  # solution_dict['z_ref'][:, 0]
@@ -668,13 +669,25 @@ class KinematicCoupledAcadosMPCNode(Node):
         ackermann_cmd.header.stamp = self.get_clock().now().to_msg()
         ackermann_cmd.header.frame_id = 'base_link'  # self.frame_id
         ackermann_cmd.drive.steering_angle = self.delta_cmd
+        # ackermann_cmd.drive.steering_angle_velocity = 0.0
         ackermann_cmd.drive.speed = self.velocity_cmd
+        ackermann_cmd.drive.acceleration = self.acc_cmd
+        # ackermann_cmd.drive.jerk = 0.0
         self.ackermann_cmd_pub.publish(ackermann_cmd)
 
         steer_msg = Float32()
         steer_msg.data = float(self.delta_cmd)
         self.steer_pub.publish(steer_msg)
         self.speed_pub.publish(Float32(data=float(self.velocity_cmd)))
+
+    def publish_twist(self, lateral_velocity=0.0):
+        twist_stamped_cmd = TwistStamped()
+        twist_stamped_cmd.header.stamp = self.get_clock().now().to_msg()
+        twist_stamped_cmd.header.frame_id = 'base_link'  # self.frame_id
+        twist_stamped_cmd.twist.linear.x = self.velocity_cmd
+        twist_stamped_cmd.twist.linear.y = lateral_velocity
+        twist_stamped_cmd.twist.angular.z = (self.velocity_cmd / self.WHEELBASE) * math.tan(self.delta_cmd)
+        self.twist_cmd_pub.publish(twist_stamped_cmd)
 
     def publish_debug_topics(self):
         """
@@ -752,15 +765,6 @@ class KinematicCoupledAcadosMPCNode(Node):
 
             path_msg.poses.append(predicted_pose)
         self.mpc_path_pub.publish(path_msg)
-
-    def publish_twist(self, lateral_velocity=0.0):
-        twist_stamped_cmd = TwistStamped()
-        twist_stamped_cmd.header.stamp = self.get_clock().now().to_msg()
-        twist_stamped_cmd.header.frame_id = 'base_link'  # self.frame_id
-        twist_stamped_cmd.twist.linear.x = self.velocity_cmd
-        twist_stamped_cmd.twist.linear.y = lateral_velocity
-        twist_stamped_cmd.twist.angular.z = (self.velocity_cmd / self.WHEELBASE) * math.tan(self.delta_cmd)
-        self.twist_cmd_pub.publish(twist_stamped_cmd)
 
 
 def main(args=None):
