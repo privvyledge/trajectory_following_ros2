@@ -304,7 +304,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.controller = None
         self.ocp = None
 
-        self.get_logger().info('kinematic_coupled_do_mpc_controller node started. ')
+        self.get_logger().info('kinematic_coupled_acados_mpc_controller node started. ')
 
     def path_callback(self, data):
         path_frame_id = data.header.frame_id

@@ -292,17 +292,20 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
 
     # create solver
     ocp.code_export_directory = code_export_directory
+    print(f"1: OCP export dir {ocp.code_export_directory}, mpc_config_file: {mpc_config_file}")
     if with_cython:
         ocp.code_export_directory = f"{ocp.code_export_directory}_cython"
+        print(f"2: OCP export dir {ocp.code_export_directory}")
         if generate:
             AcadosOcpSolver.generate(ocp, json_file=mpc_config_file)
         if build:
-            AcadosOcpSolver.build(ocp.code_export_directory, with_cython=True)
+            AcadosOcpSolver.build(ocp.code_export_directory, with_cython=True, verbose=True)
         acados_solver = AcadosOcpSolver.create_cython_solver(mpc_config_file)
     else:
         acados_solver = AcadosOcpSolver(ocp, json_file=mpc_config_file,
                                         build=build, generate=generate, verbose=True)
 
+    print(f"3: OCP export dir {ocp.code_export_directory}")
     # print("Finished compiling")
     return constraint, model, acados_solver, ocp
 
