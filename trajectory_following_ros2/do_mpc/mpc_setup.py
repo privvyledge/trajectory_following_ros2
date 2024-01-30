@@ -35,7 +35,7 @@ class MPC(object):
         self.current_prediction = None
 
         self.mpc = self.initialize_mpc(model=self.model, horizon=self.horizon,
-                                       timestep=self.Ts, store_full_solution=False)
+                                       timestep=self.Ts, store_full_solution=True)
 
         nlpsol_opts = {
             'ipopt.max_iter': max_iterations,
