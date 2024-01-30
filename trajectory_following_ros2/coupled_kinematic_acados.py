@@ -361,7 +361,7 @@ class KinematicCoupledAcadosMPCNode(Node):
                                                                                  x0=self.zk, scale_cost=scale_cost,
                                                                                  cost_module=self.stage_cost_type,
                                                                                  cost_module_e=self.terminal_cost_type,
-                                                                                 generate=self.generate_mpc_model,
+                                                                                 generate=True,  # self.generate_mpc_model. Todo: setup file check in my class
                                                                                  build=self.generate_mpc_model,
                                                                                  with_cython=self.build_with_cython,
                                                                                  mpc_config_file=config_path,
