@@ -113,10 +113,10 @@ class KinematicCoupledDoMPCNode(Node):
         self.declare_parameter('Q', [1.0, 1.0, 1.0, 0.01])
         self.declare_parameter('Qf', [0.04, 0.04, 0.1, 0.01])
 
-        self.declare_parameter('path_topic', '/waypoint_loader/path')  # todo: replace with custom message or action
-        self.declare_parameter('speed_topic', '/waypoint_loader/speed')  # todo: replace with custom message or action
-        self.declare_parameter('odom_topic', '/vehicle/odometry/filtered')
-        self.declare_parameter('acceleration_topic', '/vehicle/accel/filtered')
+        self.declare_parameter('path_topic', '/trajectory/path')  # todo: replace with custom message or action
+        self.declare_parameter('speed_topic', '/trajectory/speed')  # todo: replace with custom message or action
+        self.declare_parameter('odom_topic', '/odometry/local')
+        self.declare_parameter('acceleration_topic', '/accel/local')
         self.declare_parameter('ackermann_cmd_topic', '/drive')
         self.declare_parameter('publish_twist_topic', True)
         self.declare_parameter('twist_topic', '/cmd_vel')

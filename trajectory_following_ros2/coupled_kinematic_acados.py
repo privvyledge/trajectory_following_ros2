@@ -681,6 +681,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.speed_pub.publish(Float32(data=float(self.velocity_cmd)))
 
     def publish_twist(self, lateral_velocity=0.0):
+        # todo: also publish Twist() message and get bool parameter to select type
         twist_stamped_cmd = TwistStamped()
         twist_stamped_cmd.header.stamp = self.get_clock().now().to_msg()
         twist_stamped_cmd.header.frame_id = 'base_link'  # self.frame_id

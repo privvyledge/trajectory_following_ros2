@@ -287,6 +287,7 @@ def generate_launch_description():
                 ]
         )
 
+    # todo: use SetParameter and Group Action to avoid repeating MPC parameters.
     acados_mpc_node = Node(
                 condition=LaunchConfigurationEquals('mpc_toolbox', 'acados'),
                 package='trajectory_following_ros2',
