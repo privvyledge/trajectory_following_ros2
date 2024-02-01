@@ -171,7 +171,7 @@ def generate_launch_description():
     )
     horizon_la = DeclareLaunchArgument(
             'horizon',
-            default_value='25',
+            default_value='15',
             description='MPC horizon length.'
     )
     sample_time_la = DeclareLaunchArgument(
@@ -211,17 +211,18 @@ def generate_launch_description():
     )
     termination_condition_la = DeclareLaunchArgument(
             'termination_condition',
-            default_value='0.1',
-            description='MPC solver termination tolerance.'
+            default_value='0.001',
+            description='MPC solver termination tolerance. '
+                        'Larger values lead to earlier termination but less accurate results.'
     )
     stage_cost_type_la = DeclareLaunchArgument(
             'stage_cost_type',
-            default_value='LINEAR_LS',
+            default_value='NONLINEAR_LS',
             description='Stage cost type. LINEAR_LS, NONLINEAR_LS, EXTERNAL'
     )
     terminal_cost_type_la = DeclareLaunchArgument(
             'terminal_cost_type',
-            default_value='LINEAR_LS',
+            default_value='NONLINEAR_LS',
             description='Terminal cost type. LINEAR_LS, NONLINEAR_LS, EXTERNAL'
     )
     generate_mpc_model_la = DeclareLaunchArgument(

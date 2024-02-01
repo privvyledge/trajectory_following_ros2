@@ -23,6 +23,7 @@ import casadi
 def acados_settings(Tf, N, x0=None, scale_cost=True,
                     cost_module='external', cost_module_e='external',
                     generate=True, build=True, with_cython=True,
+                    num_iterations=10, tolerance=1e-6,
                     mpc_config_file="kinematic_bicycle_acados_ocp.json", code_export_directory="c_generated_code"
 
 ):
@@ -280,22 +281,21 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     ocp.solver_options.sim_method_num_stages = 4  # (1) RK1, (2) RK2, (4) RK4
     ocp.solver_options.sim_method_num_steps = 3
     # ocp.solver_options.nlp_solver_step_length = 0.05
-    ocp.solver_options.nlp_solver_max_iter = 20
-    # ocp.solver_options.tol = 1e-4
+    ocp.solver_options.nlp_solver_max_iter = num_iterations
+    ocp.solver_options.tol = tolerance  # 1e-4
     # ocp.solver_options.nlp_solver_tol_comp = 1e-1
-    ocp.solver_options.qp_solver_cond_N = int(N / 2)  # or N if scale_cost=False
+    ocp.solver_options.qp_solver_cond_N = 1  # int(N / 2)  # or N if scale_cost=False
     ocp.solver_options.qp_solver_warm_start = 2
-    ocp.solver_options.qp_solver_iter_max = 20
+    ocp.solver_options.qp_solver_iter_max = num_iterations
+    ocp.solver_options.qp_tol = tolerance  # 1e-3
 
     # set prediction horizon
     ocp.solver_options.tf = Tf
 
     # create solver
     ocp.code_export_directory = code_export_directory
-    print(f"1: OCP export dir {ocp.code_export_directory}, mpc_config_file: {mpc_config_file}")
     if with_cython:
         ocp.code_export_directory = f"{ocp.code_export_directory}_cython"
-        print(f"2: OCP export dir {ocp.code_export_directory}")
         if generate:
             AcadosOcpSolver.generate(ocp, json_file=mpc_config_file)
         if build:
@@ -305,8 +305,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         acados_solver = AcadosOcpSolver(ocp, json_file=mpc_config_file,
                                         build=build, generate=generate, verbose=True)
 
-    print(f"3: OCP export dir {ocp.code_export_directory}")
-    # print("Finished compiling")
+    print("Finished compiling MPC.")
     return constraint, model, acados_solver, ocp
 
 

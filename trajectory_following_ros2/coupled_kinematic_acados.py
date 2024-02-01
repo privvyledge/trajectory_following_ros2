@@ -103,7 +103,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('prediction_time')
         self.declare_parameter('max_iter', 15)  # it usually doesnt take more than 15 iterations
         self.declare_parameter('termination_condition',
-                               0.1)  # iteration finish param. todo: pass to mpc initializer solver options
+                               1e-6)  # iteration finish param. todo: pass to mpc initializer solver options
 
         # tips for tuning weights (https://www.mathworks.com/help/mpc/ug/tuning-weights.html)
         self.declare_parameter('R', [0.01, 0.01])
@@ -364,11 +364,13 @@ class KinematicCoupledAcadosMPCNode(Node):
                                                                                  generate=True,  # self.generate_mpc_model. Todo: setup file check in my class
                                                                                  build=self.generate_mpc_model,
                                                                                  with_cython=self.build_with_cython,
+                                                                                 num_iterations=self.max_iter,
+                                                                                 tolerance=self.termination_condition,
                                                                                  mpc_config_file=config_path,
                                                                                  code_export_directory=build_path
                                                                                  )
         # todo: move weight setting and initialization to my AcadosMPC class
-        if self.generate_mpc_model:
+        if self.generate_mpc_model:  # todo: should be done if self.generate_mpc_model is False
             if not self.build_with_cython:
                 # create a new uniform grid for timesteps if the horizon is different.
                 new_time_steps = np.linspace(0, self.prediction_time, self.horizon)

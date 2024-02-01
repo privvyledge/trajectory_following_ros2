@@ -17,7 +17,7 @@ class MPC(object):
                  Q=np.diag([1e-1, 1e-8, 1e-8, 1e-8]), R=np.diag([1e-3, 5e-3]),
                  Qf=np.diag([0.0, 0.0, 0.0, 0.0]), Rd=np.diag([0.0, 0.0]),
                  vel_bound=(-5.0, 5.0), delta_bound=(-23.0, 23.0), acc_bound=(-3.0, 3.0),
-                 max_iterations=20, suppress_ipopt_output=True):
+                 max_iterations=20, tolerance=1e-6, suppress_ipopt_output=True):
         """Constructor for MPC"""
         self.vehicle = vehicle
         self.model = vehicle.model
@@ -40,6 +40,7 @@ class MPC(object):
         nlpsol_opts = {
             'ipopt.max_iter': max_iterations,
             'record_time': True,
+            'ipopt.acceptable_obj_change_tol': tolerance,
             # 'ipopt.linear_solver': 'MA27'
         }
         if suppress_ipopt_output:
@@ -227,7 +228,7 @@ class MPC(object):
 def initialize_mpc_problem(reference_path, horizon=15, sample_time=0.02,
                            Q=None, R=None, Qf=None, Rd=None, wheelbase=0.256,
                            delta_min=-23.0, delta_max=23.0, vel_min=-10.0, vel_max=10.0,
-                           ay_max=4.0, acc_min=-3.0, acc_max=3.0, max_iterations=100, suppress_ipopt_output=True):
+                           ay_max=4.0, acc_min=-3.0, acc_max=3.0, max_iterations=100, tolerance=1e-6, suppress_ipopt_output=True):
     """
     Get configured do-mpc modules:
     """
@@ -241,7 +242,7 @@ def initialize_mpc_problem(reference_path, horizon=15, sample_time=0.02,
 
     Controller = MPC(Vehicle, horizon=horizon, sample_time=sample_time, Q=Q, R=R, Qf=Qf, Rd=Rd, wheelbase=wheelbase,
                      vel_bound=(vel_min, vel_max), delta_bound=(delta_min, delta_max), acc_bound=(acc_min, acc_max),
-                     max_iterations=max_iterations, suppress_ipopt_output=suppress_ipopt_output)
+                     max_iterations=max_iterations, tolerance=tolerance, suppress_ipopt_output=suppress_ipopt_output)
 
     # Sim = Simulator(Vehicle, sample_time=sample_time)
     Sim = None

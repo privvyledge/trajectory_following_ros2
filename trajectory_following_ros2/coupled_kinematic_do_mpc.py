@@ -105,7 +105,7 @@ class KinematicCoupledDoMPCNode(Node):
         self.declare_parameter('horizon', 25)
         self.declare_parameter('max_iter', 15)  # it usually doesnt take more than 15 iterations
         self.declare_parameter('termination_condition',
-                               0.1)  # iteration finish param. todo: pass to mpc initializer solver options
+                               1e-6)  # iteration finish param. todo: pass to mpc initializer solver options
 
         # tips for tuning weights (https://www.mathworks.com/help/mpc/ug/tuning-weights.html)
         self.declare_parameter('R', [0.01, 0.01])
@@ -352,7 +352,9 @@ class KinematicCoupledDoMPCNode(Node):
                                                        vel_min=self.MIN_SPEED,
                                                        vel_max=self.MAX_SPEED,
                                                        ay_max=4.0, acc_min=self.MAX_DECEL,
-                                                       acc_max=self.MAX_ACCEL, max_iterations=self.max_iter,
+                                                       acc_max=self.MAX_ACCEL,
+                                                       max_iterations=self.max_iter,
+                                                       tolerance=self.termination_condition,
                                                        suppress_ipopt_output=True)
         # warmstart
         self.Controller.mpc.x0 = self.zk
