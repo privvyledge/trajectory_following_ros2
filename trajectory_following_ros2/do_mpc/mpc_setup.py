@@ -78,6 +78,13 @@ class MPC(object):
             'collocation_deg': 2,
             'collocation_ni': 2,
             'store_full_solution': store_full_solution,  # re
+            'store_solver_stats': ['success',
+                                   # 'return_status',
+                                   't_proc_callback_fun', 't_proc_nlp_f', 't_proc_nlp_g', 't_proc_nlp_grad',
+                                   't_proc_nlp_grad_f', 't_proc_nlp_hess_l',
+                                   't_proc_nlp_jac_g', 't_proc_S', 't_wall_callback_fun',  # t_proc_{S or total}
+                                   't_wall_nlp_f', 't_wall_nlp_g', 't_wall_nlp_grad',
+                                   't_wall_nlp_grad_f', 't_wall_nlp_hess_l', 't_wall_nlp_jac_g', 't_wall_total'],
             # Use MA27 linear solver in ipopt for faster calculations:
             # 'nlpsol_opts': {'ipopt.linear_solver': 'MA27'}  # highly recommended (MA27), 'mumps'
         }

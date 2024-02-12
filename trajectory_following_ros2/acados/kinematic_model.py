@@ -13,7 +13,7 @@ import numpy as np
 from casadi import *
 
 
-def kinematic_model(symbol_type='SX'):
+def kinematic_model(symbol_type='MX'):
     # define structs
     constraint = types.SimpleNamespace()
     model = types.SimpleNamespace()

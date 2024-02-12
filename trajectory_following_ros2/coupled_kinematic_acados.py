@@ -606,6 +606,9 @@ class KinematicCoupledAcadosMPCNode(Node):
                 time_linearization_ = self.controller.get_stats('time_lin')
                 time_integrator_ = self.controller.get_stats('time_sim')
                 # acados_solver.print_statistics()
+                print(f"Elapsed time: {dt}, total_time = {solve_time_}, num_iter = {num_iter},"
+                      f"linearization_time = {time_linearization_}, integration_time = {time_integrator_}, "
+                      f"qp time = {time_qp_solution_}  \n")
 
                 warmstart_variables = {'z_ws': solution_dict['z_mpc'], 'u_ws': solution_dict['u_mpc'],
                                        'sl_ws': solution_dict['sl_mpc']}
