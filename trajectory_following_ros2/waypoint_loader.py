@@ -4,6 +4,7 @@ Load path from waypoints and set QoS profile to transient.
 Todo:
     Move to a separate package
     Publish as a list of poses for NavigateThroughPoses action servers
+    Check if the file exists
     Limit the number of nodes/states published
     Switch to Pandas
     Switch to custom message or actions to specify Path + speeds

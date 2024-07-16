@@ -267,7 +267,7 @@ class KinematicCoupledDoMPCNode(Node):
 
         # setup mpc timer
         self.mpc_timer = self.create_timer(self.sample_time, self.mpc_callback)
-        self.debug_timer = self.create_timer(self.sample_time, self.publish_debug_topics)
+        # self.debug_timer = self.create_timer(self.sample_time, self.publish_debug_topics)  # todo
 
         self.path = None
         self.des_yaw_list = None

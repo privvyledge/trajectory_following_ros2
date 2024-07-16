@@ -43,7 +43,7 @@ from ackermann_msgs.msg import AckermannDriveStamped
 
 # Custom messages
 from trajectory_following_ros2.do_mpc.model import BicycleKinematicModel
-from trajectory_following_ros2.simulator.do_mpc_simulator import Simulator
+from trajectory_following_ros2.simulator.do_mpc.do_mpc_simulator import Simulator
 
 
 class KinematicDoMPCSimulationNode(Node):

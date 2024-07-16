@@ -12,12 +12,12 @@ See:
 Perfomance Tips:
     * https://discourse.acados.org/t/solver-runs-slower-in-nvidia-jetson-tx2-platform/531/2
 """
+import numpy as np
+import scipy.linalg
+import casadi
 
 from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
 from trajectory_following_ros2.acados.kinematic_model import kinematic_model
-import scipy.linalg
-import numpy as np
-import casadi
 
 
 def acados_settings(Tf, N, x0=None, scale_cost=True,
@@ -305,7 +305,6 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         acados_solver = AcadosOcpSolver(ocp, json_file=mpc_config_file,
                                         build=build, generate=generate, verbose=True)
 
-    print("Finished compiling MPC.")
     return constraint, model, acados_solver, ocp
 
 

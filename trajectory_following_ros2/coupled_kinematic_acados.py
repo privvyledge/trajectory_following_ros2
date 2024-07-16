@@ -11,7 +11,8 @@ Tips:
     5. ROS2 Nav2 Controller plugin explanation (https://navigation.ros.org/plugin_tutorials/docs/writing_new_nav2controller_plugin.html)
     6. For an interesting cost function, see (https://discourse.acados.org/t/how-to-set-weights-of-costs-according-to-the-time-interval-in-mpc-prediction-horizon/1001)
 Todo:
-    * declare/initialize arrays and update instead of redeclaring each iteration
+    * declare/initialize arrays and update instead of redeclaring each iteration (e.g using contiguous array)
+    * switch to Multithreaded executor and reentrant callback group (plus threading lock) to run MPC and visualization on different threads
     * setup parameter types (https://github.com/ros2/rclpy/blob/5285e61f02ab87f8b84f11ee33e608ff118a8f06/rclpy/test/test_parameter.py). Types (https://roboticsbackend.com/ros2-rclpy-parameter-callback/#Check_the_parameters_type).
         * See saturate_inputs parameter below
     * setup point stabilization, i.e go to goal from RVIz pose
@@ -33,6 +34,9 @@ Todo:
     * switch stop condition to use ROS Goal checker or create mine (https://navigation.ros.org/configuration/packages/nav2_controller-plugins/simple_goal_checker.html | https://navigation.ros.org/plugins/index.html#waypoint-task-executors)
     * Switch to custom message or actions to specify Path + speeds
     * Move main MPC code to separate package and as a submodule to this ROS repo instead
+    * create mpc directory and parents if they dont exist
+    * Setup only generating and saving the mpc model once then exiting
+    * add an option to only run the mpc calculation if new messages are received
 """
 import math
 import time
@@ -80,7 +84,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('stage_cost_type', "LINEAR_LS")  # Acados specific (LINEAR_LS, NONLINEAR_LS, EXTERNAL)
         self.declare_parameter('terminal_cost_type', "LINEAR_LS")  # Acados specific (LINEAR_LS, NONLINEAR_LS, EXTERNAL)
         self.declare_parameter('model_type', "continuous_kinematic_coupled")
-        self.declare_parameter('control_rate', 20.0)
+        self.declare_parameter('control_rate', 50.0)
         self.declare_parameter('distance_tolerance', 0.2)  # todo: move to goal checker node
         self.declare_parameter('speed_tolerance', 0.5)  # todo: move to goal checker node
         self.declare_parameter('wheelbase', 0.256)
@@ -126,7 +130,8 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('debug', False)  # displays solver output
         self.declare_parameter('generate_mpc_model', True)  # generate and build model
         self.declare_parameter('build_with_cython', True)  # whether to use cython (recommended) or ctypes
-        self.declare_parameter('model_directory', '/f1tenth_ws/src/trajectory_following_ros2/data/model')  # don't use absolute paths
+        self.declare_parameter('model_directory',
+                               '/f1tenth_ws/src/trajectory_following_ros2/data/model')  # don't use absolute paths
 
         self.control_rate = self.get_parameter('control_rate').value
         self.distance_tolerance = self.get_parameter('distance_tolerance').value
@@ -273,9 +278,9 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.mpc_odom_pub = self.create_publisher(Odometry, '/mpc/current_state', 1)
         self.mpc_pose_pub = self.create_publisher(PoseStamped, '/mpc/current_pose', 1)
 
-        # setup mpc timer
+        # setup mpc timer. todo: either publish debug topics in a separate node or use Reentrant MultiThreadedExecutor
         self.mpc_timer = self.create_timer(self.sample_time, self.mpc_callback)
-        self.debug_timer = self.create_timer(self.sample_time, self.publish_debug_topics)
+        # self.debug_timer = self.create_timer(1.0, self.publish_debug_topics)
 
         self.path = None
         self.des_yaw_list = None
@@ -353,6 +358,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.desired_speed_received = True
 
     def initialize_mpc(self):
+        # todo: initialize during init phase as this causes the model to not be generated early when replaying rosbags
         scale_cost = True
         config_path = os.path.join(self.model_directory, "kinematic_bicycle_acados_ocp.json")
         build_path = os.path.join(self.model_directory, "c_generated_code")
@@ -361,7 +367,8 @@ class KinematicCoupledAcadosMPCNode(Node):
                                                                                  x0=self.zk, scale_cost=scale_cost,
                                                                                  cost_module=self.stage_cost_type,
                                                                                  cost_module_e=self.terminal_cost_type,
-                                                                                 generate=True,  # self.generate_mpc_model. Todo: setup file check in my class
+                                                                                 generate=True,
+                                                                                 # self.generate_mpc_model. Todo: setup file check in my class
                                                                                  build=self.generate_mpc_model,
                                                                                  with_cython=self.build_with_cython,
                                                                                  num_iterations=self.max_iter,
@@ -408,7 +415,8 @@ class KinematicCoupledAcadosMPCNode(Node):
         # solve/get initial guess
         status = self.controller.solve()
         self.mpc_initialized = True
-        print("########################MPC initialized##################################")
+        self.get_logger().info("Finished compiling MPC.")
+        self.get_logger().info("########################MPC initialized##################################")
 
     def odom_callback(self, data):
         """
@@ -497,10 +505,10 @@ class KinematicCoupledAcadosMPCNode(Node):
                                                                  self.current_idx, self.path.shape[0])
             if self.stop_flag:
                 # if self.current_idx >= len(self.path[:, 0]):
-                #     print("Target index out of bounds")
+                #     self.get_logger().info("Target index out of bounds")
                 #     return
 
-                print("Goal reached")
+                self.get_logger().info("Goal reached")
                 return
 
             if self.initial_pose_received and not self.stop_flag:
@@ -526,7 +534,8 @@ class KinematicCoupledAcadosMPCNode(Node):
                             [xref[0, j], xref[1, j], xref[2, j], xref[3, j], 0, 0])  # reference state and input
 
                     if self.stage_cost_type in ['LINEAR_LS', 'NONLINEAR_LS']:
-                        self.controller.cost_set(j, "yref", yref.flatten())  # update reference, cost_set(j, "yref", yref)
+                        self.controller.cost_set(j, "yref",
+                                                 yref.flatten())  # update reference, cost_set(j, "yref", yref)
 
                     '''
                     set the value of parameters
@@ -551,12 +560,12 @@ class KinematicCoupledAcadosMPCNode(Node):
                 if self.terminal_cost_type in ['LINEAR_LS', 'NONLINEAR_LS']:
                     self.controller.set(self.horizon, "yref", yref_N.flatten())
                 self.controller.set(self.horizon,
-                                  "p",
-                                  np.array([0.256,
-                                            *yref_N.flatten(),
-                                            *np.zeros(2),
-                                            *self.zk.flatten(),
-                                            *self.u_prev.flatten()]))
+                                    "p",
+                                    np.array([0.256,
+                                              *yref_N.flatten(),
+                                              *np.zeros(2),
+                                              *self.zk.flatten(),
+                                              *self.u_prev.flatten()]))
 
                 # if len(warmstart_variables) > 0:
                 #     self.controller.set(self.horizon,
@@ -567,11 +576,12 @@ class KinematicCoupledAcadosMPCNode(Node):
                 # 0 – success, 1 – failure, 2 – maximum number of iterations reached,
                 # 3 – minimum step size in QP solver reached, 4 – qp solver failed
                 status = self.controller.solve()
+                solver_dt = time.process_time() - start_time
                 if status != 0:
                     # acados_solver.print_statistics()
-                    print("acados returned status {} in"
-                          " closed loop iteration {}.".format(status, self.run_count))
-                dt = time.process_time() - start_time
+                    # todo: set a flag (verbosity) to enable/disable this
+                    self.get_logger().info("acados returned status {} in"
+                                           " closed loop iteration {}.".format(status, self.run_count))
 
                 # retrieve/unpack mpc predicted states
                 time_index = self.run_count  # self.run_count or -1. Optionally used to index MPC solution history
@@ -583,9 +593,10 @@ class KinematicCoupledAcadosMPCNode(Node):
                 u = self.controller.get(0, "u")
 
                 solution_dict = {'z_mpc': [], 'u_mpc': [], 'z_ref': [], 'sl_mpc': []}  # todo: initialize above
+                # todo: move data packing to the timer callback
                 for i in range(self.horizon + 1):
                     x_s = self.controller.get(i, 'x')
-                    # print(pred_)
+                    # self.get_logger().info(pred_)
                     solution_dict['z_mpc'].append(x_s)
                     solution_dict['sl_mpc'].append([self.controller.get(i, "sl"), self.controller.get(i, "su")])
                     # solution_dict['z_ref'].append(acados_solver.get(i, 'yref'))  # Acados doesn't return yref
@@ -598,7 +609,7 @@ class KinematicCoupledAcadosMPCNode(Node):
                 solution_dict['u_mpc'] = np.array(solution_dict['u_mpc']).T
 
                 cost = self.controller.get_cost()
-                # print(f'Cost: {cost}')
+                # self.get_logger().info(f'Cost: {cost}')
                 num_iter = self.controller.get_stats('sqp_iter')
                 stats = self.controller.get_stats('statistics')
                 solve_time_ = self.controller.get_stats('time_tot')
@@ -606,9 +617,9 @@ class KinematicCoupledAcadosMPCNode(Node):
                 time_linearization_ = self.controller.get_stats('time_lin')
                 time_integrator_ = self.controller.get_stats('time_sim')
                 # acados_solver.print_statistics()
-                print(f"Elapsed time: {dt}, total_time = {solve_time_}, num_iter = {num_iter},"
-                      f"linearization_time = {time_linearization_}, integration_time = {time_integrator_}, "
-                      f"qp time = {time_qp_solution_}  \n")
+                # self.get_logger().info(f"Elapsed time: {solver_dt}, total_time = {solve_time_}, num_iter = {num_iter},"
+                #       f"linearization_time = {time_linearization_}, integration_time = {time_integrator_}, "
+                #       f"qp time = {time_qp_solution_}  \n")
 
                 warmstart_variables = {'z_ws': solution_dict['z_mpc'], 'u_ws': solution_dict['u_mpc'],
                                        'sl_ws': solution_dict['sl_mpc']}
@@ -648,16 +659,17 @@ class KinematicCoupledAcadosMPCNode(Node):
                 self.target_point = self.xref[0, :].tolist()  # todo: refactor
 
                 # todo: initialize solution_dict above and modify values
-                self.solution_time = solve_time_  # or dt
+                self.solution_time = solve_time_  # or solver_dt
 
                 self.solver_iteration_count = num_iter
                 self.solution_status = not bool(status)
 
                 self.run_count += 1
-                return
+                # return
 
+        # todo: replace with an else block and just  print that the model isn't initialized
         if self.path_received and self.desired_speed_received and not self.mpc_initialized:
-            self.initialize_mpc()
+            self.initialize_mpc()  # todo: initialize during init phase as this causes the model to not be generated early when replaying rosbags
 
     def input_saturation(self):
         # saturate inputs
@@ -686,7 +698,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.speed_pub.publish(Float32(data=float(self.velocity_cmd)))
 
     def publish_twist(self, lateral_velocity=0.0):
-        # todo: also publish Twist() message and get bool parameter to select type
+        # todo: also add an option to publish Twist() message and get bool parameter to select type
         twist_stamped_cmd = TwistStamped()
         twist_stamped_cmd.header.stamp = self.get_clock().now().to_msg()
         twist_stamped_cmd.header.frame_id = 'base_link'  # self.frame_id
@@ -700,6 +712,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         Publish markers and path.
         Todo: check if mpc is initialized first
         Todo: publish car path travelled as a Path message
+        Todo: speedup or use thread locks to copy
         """
         if (not self.mpc_initialized) or self.run_count == 0:
             return
@@ -744,7 +757,7 @@ class KinematicCoupledAcadosMPCNode(Node):
             reference_pose.header.frame_id = 'odom'
 
             reference_pose.pose.position.x, reference_pose.pose.position.y = self.xref[k, 0], self.xref[k, 1]
-            # print(f"x: {self.xref[0, index]}, y: {self.xref[1, index]}, yaw: {self.xref[3, index]}\n")
+            # self.get_logger().info(f"x: {self.xref[0, index]}, y: {self.xref[1, index]}, yaw: {self.xref[3, index]}\n")
 
             reference_quaternion = tf_transformations.quaternion_from_euler(0, 0, self.xref[k, 3])
             reference_pose.pose.orientation.x = reference_quaternion[0]

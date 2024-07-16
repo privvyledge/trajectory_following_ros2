@@ -7,12 +7,16 @@ Notes:
     * some controllers work in robot frame, so tranform to that frame (e.g collision checker)
 
     Todo:
-    * get parameters like frame ID
-    * subscribe to pose or odom topics
-    * setup timer callback to save
-    * transform to another reference frame
-    * save to CSV
-    * Save time delta instead of Time
+        * create parent directories if they don't exist
+        * save global pose
+        * save control commands (speed, delta)
+        * add message filters
+        * get parameters like frame ID
+        * subscribe to pose or odom topics
+        * setup timer callback to save
+        * transform to another reference frame
+        * save to CSV
+        * Save time delta instead of Time
 
 Msgs:
     Path: http://docs.ros.org/en/noetic/api/nav_msgs/html/msg/Path.html
@@ -50,10 +54,11 @@ class WaypointRecorderNode(Node):
         super(WaypointRecorderNode, self).__init__('waypoint_recorder')
 
         # declare parameters
+        self.declare_parameter('use_sim_time', True)
         self.declare_parameter('file_path')
         self.declare_parameter('waypoint_source', 'odometry')
         self.declare_parameter('save_frequency', 20.0)  # Hz
-        self.declare_parameter('save_interval', 0.1)  # seconds
+        self.declare_parameter('save_interval', 1)  # seconds
         self.declare_parameter('target_frame_id', 'odom',
                                ParameterDescriptor(description='The static frame to save the waypoints in.'))  # map
         self.declare_parameter('odom_topic', '/odometry/local')
@@ -222,6 +227,7 @@ class WaypointRecorderNode(Node):
                                    f"{self.speed}, {self.omega}\n")
 
     def publish_path(self, position, orientation):
+        # todo: fix and test
         pose_msg = PoseStamped()
         pose_msg.header.stamp = self.get_clock().now().to_msg()
         pose_msg.header.frame_id = self.global_frame
@@ -232,6 +238,7 @@ class WaypointRecorderNode(Node):
         self.path_pub.publish(self.path_msg)
 
     def publish_marker(self, position, orientation, speed, scale=None, rgb=None):
+        # todo: fix and test
         if rgb is None:
             rgb = [0., 1., 0.]
         if scale is None:

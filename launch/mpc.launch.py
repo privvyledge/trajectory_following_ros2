@@ -33,6 +33,7 @@ def generate_launch_description():
     params_file = LaunchConfiguration('params_file')
     log_level = LaunchConfiguration('log_level')
     frequency = LaunchConfiguration('frequency')
+    publish_twist_topic = LaunchConfiguration('publish_twist_topic')
     wheelbase = LaunchConfiguration('wheelbase')
     ode_type = LaunchConfiguration('ode_type')
     load_waypoints = LaunchConfiguration('load_waypoints')
@@ -87,8 +88,13 @@ def generate_launch_description():
     )
     frequency_la = DeclareLaunchArgument(
             'frequency',
-            default_value='20.0',
+            default_value='50.0',
             description='Controller frequency.'
+    )
+    publish_twist_topic_la = DeclareLaunchArgument(
+            'publish_twist_topic',
+            default_value='True',
+            description='Whether or not to publish as a TwistStamped topic.'
     )
     wheelbase_la = DeclareLaunchArgument(
             'wheelbase',
@@ -256,7 +262,7 @@ def generate_launch_description():
 
     # Create Launch Description
     ld = LaunchDescription(
-            [declare_use_sim_time_cmd, params_file_la, frequency_la, wheelbase_la, ode_type_la,
+            [declare_use_sim_time_cmd, params_file_la, frequency_la, publish_twist_topic_la, wheelbase_la, ode_type_la,
              load_waypoints_la, waypoints_csv_la,
              saturate_inputs_la, allow_reversing_la, max_speed_la, min_speed_la, max_accel_la, max_decel_la,
              max_steer_la, min_steer_la, max_steer_rate_la,
@@ -299,6 +305,7 @@ def generate_launch_description():
                     params_file,
                     {'use_sim_time': use_sim_time},
                     {'control_rate': frequency},
+                    {'publish_twist_topic', publish_twist_topic},
                     {'wheelbase': wheelbase},
                     {'ode_type': ode_type},
                     {'max_speed': max_speed},
@@ -344,6 +351,7 @@ def generate_launch_description():
                     params_file,
                     {'use_sim_time': use_sim_time},
                     {'control_rate': frequency},
+                    {'publish_twist_topic', publish_twist_topic},
                     {'wheelbase': wheelbase},
                     {'ode_type': ode_type},
                     {'max_speed': max_speed},
