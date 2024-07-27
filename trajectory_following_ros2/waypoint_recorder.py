@@ -7,16 +7,10 @@ Notes:
     * some controllers work in robot frame, so tranform to that frame (e.g collision checker)
 
     Todo:
-        * create parent directories if they don't exist
-        * save global pose
+        * catch exception if the directory does not exist and create parent directories if they don't exist
         * save control commands (speed, delta)
-        * add message filters
-        * get parameters like frame ID
-        * subscribe to pose or odom topics
-        * setup timer callback to save
-        * transform to another reference frame
-        * save to CSV
-        * Save time delta instead of Time
+        * add option to save at a specific frequency or only when messages are received
+        * add the option to either save Odometry or subscribe to a path topic and save
 
 Msgs:
     Path: http://docs.ros.org/en/noetic/api/nav_msgs/html/msg/Path.html
@@ -54,10 +48,9 @@ class WaypointRecorderNode(Node):
         super(WaypointRecorderNode, self).__init__('waypoint_recorder')
 
         # declare parameters
-        self.declare_parameter('use_sim_time', True)
         self.declare_parameter('file_path')
         self.declare_parameter('waypoint_source', 'odometry')
-        self.declare_parameter('save_frequency', 20.0)  # Hz
+        # self.declare_parameter('save_frequency', 20.0)  # Hz. todo: remove
         self.declare_parameter('save_interval', 1)  # seconds
         self.declare_parameter('target_frame_id', 'odom',
                                ParameterDescriptor(description='The static frame to save the waypoints in.'))  # map
@@ -73,7 +66,7 @@ class WaypointRecorderNode(Node):
         # get parameters
         self.file_path = str(self.get_parameter('file_path').value)
         self.waypoint_source = self.get_parameter('waypoint_source').value
-        self.save_frequency = self.get_parameter('save_frequency').value
+        # self.save_frequency = self.get_parameter('save_frequency').value
         self.save_interval = self.get_parameter('save_interval').value
         self.target_frame_id = self.get_parameter('target_frame_id').value  # target_frame
         self.odom_topic = self.get_parameter('odom_topic').value
@@ -91,9 +84,10 @@ class WaypointRecorderNode(Node):
         self.speed, self.omega = 0.0, 0.0
         self.global_frame = ''
         self.msg_time = self.get_clock().now()
+        self.dt = 0.
         self.initial_message_received = False
 
-        header = 'frame_id, timestamp, x, y, z, yaw angle, qx, qy, qz, qw, vx, vy, speed, omega\n'
+        header = 'frame_id, timestamp, dt, x, y, z, yaw angle, qx, qy, qz, qw, vx, vy, speed, omega\n'
         self.waypoint_file = open(self.file_path, 'w', encoding="utf-8")
         self.get_logger().info(f'Saving to {self.file_path}. ')
         self.waypoint_file.write(header)
@@ -134,12 +128,13 @@ class WaypointRecorderNode(Node):
 
     def odom_callback(self, data):
         self.initial_message_received = True
-        # self.msg_time = data.header.stamp
-        self.msg_time = 0.
-        # todo: save time delta instead of time
         msg_time = data.header.stamp
-        time_delta = self.get_clock().now() - rclpy.time.Time.from_msg(msg_time)
+        # todo: test
+        time_delta = rclpy.time.Time.from_msg(self.msg_time) - rclpy.time.Time.from_msg(msg_time)
         delta_in_seconds = time_delta.nanoseconds
+
+        self.msg_time = msg_time
+        self.dt = delta_in_seconds
 
         frame_id = data.header.frame_id  # source frame
 

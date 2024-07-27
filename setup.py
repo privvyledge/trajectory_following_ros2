@@ -51,9 +51,11 @@ setup(
         tests_require=['pytest'],
         entry_points={
             'console_scripts': [
-                'coupled_kinematic_casadi = trajectory_following_ros2.coupled_kinematic_casadi:main',
+                # 'coupled_kinematic_casadi = trajectory_following_ros2.coupled_kinematic_casadi:main',
                 'coupled_kinematic_do_mpc = trajectory_following_ros2.coupled_kinematic_do_mpc:main',
                 'coupled_kinematic_acados = trajectory_following_ros2.coupled_kinematic_acados:main',
+                # 'coupled_kinematic_cvxpy = trajectory_following_ros2.ackermann_mpc_cvxpy:main',
+                'purepursuit = trajectory_following_ros2.ackermann_purepursuit:main',
                 'kinematic_dompc_simulator = trajectory_following_ros2.simulator.do_mpc.do_mpc_simulator_node:main',
                 'kinematic_acados_simulator = trajectory_following_ros2.simulator.acados.acados_simulator_node:main',
                 'twist_to_ackermann = trajectory_following_ros2.twist_to_ackermann_drive:main',

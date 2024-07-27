@@ -8,12 +8,12 @@
     sample_time: 0.05
     prediction_time: 1.5
     control_rate: 20.0
-    sature_input: True
+    saturate_input: True
     allow_reversing: True
 
     max_speed: 1.5
     min_speed: -1.5
-    max_acce: 3.0
+    max_accel: 3.0
     max_decel: -3.0
     max_steer: 27.0
     min_steer: -27.0

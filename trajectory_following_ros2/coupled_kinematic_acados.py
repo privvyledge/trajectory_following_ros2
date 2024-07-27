@@ -280,7 +280,7 @@ class KinematicCoupledAcadosMPCNode(Node):
 
         # setup mpc timer. todo: either publish debug topics in a separate node or use Reentrant MultiThreadedExecutor
         self.mpc_timer = self.create_timer(self.sample_time, self.mpc_callback)
-        # self.debug_timer = self.create_timer(1.0, self.publish_debug_topics)
+        # self.debug_timer = self.create_timer(1.0, self.publish_debug_topics)  # todo: test publishing within the main function
 
         self.path = None
         self.des_yaw_list = None
@@ -665,6 +665,8 @@ class KinematicCoupledAcadosMPCNode(Node):
                 self.solution_status = not bool(status)
 
                 self.run_count += 1
+
+                self.publish_debug_topics()  # optionally publish debug topics for viewing
                 # return
 
         # todo: replace with an else block and just  print that the model isn't initialized
