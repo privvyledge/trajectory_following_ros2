@@ -18,6 +18,7 @@ PP Pipeline:
 
 Todo:
     Use path message instead of loading from CSV
+    Add a flag for stamped or unstamped message
     Add derivative in PI controller
     Make speed command optional
     Move PID speed controller to separate node
@@ -71,7 +72,7 @@ class PurePursuitNode(Node):
         # declare parameters
         self.declare_parameter('file_path', "/f1tenth_ws/data/test_waypoints.csv")
         self.declare_parameter('path_source', 'file')  # from csv file (file) or ros path message (path)
-        self.declare_parameter('csv_columns', (0, 2, 3, 5, 10))  # what columns to load if loading from a CSV file
+        self.declare_parameter('csv_columns', (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14))  # what columns to load if loading from a CSV file
         self.declare_parameter('control_rate', 20.0)
         self.declare_parameter('goal_tolerance', 0.5)
         self.declare_parameter('lookahead_distance', 0.4)  # (0.4) [m] lookahead distance
@@ -81,9 +82,9 @@ class PurePursuitNode(Node):
         self.declare_parameter('use_adaptive_lookahead', False)
         self.declare_parameter('speedup_first_lookup', True)
         self.declare_parameter('wheelbase', 0.256)
-        self.declare_parameter('min_steer', -23,
+        self.declare_parameter('min_steer', -23.0,
                                ParameterDescriptor(description='The minimum lateral command (steering) to apply.'))  # in degrees
-        self.declare_parameter('max_steer', 23)  # in degrees
+        self.declare_parameter('max_steer', 23.0)  # in degrees
         self.declare_parameter('odom_topic', '/vehicle/odometry/filtered')
         self.declare_parameter('acceleration_topic', '/vehicle/accel/filtered')
         self.declare_parameter('ackermann_cmd_topic', '/drive')
@@ -296,8 +297,8 @@ class PurePursuitNode(Node):
             # self.speed_error = self.desired_speed - self.speed
             #print(f"Speed (before) error: {self.speed_error}, desired: {self.desired_speed}, actual: {self.speed}")
             target_speed = self.speeds[self.last_idx]
-            target_speed = (target_speed / abs(target_speed)) * self.desired_speed
-            speed_cmd = speed_cmd = self.set_speed(target_speed, self.speed)  #self.set_speed(self.desired_speed, self.speed)
+            target_speed = (target_speed / abs(target_speed)) * self.desired_speed  # todo: catch ZeroDivisionError
+            speed_cmd = self.set_speed(target_speed, self.speed)  #self.set_speed(self.desired_speed, self.speed)
             #print(f"Speed (after) error: {self.speed_error}, desired: {self.desired_speed}, actual: {self.speed}")
             #print(f"Desired steering angle: {self.desired_steering_angle}")
             if not (self.MAX_SPEED >= speed_cmd >= -self.MAX_SPEED):
@@ -361,6 +362,7 @@ class PurePursuitNode(Node):
         # if x, and y are relative to CoG
         self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))
         self.rear_y = self.y - ((self.WHEELBASE / 2) * math.sin(self.yaw))
+        self.location = [self.x, self.y]
 
         # Publish vehicle kinematic state
         odom = Odometry()
@@ -517,10 +519,10 @@ class PurePursuitNode(Node):
         csv_array = np.genfromtxt(path_to_csv, delimiter=',', skip_header=1, usecols=columns, dtype=float)[35:468, :]
         # csv_struct = np.genfromtxt(path_to_csv, delimiter=',', names=True, usecols=columns, dtype=float)
 
-        frame_ids = ['odom'] * len(csv_array)  # todo: get from CSV
-        waypoints_array = csv_array[:, 1:3]
-        des_yaw_list = csv_array[:, 3]
-        des_speed_list = csv_array[:, -1]
+        frame_ids = ['odom'] * len(csv_array)  # todo: get from CSV or don't hardcode
+        waypoints_array = csv_array[:, 3:5]
+        des_yaw_list = csv_array[:, 6]
+        des_speed_list = csv_array[:, 11]
         return frame_ids, waypoints_array, des_yaw_list, des_speed_list
 
 

@@ -87,7 +87,7 @@ class WaypointRecorderNode(Node):
         self.dt = 0.
         self.initial_message_received = False
 
-        header = 'frame_id, timestamp, dt, x, y, z, yaw angle, qx, qy, qz, qw, vx, vy, speed, omega\n'
+        header = 'frame_id, timestamp, dt, x, y, z, yaw, qx, qy, qz, qw, vx, vy, speed, omega\n'
         self.waypoint_file = open(self.file_path, 'w', encoding="utf-8")
         self.get_logger().info(f'Saving to {self.file_path}. ')
         self.waypoint_file.write(header)
@@ -209,13 +209,13 @@ class WaypointRecorderNode(Node):
 
     def recording_callback(self):
         if self.initial_message_received:
-            self.waypoint_file.write(f"{self.global_frame}, {self.msg_time}, "
+            self.waypoint_file.write(f"{self.global_frame}, {self.msg_time}, {self.dt}"
                                      f"{self.x}, {self.y}, {self.z}, {self.yaw}, "
                                      f"{self.qx}, {self.qy}, {self.qz}, {self.qw},"
                                      f"{self.vx}, {self.vy}, "
                                      f"{self.speed}, {self.omega}\n")
             # todo: remove
-            self.get_logger().info(f"{self.global_frame}, {self.msg_time}, "
+            self.get_logger().info(f"{self.global_frame}, {self.msg_time}, {self.dt} "
                                    f"{self.x}, {self.y}, {self.z}, {self.yaw}, "
                                    f"{self.qx}, {self.qy}, {self.qz}, {self.qw},"
                                    f"{self.vx}, {self.vy}, "

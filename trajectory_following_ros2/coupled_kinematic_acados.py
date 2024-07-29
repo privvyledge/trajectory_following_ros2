@@ -11,10 +11,15 @@ Tips:
     5. ROS2 Nav2 Controller plugin explanation (https://navigation.ros.org/plugin_tutorials/docs/writing_new_nav2controller_plugin.html)
     6. For an interesting cost function, see (https://discourse.acados.org/t/how-to-set-weights-of-costs-according-to-the-time-interval-in-mpc-prediction-horizon/1001)
 Todo:
+    * use desired speed parameter
+    * change current desired speed topic to desired speed array
+    * add desired speed topic to a Float64 message and optionally generate a velocity profile
+    * add a check for if speeds or desired speed is zero and modify the mpc weights to make the car move
+    * Add a flag for stamped or unstamped message
+    * add a flag to convert from center of mass (or gravity) to rear axle, e.g for carla.
+    Also see https://dingyan89.medium.com/simple-understanding-of-kinematic-bicycle-model-81cac6420357 and New Eagles CoM odometry to base link conversion
     * declare/initialize arrays and update instead of redeclaring each iteration (e.g using contiguous array)
     * switch to Multithreaded executor and reentrant callback group (plus threading lock) to run MPC and visualization on different threads
-    * setup parameter types (https://github.com/ros2/rclpy/blob/5285e61f02ab87f8b84f11ee33e608ff118a8f06/rclpy/test/test_parameter.py). Types (https://roboticsbackend.com/ros2-rclpy-parameter-callback/#Check_the_parameters_type).
-        * See saturate_inputs parameter below
     * setup point stabilization, i.e go to goal from RVIz pose
     * set default reference speed to 0 and set velocity cost weight to close to 0
     * Fix/detect time jump, e.g when using ROSBags (https://github.com/ros2/geometry2/issues/606#issuecomment-1589927587 | https://github.com/ros2/geometry2/pull/608#discussion_r1229877511)
@@ -51,6 +56,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.duration import Duration
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy
+from rclpy.qos import DurabilityPolicy
+from rclpy.qos import HistoryPolicy
 
 # TF
 from tf2_ros import TransformException, LookupException, ConnectivityException, ExtrapolationException
@@ -104,7 +112,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('n_states', 4)  # todo: remove and get from import model
         self.declare_parameter('n_inputs', 2)  # todo: remove and get from import model
         self.declare_parameter('horizon', 25)
-        self.declare_parameter('prediction_time')
+        self.declare_parameter('prediction_time', 0.0)
         self.declare_parameter('max_iter', 15)  # it usually doesnt take more than 15 iterations
         self.declare_parameter('termination_condition',
                                1e-6)  # iteration finish param. todo: pass to mpc initializer solver options
@@ -123,7 +131,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('publish_twist_topic', True)
         self.declare_parameter('twist_topic', '/cmd_vel')
 
-        self.declare_parameter('desired_speed')  # todo: get from topic/trajectory message
+        self.declare_parameter('desired_speed', 10.0)  # todo: get from topic/trajectory message
         self.declare_parameter('loop', False)  # todo: remove and pass to waypoint publisher
         self.declare_parameter('n_ind_search', 10)  # the number of points to check for when searching for the closest
         self.declare_parameter('smooth_yaw', False)
@@ -191,7 +199,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.model_directory = self.get_parameter('model_directory').value
 
         self.dt = self.sample_time = 1 / self.control_rate  # [s] sample time. # todo: get from ros Duration
-        if self.prediction_time is None:
+        if (self.prediction_time is None) or (self.prediction_time == 0.0):
             self.prediction_time = self.sample_time * self.horizon
 
         # initialize trajectory class
@@ -234,17 +242,18 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.state_frame_id = ''  # the frame ID of the pose state received. odom, map
 
+        latching_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         # Setup subscribers
         self.path_sub = self.create_subscription(
                 Path,
                 self.path_topic,
                 self.path_callback,
-                1)  # to get the desired/reference states of the robot
+                qos_profile=latching_qos)  # to get the desired/reference states of the robot
         self.speed_sub = self.create_subscription(
                 Float32MultiArray,
                 self.speed_topic,
                 self.desired_speed_callback,
-                1)  # to get the desired/reference states of the robot
+                qos_profile=latching_qos)  # to get the desired/reference states of the robot
         self.odom_sub = self.create_subscription(
                 Odometry,
                 self.odom_topic,
@@ -280,7 +289,7 @@ class KinematicCoupledAcadosMPCNode(Node):
 
         # setup mpc timer. todo: either publish debug topics in a separate node or use Reentrant MultiThreadedExecutor
         self.mpc_timer = self.create_timer(self.sample_time, self.mpc_callback)
-        # self.debug_timer = self.create_timer(1.0, self.publish_debug_topics)  # todo: test publishing within the main function
+        self.debug_timer = self.create_timer(1.0, self.publish_debug_topics)  # todo: test publishing within the main function
 
         self.path = None
         self.des_yaw_list = None
@@ -341,14 +350,14 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.path = np.array(coordinate_list)
         self.des_yaw_list = np.array(yaw_list)
         self.frame_id_list = frame_id_list
-        # self.dist_arr = np.zeros(len(self.path))  # array of distances used to check closes path
+        self.path_received = True
+        self.final_idx = self.path.shape[0] - 1
+        self.final_goal = self.path[self.final_idx, :]
+        # self.dist_arr = np.zeros(len(
+        # self.path))  # array of distances used to check closes path
         if self.desired_speed_received:
             self.reference_path = np.array(
                     [self.path[:, 0], self.path[:, 1], self.speeds, self.des_yaw_list]).T  # todo: remove
-            self.final_idx = self.path.shape[0] - 1
-            self.final_goal = self.path[self.final_idx, :]
-
-            self.path_received = True
 
     def desired_speed_callback(self, data):
         speed_list = []
@@ -421,6 +430,7 @@ class KinematicCoupledAcadosMPCNode(Node):
     def odom_callback(self, data):
         """
         Todo: transform coordinates
+        todo: add flag to convert to and from center of mass to rear axle
         :param data:
         :return:
         """
@@ -456,6 +466,14 @@ class KinematicCoupledAcadosMPCNode(Node):
 
         self.speed = self.direction * np.linalg.norm([self.vx, self.vy, self.vz])
         # self.speed = self.vx
+
+        # todo: use flag to convert from the center of mass <--> rear axle
+        # great tutorial: https://dingyan89.medium.com/simple-understanding-of-kinematic-bicycle-model-81cac6420357
+        # # if x, and y are relative to CoG
+        # self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))
+        # self.rear_y = self.y - ((self.WHEELBASE / 2) * math.sin(self.yaw))
+        # self.location = [self.rear_x, self.rear_x_y]  # [self.x, self.y]
+        # todo: to convert from rear axle to cog see new eagles misc report
 
         self.zk[0, 0] = self.x
         self.zk[1, 0] = self.y
@@ -666,7 +684,7 @@ class KinematicCoupledAcadosMPCNode(Node):
 
                 self.run_count += 1
 
-                self.publish_debug_topics()  # optionally publish debug topics for viewing
+                #self.publish_debug_topics()  # optionally publish debug topics for viewing
                 # return
 
         # todo: replace with an else block and just  print that the model isn't initialized
@@ -713,6 +731,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         """
         Publish markers and path.
         Todo: check if mpc is initialized first
+        Todo: dont hardcode frame ids
         Todo: publish car path travelled as a Path message
         Todo: speedup or use thread locks to copy
         """

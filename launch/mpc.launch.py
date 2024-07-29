@@ -5,6 +5,8 @@ Set directory paths
 Set default parameters
 Choose MPC type
 Remap nav2 path topic to
+
+Todo: setup node name arguments
 """
 
 import os
@@ -70,6 +72,14 @@ def generate_launch_description():
     # # Trajectory/goal parameters
     distance_tolerance = LaunchConfiguration('distance_tolerance')
     speed_tolerance = LaunchConfiguration('speed_tolerance')
+
+    # #  Topics
+    odom_topic = LaunchConfiguration('odom_topic', default="/odometry/local")
+    ackermann_cmd_topic = LaunchConfiguration('ackermann_cmd_topic', default="/drive")
+    twist_topic = LaunchConfiguration('twist_topic', default="/cmd_vel")
+    acceleration_topic = LaunchConfiguration('acceleration_topic', default="/accel/local")
+    path_topic = LaunchConfiguration('path_topic', default="/trajectory/path")
+    speed_topic = LaunchConfiguration('speed_topic', default="/trajectory/speed")
 
     # Declare default launch arguments
     config_file_path = os.path.join(trajectory_following_ros2_pkg_prefix, 'config/mpc_parameters.yaml')
@@ -260,6 +270,36 @@ def generate_launch_description():
             'log_level', default_value='info',
             description='log level')
 
+    odom_topic_la = DeclareLaunchArgument(
+            'odom_topic',
+            default_value=odom_topic
+    )
+
+    ackermann_cmd_topic_la = DeclareLaunchArgument(
+            'ackermann_cmd_topic',
+            default_value=ackermann_cmd_topic
+    )
+
+    twist_topic_la = DeclareLaunchArgument(
+            'twist_topic',
+            default_value=twist_topic
+    )
+
+    acceleration_topic_la = DeclareLaunchArgument(
+            'acceleration_topic',
+            default_value=acceleration_topic
+    )
+
+    path_topic_la = DeclareLaunchArgument(
+            'path_topic',
+            default_value=path_topic
+    )
+
+    speed_topic_la = DeclareLaunchArgument(
+            'speed_topic',
+            default_value=speed_topic
+    )
+
     # Create Launch Description
     ld = LaunchDescription(
             [declare_use_sim_time_cmd, params_file_la, frequency_la, publish_twist_topic_la, wheelbase_la, ode_type_la,
@@ -272,12 +312,13 @@ def generate_launch_description():
              stage_cost_type_la, terminal_cost_type_la,
              generate_mpc_model_la, build_with_cython_la, model_directory_la,
              distance_tolerance_la, speed_tolerance_la,
-             declare_log_level_cmd]
+             declare_log_level_cmd,
+             odom_topic_la, ackermann_cmd_topic_la, twist_topic_la, acceleration_topic_la, path_topic_la, speed_topic_la]
     )
 
     # Load Nodes
     waypoint_loader_node = Node(
-                condition=IfCondition([load_waypoints]),
+                condition=IfCondition(load_waypoints),
                 package='trajectory_following_ros2',
                 executable='waypoint_loader',
                 name='waypoint_loader_node',
@@ -289,8 +330,8 @@ def generate_launch_description():
                 ],
                 arguments=['--ros-args', '--log-level', log_level],
                 remappings=[
-                    ('/waypoint_loader/path', '/trajectory/path'),
-                    ('/waypoint_loader/speed', '/trajectory/speed'),
+                    ('/waypoint_loader/path', path_topic),
+                    ('/waypoint_loader/speed', speed_topic),
                 ]
         )
 
@@ -305,7 +346,7 @@ def generate_launch_description():
                     params_file,
                     {'use_sim_time': use_sim_time},
                     {'control_rate': frequency},
-                    {'publish_twist_topic', publish_twist_topic},
+                    {'publish_twist_topic': publish_twist_topic},
                     {'wheelbase': wheelbase},
                     {'ode_type': ode_type},
                     {'max_speed': max_speed},
@@ -333,6 +374,14 @@ def generate_launch_description():
                     {'terminal_cost_type': terminal_cost_type},
                     {'distance_tolerance': distance_tolerance},
                     {'speed_tolerance': speed_tolerance},
+                    {
+                        'odom_topic': odom_topic,
+                        'ackermann_cmd_topic': ackermann_cmd_topic,
+                        'twist_topic': twist_topic,
+                        'acceleration_topic': acceleration_topic,
+                        'path_topic': path_topic,
+                        'speed_topic': speed_topic,
+                    },
                 ],
                 arguments=['--ros-args', '--log-level', log_level],
                 # remappings=[
@@ -379,6 +428,14 @@ def generate_launch_description():
                     # {'terminal_cost_type': terminal_cost_type},
                     {'distance_tolerance': distance_tolerance},
                     {'speed_tolerance': speed_tolerance},
+                    {
+                        'odom_topic': odom_topic,
+                        'ackermann_cmd_topic': ackermann_cmd_topic,
+                        'twist_topic': twist_topic,
+                        'acceleration_topic': acceleration_topic,
+                        'path_topic': path_topic,
+                        'speed_topic': speed_topic,
+                    },
                 ],
                 arguments=['--ros-args', '--log-level', log_level],
                 # remappings=[

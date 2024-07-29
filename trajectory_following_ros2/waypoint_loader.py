@@ -2,14 +2,14 @@
 Load path from waypoints and set QoS profile to transient.
 
 Todo:
-    Move to a separate package
+    switch to pandas
     Publish as a list of poses for NavigateThroughPoses action servers
     Check if the file exists
-    Limit the number of nodes/states published
-    Switch to Pandas
-    Switch to custom message or actions to specify Path + speeds
     Pass data into ROS arrays at once instead of appending
+    Limit the number of nodes/states published
+    Switch to custom message or actions to specify Path + speeds, i.e trajectory
     Smooth/interpolate (in a separate replanner node)
+    Move to a separate package
 """
 import os
 import sys
@@ -20,6 +20,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 
 # TF
 from tf2_ros import TransformException, LookupException
@@ -48,8 +49,8 @@ class WaypointLoaderNode(Node):
         super(WaypointLoaderNode, self).__init__('waypoint_loader')
 
         # declare parameters
-        self.declare_parameter('file_path')
-        self.declare_parameter('csv_columns', (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13))  # what columns to load
+        self.declare_parameter('file_path', '')
+        self.declare_parameter('csv_columns', (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14))  # what columns to load
         self.declare_parameter('publish_frequency', 20.0)  # Hz. todo: remove as seconds makes more sense here
         self.declare_parameter('publish_interval', 1.0)  # seconds
         self.declare_parameter('path_topic', '/waypoint_loader/path')
@@ -65,7 +66,7 @@ class WaypointLoaderNode(Node):
         # get parameters
         self.file_path = str(self.get_parameter('file_path').value)
         self.csv_columns = self.get_parameter('csv_columns').value
-        self.publish_frequency = self.get_parameter('publish_frequency').value
+        # self.publish_frequency = self.get_parameter('publish_frequency').value
         self.publish_interval = self.get_parameter('publish_interval').value
         self.path_topic = self.get_parameter('path_topic').value
         self.speed_topic = self.get_parameter('speed_topic').value
@@ -76,10 +77,9 @@ class WaypointLoaderNode(Node):
         # Load waypoints (csv_data: frame_id, time_delta (dt), x, y, z, yaw, qx, qy, qz, qw, speed)
         self.csv_data = self.get_waypoints_from_csv(self.file_path, columns=self.csv_columns)
         # print(f"CSV_data shape: {self.csv_data.shape}")
+        # todo: either get the frame id as a parameter or use pandas to load the CSV
         self.frame_ids = ['odom'] * self.csv_data.shape[
             0]  # a hack because Numpys loader converts strings to Nan. self.csv_data[:, 0]
-        self.time_deltas = self.csv_data[:, 1]
-
         # # optional smoothing
         # self.trajectory_instance = Trajectory(search_index_number=10,
         #                                       goal_tolerance=self.distance_tolerance,
@@ -101,18 +101,19 @@ class WaypointLoaderNode(Node):
         #         k=3)  # we use splprep to handle nonunique and not strictly ascending x
         # _, self.speeds = scipy.interpolate.splev(b_spline_coefficients, interpolation_function)
 
-        self.xs = self.csv_data[:, 2]
-        self.ys = self.csv_data[:, 3]
-        self.zs = self.csv_data[:, 4]
-        self.yaws = self.csv_data[:, 5]
-        self.qxs = self.csv_data[:, 6]
-        self.qys = self.csv_data[:, 7]
-        self.qzs = self.csv_data[:, 8]
-        self.qws = self.csv_data[:, 9]
-        # self.waypoints = self.csv_data[:, 2:10]  # wrong. todo: use np.hstack instead
-        self.vxs = self.csv_data[:, 10]  # vx
-        self.vys = self.csv_data[:, 11]
-        self.yaw_rates = self.csv_data[:, 13]  # omega
+        self.dts = self.csv_data[:, 2]
+        self.xs = self.csv_data[:, 3]
+        self.ys = self.csv_data[:, 4]
+        self.zs = self.csv_data[:, 5]
+        self.yaws = self.csv_data[:, 6]
+        self.qxs = self.csv_data[:, 7]
+        self.qys = self.csv_data[:, 8]
+        self.qzs = self.csv_data[:, 9]
+        self.qws = self.csv_data[:, 10]
+        # self.waypoints = self.csv_data[:, 3:11]  # wrong. todo: use np.hstack instead
+        self.vxs = self.csv_data[:, 11]  # vx
+        self.vys = self.csv_data[:, 12]
+        self.yaw_rates = self.csv_data[:, 14]  # omega
 
         # Setup transformations to transform pose from one frame to another. todo
         self.tf_buffer = Buffer()
@@ -138,12 +139,14 @@ class WaypointLoaderNode(Node):
         self.waypoint_parser()
 
         # Setup publishers
-        self.path_pub = self.create_publisher(Path, self.path_topic, 1)
-        self.speed_pub = self.create_publisher(Float32MultiArray, self.speed_topic, 1)
-        self.marker_pub = self.create_publisher(MarkerArray, self.marker_topic, 1)
+        latching_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.path_pub = self.create_publisher(Path, self.path_topic, qos_profile=latching_qos)
+        self.speed_pub = self.create_publisher(Float32MultiArray, self.speed_topic, qos_profile=latching_qos)
+        self.marker_pub = self.create_publisher(MarkerArray, self.marker_topic, qos_profile=latching_qos)
 
         # Setup timers
-        self.publisher_timer = self.create_timer(self.publish_interval, self.publisher_callback)
+        self.publisher_callback()
+        # self.publisher_timer = self.create_timer(self.publish_interval, self.publisher_callback)
 
         self.get_logger().info('waypoint_loader started. ')
 

@@ -212,7 +212,7 @@ class KinematicDoMPCSimulationNode(Node):
 
         odom_msg.twist.twist.angular.x = 0.0
         odom_msg.twist.twist.angular.y = 0.0
-        odom_msg.twist.twist.angular.z = self.yaw_rate
+        odom_msg.twist.twist.angular.z = self.yaw_rate  # todo: test
 
         self.odom_pub.publish(odom_msg)
 
