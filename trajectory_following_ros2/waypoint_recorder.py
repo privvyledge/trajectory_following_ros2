@@ -48,7 +48,7 @@ class WaypointRecorderNode(Node):
         super(WaypointRecorderNode, self).__init__('waypoint_recorder')
 
         # declare parameters
-        self.declare_parameter('file_path')
+        self.declare_parameter('file_path', '')
         self.declare_parameter('waypoint_source', 'odometry')
         # self.declare_parameter('save_frequency', 20.0)  # Hz. todo: remove
         self.declare_parameter('save_interval', 1)  # seconds
@@ -83,11 +83,12 @@ class WaypointRecorderNode(Node):
         self.vx, self.vy, self.vz = 0., 0., 0.
         self.speed, self.omega = 0.0, 0.0
         self.global_frame = ''
-        self.msg_time = self.get_clock().now()
+        self.msg_time = None
+        self.total_time_elapsed = 0.0
         self.dt = 0.
         self.initial_message_received = False
 
-        header = 'frame_id, timestamp, dt, x, y, z, yaw, qx, qy, qz, qw, vx, vy, speed, omega\n'
+        header = 'frame_id, total_time_elapsed, dt, x, y, z, yaw, qx, qy, qz, qw, vx, vy, speed, omega\n'
         self.waypoint_file = open(self.file_path, 'w', encoding="utf-8")
         self.get_logger().info(f'Saving to {self.file_path}. ')
         self.waypoint_file.write(header)
@@ -129,12 +130,13 @@ class WaypointRecorderNode(Node):
     def odom_callback(self, data):
         self.initial_message_received = True
         msg_time = data.header.stamp
-        # todo: test
-        time_delta = rclpy.time.Time.from_msg(self.msg_time) - rclpy.time.Time.from_msg(msg_time)
-        delta_in_seconds = time_delta.nanoseconds
+        if self.msg_time is not None:
+            time_delta = rclpy.time.Time.from_msg(msg_time) - rclpy.time.Time.from_msg(self.msg_time)
+            delta_in_seconds = time_delta.nanoseconds / 1e+9
+            self.dt = abs(delta_in_seconds)
 
         self.msg_time = msg_time
-        self.dt = delta_in_seconds
+        self.total_time_elapsed = self.msg_time.sec + (self.msg_time.nanosec / 1e+9)
 
         frame_id = data.header.frame_id  # source frame
 
@@ -209,15 +211,15 @@ class WaypointRecorderNode(Node):
 
     def recording_callback(self):
         if self.initial_message_received:
-            self.waypoint_file.write(f"{self.global_frame}, {self.msg_time}, {self.dt}"
+            self.waypoint_file.write(f"{self.global_frame}, {self.total_time_elapsed}, {self.dt}, "
                                      f"{self.x}, {self.y}, {self.z}, {self.yaw}, "
-                                     f"{self.qx}, {self.qy}, {self.qz}, {self.qw},"
+                                     f"{self.qx}, {self.qy}, {self.qz}, {self.qw}, "
                                      f"{self.vx}, {self.vy}, "
                                      f"{self.speed}, {self.omega}\n")
             # todo: remove
-            self.get_logger().info(f"{self.global_frame}, {self.msg_time}, {self.dt} "
+            self.get_logger().info(f"{self.global_frame}, {self.total_time_elapsed}, {self.dt}, "
                                    f"{self.x}, {self.y}, {self.z}, {self.yaw}, "
-                                   f"{self.qx}, {self.qy}, {self.qz}, {self.qw},"
+                                   f"{self.qx}, {self.qy}, {self.qz}, {self.qw}, "
                                    f"{self.vx}, {self.vy}, "
                                    f"{self.speed}, {self.omega}\n")
 

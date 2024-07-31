@@ -163,7 +163,10 @@ class KinematicDoMPCSimulationNode(Node):
 
         self.delta_cmd = data.drive.steering_angle
         self.velocity_cmd = data.drive.speed
-        self.acc_cmd = (self.velocity_cmd - self.speed) / self.sample_time  # i.e dv/dt todo: use an augmented ode to calculate instead
+        if data.drive.acceleration != 0.0:
+            self.acc_cmd = data.drive.acceleration
+        else:
+            self.acc_cmd = (self.velocity_cmd - self.speed) / self.sample_time  # i.e dv/dt
         self.uk[0, 0] = self.acc_cmd
         self.uk[1, 0] = self.delta_cmd
 

@@ -2,10 +2,13 @@
 Load path from waypoints and set QoS profile to transient.
 
 Todo:
-    switch to pandas
-    Publish as a list of poses for NavigateThroughPoses action servers
-    Check if the file exists
+    switch to pandas [done]
+    Check if the file exists [done: no need]
+    Make the marker type configurable and choose what to display
+    add a flag to replace zero speeds with a default value
+    Add flag to publish initialpose as the first data row
     Pass data into ROS arrays at once instead of appending
+    Publish as a list of poses for NavigateThroughPoses action servers
     Limit the number of nodes/states published
     Switch to custom message or actions to specify Path + speeds, i.e trajectory
     Smooth/interpolate (in a separate replanner node)
@@ -16,6 +19,7 @@ import sys
 import csv
 import threading
 import numpy as np
+import pandas as pd
 
 import rclpy
 from rclpy.node import Node
@@ -50,9 +54,6 @@ class WaypointLoaderNode(Node):
 
         # declare parameters
         self.declare_parameter('file_path', '')
-        self.declare_parameter('csv_columns', (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14))  # what columns to load
-        self.declare_parameter('publish_frequency', 20.0)  # Hz. todo: remove as seconds makes more sense here
-        self.declare_parameter('publish_interval', 1.0)  # seconds
         self.declare_parameter('path_topic', '/waypoint_loader/path')
         self.declare_parameter('speed_topic', '/waypoint_loader/speed')
         self.declare_parameter('marker_topic', '/waypoint_loader/markers')
@@ -65,9 +66,6 @@ class WaypointLoaderNode(Node):
 
         # get parameters
         self.file_path = str(self.get_parameter('file_path').value)
-        self.csv_columns = self.get_parameter('csv_columns').value
-        # self.publish_frequency = self.get_parameter('publish_frequency').value
-        self.publish_interval = self.get_parameter('publish_interval').value
         self.path_topic = self.get_parameter('path_topic').value
         self.speed_topic = self.get_parameter('speed_topic').value
         self.marker_topic = self.get_parameter('marker_topic').value
@@ -75,11 +73,7 @@ class WaypointLoaderNode(Node):
         self.publish_if_transform_fails = self.get_parameter('publish_if_transform_fails').value
 
         # Load waypoints (csv_data: frame_id, time_delta (dt), x, y, z, yaw, qx, qy, qz, qw, speed)
-        self.csv_data = self.get_waypoints_from_csv(self.file_path, columns=self.csv_columns)
-        # print(f"CSV_data shape: {self.csv_data.shape}")
-        # todo: either get the frame id as a parameter or use pandas to load the CSV
-        self.frame_ids = ['odom'] * self.csv_data.shape[
-            0]  # a hack because Numpys loader converts strings to Nan. self.csv_data[:, 0]
+        self.csv_data = self.get_waypoints_from_csv(self.file_path)
         # # optional smoothing
         # self.trajectory_instance = Trajectory(search_index_number=10,
         #                                       goal_tolerance=self.distance_tolerance,
@@ -101,19 +95,23 @@ class WaypointLoaderNode(Node):
         #         k=3)  # we use splprep to handle nonunique and not strictly ascending x
         # _, self.speeds = scipy.interpolate.splev(b_spline_coefficients, interpolation_function)
 
-        self.dts = self.csv_data[:, 2]
-        self.xs = self.csv_data[:, 3]
-        self.ys = self.csv_data[:, 4]
-        self.zs = self.csv_data[:, 5]
-        self.yaws = self.csv_data[:, 6]
-        self.qxs = self.csv_data[:, 7]
-        self.qys = self.csv_data[:, 8]
-        self.qzs = self.csv_data[:, 9]
-        self.qws = self.csv_data[:, 10]
-        # self.waypoints = self.csv_data[:, 3:11]  # wrong. todo: use np.hstack instead
-        self.vxs = self.csv_data[:, 11]  # vx
-        self.vys = self.csv_data[:, 12]
-        self.yaw_rates = self.csv_data[:, 14]  # omega
+        # todo: just do the unpacking where needed
+        self.frame_ids = self.csv_data["frame_id"].tolist()
+        self.total_time_elapsed = self.csv_data["total_time_elapsed"].tolist()
+        self.dts = self.csv_data["dt"].tolist()
+        self.xs = self.csv_data["x"].tolist()
+        self.ys = self.csv_data["y"].tolist()
+        self.zs = self.csv_data["z"].tolist()
+        self.yaws = self.csv_data["yaw"].tolist()
+        self.qxs = self.csv_data["qx"].tolist()
+        self.qys = self.csv_data["qy"].tolist()
+        self.qzs = self.csv_data["qz"].tolist()
+        self.qws = self.csv_data["qw"].tolist()
+        # self.waypoints = self.csv_data.loc[:, "x":"yaw"]
+        self.vxs = self.csv_data["vx"].tolist()
+        self.vys = self.csv_data["vy"].tolist()
+        self.speeds = self.csv_data["speed"].tolist()
+        self.yaw_rates = self.csv_data["omega"].tolist()
 
         # Setup transformations to transform pose from one frame to another. todo
         self.tf_buffer = Buffer()
@@ -146,50 +144,17 @@ class WaypointLoaderNode(Node):
 
         # Setup timers
         self.publisher_callback()
-        # self.publisher_timer = self.create_timer(self.publish_interval, self.publisher_callback)
 
         self.get_logger().info('waypoint_loader started. ')
 
-    def get_waypoints_from_csv(self, path_to_csv, columns=None):
-        """frame_id, timestamp, x, y, z, yaw angle, qx, qy, qz, qw, vx, vy, speed, omega"""
-        # Todo: finish up
-        # todo: remove rows with Nan
-        """ to import as a struct with column indexing"""
-        # As waypoints array (note, will convert strings to NaN)
-        waypoints_array = np.genfromtxt(path_to_csv, delimiter=',', skip_header=1, usecols=columns, dtype=float)
-        # # As numpy structured array
-        # waypoints_struct = np.genfromtxt(path_to_csv, delimiter=',', names=True, usecols=columns, dtype=None,
-        # autostrip=None, unpack=True, encoding=None)
-        # frame_ids = waypoints_struct['frame_id']
-        # stamps = waypoints_struct['time_delta']
-
-        # # Using python reader
-        # row_index = 0
-        # skip_header = True
-        # if skip_header:
-        #     row_index = 1
-        #
-        # frame_ids = []
-        # timestamps = []
-        # position = []
-        # with open(path_to_csv, mode='r', encoding="utf-8") as csv_file:
-        #     csv_reader = csv.DictReader(csv_file)
-        #     # rows = [[x.strip() for x in row] for row in csv_reader]
-        #     for row in csv_reader:
-        #         row = {k.strip(): v.strip() for (k, v) in row.items()}
-        #         for (k, v) in row.items():
-        #             if k == 'frame_id':
-        #                 frame_ids.append(v)
-        #         row_index += 1
-
-        # csv_data = waypoints_array[35:468:10, :]
-        csv_data = waypoints_array
+    def get_waypoints_from_csv(self, path_to_csv):
+        waypoints_df = pd.read_csv(path_to_csv, skipinitialspace=True)
+        csv_data = waypoints_df
         return csv_data
 
     def waypoint_parser(self):
         """
         Should run once to add the waypoints to Path and MarkerArray messages.
-        Todo: also publish speed
         """
         # self.path_msg = Path()
         # self.path_msg.header.stamp = rospy.Time.now()
@@ -206,7 +171,6 @@ class WaypointLoaderNode(Node):
 
         # self.path_msg = Path()
         # self.marker_array_msg = MarkerArray()
-        counter = 0
         for row in range(self.csv_data.shape[0]):
             # waypoint: frame_id, time_delta (dt), x, y, z, yaw, qx, qy, qz, qw, speed
             if self.target_frame_id:
@@ -216,7 +180,6 @@ class WaypointLoaderNode(Node):
 
             self.parse_trajectory(index=row)
             self.parse_marker(index=row, display_type='orientation')  # orientation, speed, position
-            counter += 1
 
     def transform_waypoints(self):
         """
@@ -326,7 +289,7 @@ class WaypointLoaderNode(Node):
         marker.text = f"{self.vxs[index]}"
 
         # to automatically delete old markers
-        marker.lifetime = Duration(seconds=2).to_msg()  # 0 means forever
+        marker.lifetime = Duration(seconds=0).to_msg()  # 0 means forever.
 
         self.marker_array_msg.markers.append(marker)
 

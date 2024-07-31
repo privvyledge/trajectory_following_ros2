@@ -21,6 +21,8 @@ from trajectory_following_ros2.acados.kinematic_model import kinematic_model
 
 
 def acados_settings(Tf, N, x0=None, scale_cost=True,
+                    Q=None, R=None, Qe=None, Rd=None,
+                    wheelbase=0.256,
                     cost_module='external', cost_module_e='external',
                     generate=True, build=True, with_cython=True,
                     num_iterations=10, tolerance=1e-6,
@@ -75,15 +77,21 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     R = np.diag([1., 10.]), np.diag([1000., 10000.])
     Qe = np.diag([0.0, 0.0, 0.0, 10.0])
     '''
-    Q = np.diag([100.0, 100.0, 1000.0, 0.001])  # np.diag(100000.0, 100000.0, 1.0, 1.0])
+    # todo: initialize with nx, nu sizes
+    if Q is None:
+        Q = np.diag([100.0, 100.0, 1000.0, 0.001])  # np.diag(100000.0, 100000.0, 1.0, 1.0])
 
     # R = np.eye(nu)
     # R[0, 0] = 1e-3
     # R[1, 1] = 5e-3
-    R = np.diag([1., 10.])  # np.diag([1000., 10000.])
+    if R is None:
+        R = np.diag([1., 10.])  # np.diag([1000., 10000.])
 
-    Qe = np.diag([1000.0, 1000.0, 1.0, 0.0001])  # terminal state  np.diag([5e0, 1e1, 1e-8, 1e-8]), np.zeros((nx, nx)), Q
-    Rd = np.diag([1., 10.])  # (optional) for external cost only
+    if Qe is None:
+        Qe = np.diag([1000.0, 1000.0, 1.0, 0.0001])  # terminal state  np.diag([5e0, 1e1, 1e-8, 1e-8]), np.zeros((nx, nx)), Q
+
+    if Rd is None:
+        Rd = np.diag([1., 10.])  # (optional) for external cost only
 
     unscale = 1.0
     if scale_cost:
@@ -93,7 +101,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     W_e = Qe / unscale
 
     # unpack parameters
-    wheelbase = model.p[0]
+    # wheelbase = model.p[0]
 
     zref = model.p[1:(nx + 1)]
     uref = model.p[(nx + 1):(nx + nu + 1)]  # model.p[(nx + nx + 1):(nx + nx + nu + 1)]
@@ -103,7 +111,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
 
     yref = casadi.vertcat(zref, uref)
     ocp.parameter_values = np.array([
-        0.256,  # wheelbase
+        wheelbase,  # wheelbase
         *np.zeros(nx),  # zref
         *np.zeros(nu),  # uref
         *np.zeros(nx),  # zk

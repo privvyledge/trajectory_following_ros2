@@ -16,6 +16,8 @@ Todo:
     * add desired speed topic to a Float64 message and optionally generate a velocity profile
     * add a check for if speeds or desired speed is zero and modify the mpc weights to make the car move
     * Add a flag for stamped or unstamped message
+    * Create a common class/module or function file for common MPC/Purepursuit functions
+    * refactor acados settings and model
     * add a flag to convert from center of mass (or gravity) to rear axle, e.g for carla.
     Also see https://dingyan89.medium.com/simple-understanding-of-kinematic-bicycle-model-81cac6420357 and New Eagles CoM odometry to base link conversion
     * declare/initialize arrays and update instead of redeclaring each iteration (e.g using contiguous array)
@@ -88,6 +90,43 @@ class KinematicCoupledAcadosMPCNode(Node):
         """Constructor for KinematicCoupledAcadosMPCNode"""
         super(KinematicCoupledAcadosMPCNode, self).__init__('kinematic_coupled_acados_controller')
         # declare parameters
+        # todo: transform from/to the global and robot frames
+        self.declare_parameter('robot_frame', 'base_link',
+                               ParameterDescriptor(description='The frame attached to the car. '
+                                                               'The relative/local frame. '
+                                                               'Usually the ground projection of the center '
+                                                               'of the rear axle of a car or the center of gravity '
+                                                               'of a differential robot. '
+                                                               'Actuation commands, speed and acceleration are '
+                                                               'relative to this frame.'
+                                                               'E.g base_link, base_footprint, '
+                                                               'ego_vehicle (Carla). '
+                                                               'Obstacle positions could be specified '
+                                                               'relative to this frame or the global frame.'))
+        self.declare_parameter('global_frame', 'odom',
+                               ParameterDescriptor(description='The global/world/map frame. '
+                                                               'This frame is static and ideally its origin should '
+                                                               'not change during the lifetime of motion. '
+                                                               'Position errors are usually calculated relative '
+                                                               'to this frame, e.g X, Y, Psi '
+                                                               'for MPC, purepursuit, etc. '
+                                                               'Target/goal positions are also specified here.'
+                                                               'Usually the ground projection of the center '
+                                                               'of the rear axle of a car or the center of gravity '
+                                                               'of a differential robot. '
+                                                               'Obstacle positions could be specified '
+                                                               'relative to this frame or the robots frame.'
+                                                               'E.g odom, map. '
+                                                               'ROS2 Nav2 local costmaps are usually '
+                                                               'in this frame, i.e "odom", '
+                                                               'odometry messages are also in the "odom" frame '
+                                                               'whereas waypoints and goal poses are usually '
+                                                               'specified in the "map" or "gnss" frame so it makes '
+                                                               'sense to transform the goal points (waypoints) to the '
+                                                               '"odom" frame. '
+                                                               'Since Carla does not use the odom frame, '
+                                                               'set to "map", '
+                                                               'otherwise use "odom".'))  # global frame: odom, map
         self.declare_parameter('ode_type', "continuous_kinematic_coupled")  # todo: also augmented, etc
         self.declare_parameter('stage_cost_type', "LINEAR_LS")  # Acados specific (LINEAR_LS, NONLINEAR_LS, EXTERNAL)
         self.declare_parameter('terminal_cost_type', "LINEAR_LS")  # Acados specific (LINEAR_LS, NONLINEAR_LS, EXTERNAL)
@@ -122,6 +161,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('Rd', [10., 100.])
         self.declare_parameter('Q', [1.0, 1.0, 1.0, 0.01])
         self.declare_parameter('Qf', [0.04, 0.04, 0.1, 0.01])
+        self.declare_parameter('scale_cost', False)
 
         self.declare_parameter('path_topic', '/trajectory/path')  # todo: replace with custom message or action
         self.declare_parameter('speed_topic', '/trajectory/speed')  # todo: replace with custom message or action
@@ -141,6 +181,10 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('model_directory',
                                '/f1tenth_ws/src/trajectory_following_ros2/data/model')  # don't use absolute paths
 
+
+        # get parameter values
+        self.robot_frame = self.get_parameter('robot_frame').value
+        self.global_frame = self.get_parameter('global_frame').value
         self.control_rate = self.get_parameter('control_rate').value
         self.distance_tolerance = self.get_parameter('distance_tolerance').value
         self.speed_tolerance = self.get_parameter('speed_tolerance').value
@@ -171,6 +215,7 @@ class KinematicCoupledAcadosMPCNode(Node):
             self.Qf = np.diag(self.get_parameter('Qf').value)
         else:
             self.Qf = self.Q
+        self.scale_cost = self.get_parameter('scale_cost').value
         self.horizon = int(self.get_parameter('horizon').value)
         self.prediction_time = self.get_parameter('prediction_time').value
 
@@ -242,6 +287,33 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.state_frame_id = ''  # the frame ID of the pose state received. odom, map
 
+        self.path = None
+        self.des_yaw_list = None
+        self.speeds = None
+
+        # setup waypoint variables. todo: make mpc not need the path to be initialized
+        self.reference_path = None  # todo: remove
+        self.current_idx = 0
+        self.final_idx = None
+        self.final_goal = None
+        self.final_goal_reached = False
+        self.stop_flag = False
+
+        # Initialize MPC
+        self.mpc_reference_states = np.zeros((self.horizon + 1, self.NX))
+        self.mpc_reference_inputs = np.zeros((self.horizon, self.NU))
+        self.mpc_predicted_states = np.zeros((self.horizon + 1, self.NX))
+        self.mpc_predicted_inputs = np.zeros((self.horizon, self.NU))
+        self.solution_time = 0.0
+        self.solver_iteration_count = 0
+        self.run_count = 0
+        self.solution_status = False
+
+        self.constraint = None
+        self.model = None
+        self.controller = None
+        self.ocp = None
+
         latching_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         # Setup subscribers
         self.path_sub = self.create_subscription(
@@ -289,34 +361,8 @@ class KinematicCoupledAcadosMPCNode(Node):
 
         # setup mpc timer. todo: either publish debug topics in a separate node or use Reentrant MultiThreadedExecutor
         self.mpc_timer = self.create_timer(self.sample_time, self.mpc_callback)
-        self.debug_timer = self.create_timer(1.0, self.publish_debug_topics)  # todo: test publishing within the main function
-
-        self.path = None
-        self.des_yaw_list = None
-        self.speeds = None
-
-        # setup waypoint variables. todo: make mpc not need the path to be initialized
-        self.reference_path = None  # todo: remove
-        self.current_idx = 0
-        self.final_idx = None
-        self.final_goal = None
-        self.final_goal_reached = False
-        self.stop_flag = False
-
-        # Initialize MPC
-        self.mpc_reference_states = np.zeros((self.horizon + 1, self.NX))
-        self.mpc_reference_inputs = np.zeros((self.horizon, self.NU))
-        self.mpc_predicted_states = np.zeros((self.horizon + 1, self.NX))
-        self.mpc_predicted_inputs = np.zeros((self.horizon, self.NU))
-        self.solution_time = 0.0
-        self.solver_iteration_count = 0
-        self.run_count = 0
-        self.solution_status = False
-
-        self.constraint = None
-        self.model = None
-        self.controller = None
-        self.ocp = None
+        self.debug_timer = self.create_timer(1.0,
+                                             self.publish_debug_topics)  # todo: test publishing within the main function
 
         self.get_logger().info('kinematic_coupled_acados_mpc_controller node started. ')
 
@@ -367,17 +413,21 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.desired_speed_received = True
 
     def initialize_mpc(self):
-        # todo: initialize during init phase as this causes the model to not be generated early when replaying rosbags
-        scale_cost = True
+        # todo: initialize during init phase as this causes the model to not be generated until path, speed and odom messages arrive
+        # todo: add weights to acados settings arguments
+        # todo: refactor acados settings
+        # todo: add wheelbase
         config_path = os.path.join(self.model_directory, "kinematic_bicycle_acados_ocp.json")
         build_path = os.path.join(self.model_directory, "c_generated_code")
         self.constraint, self.model, self.controller, self.ocp = acados_settings(Tf=self.prediction_time,
                                                                                  N=self.horizon,
-                                                                                 x0=self.zk, scale_cost=scale_cost,
+                                                                                 x0=self.zk, scale_cost=self.scale_cost,
+                                                                                 Q=self.Q, R=self.R,
+                                                                                 Qe=self.Qf, Rd=self.Rd,
+                                                                                 wheelbase=self.WHEELBASE,
                                                                                  cost_module=self.stage_cost_type,
                                                                                  cost_module_e=self.terminal_cost_type,
                                                                                  generate=True,
-                                                                                 # self.generate_mpc_model. Todo: setup file check in my class
                                                                                  build=self.generate_mpc_model,
                                                                                  with_cython=self.build_with_cython,
                                                                                  num_iterations=self.max_iter,
@@ -398,7 +448,7 @@ class KinematicCoupledAcadosMPCNode(Node):
 
             # set weights
             unscale = 1.0
-            if scale_cost:
+            if self.scale_cost:
                 unscale = self.horizon / self.prediction_time  # (Tf/horizon)
 
             if (self.Q is not None) and (self.R is not None):
@@ -597,6 +647,8 @@ class KinematicCoupledAcadosMPCNode(Node):
                 solver_dt = time.process_time() - start_time
                 if status != 0:
                     # acados_solver.print_statistics()
+                    # 0-success, 1-failure, 2-maximum number of iterations reached,
+                    # 3-minimum step sizze in QP solver reached, 4-qp solver failed
                     # todo: set a flag (verbosity) to enable/disable this
                     self.get_logger().info("acados returned status {} in"
                                            " closed loop iteration {}.".format(status, self.run_count))
@@ -704,7 +756,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         # Publish Ackermann command
         ackermann_cmd = AckermannDriveStamped()
         ackermann_cmd.header.stamp = self.get_clock().now().to_msg()
-        ackermann_cmd.header.frame_id = 'base_link'  # self.frame_id
+        ackermann_cmd.header.frame_id = self.robot_frame  # self.frame_id
         ackermann_cmd.drive.steering_angle = self.delta_cmd
         # ackermann_cmd.drive.steering_angle_velocity = 0.0
         ackermann_cmd.drive.speed = self.velocity_cmd
@@ -721,7 +773,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         # todo: also add an option to publish Twist() message and get bool parameter to select type
         twist_stamped_cmd = TwistStamped()
         twist_stamped_cmd.header.stamp = self.get_clock().now().to_msg()
-        twist_stamped_cmd.header.frame_id = 'base_link'  # self.frame_id
+        twist_stamped_cmd.header.frame_id = self.robot_frame  # self.frame_id
         twist_stamped_cmd.twist.linear.x = self.velocity_cmd
         twist_stamped_cmd.twist.linear.y = lateral_velocity
         twist_stamped_cmd.twist.angular.z = (self.velocity_cmd / self.WHEELBASE) * math.tan(self.delta_cmd)
@@ -731,7 +783,6 @@ class KinematicCoupledAcadosMPCNode(Node):
         """
         Publish markers and path.
         Todo: check if mpc is initialized first
-        Todo: dont hardcode frame ids
         Todo: publish car path travelled as a Path message
         Todo: speedup or use thread locks to copy
         """
@@ -739,19 +790,19 @@ class KinematicCoupledAcadosMPCNode(Node):
             return
 
         timestamp = self.get_clock().now().to_msg()
-        frame_id = 'base_link'
+        frame_id = self.robot_frame
 
         # publish the position of the current goal point
         point_msg = PointStamped()
         point_msg.header.stamp = timestamp
-        point_msg.header.frame_id = 'odom'
+        point_msg.header.frame_id = self.global_frame
         point_msg.point.x, point_msg.point.y = self.target_point[0:2]
         self.mpc_goal_pub.publish(point_msg)
 
         # Publish a few points in the path left
         path_msg = Path()
         path_msg.header.stamp = timestamp
-        path_msg.header.frame_id = "odom"
+        path_msg.header.frame_id = self.global_frame
 
         # todo: remove
         start_idx = self.current_idx
@@ -760,7 +811,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         for index in range(start_idx, end_idx):
             waypoint_pose = PoseStamped()
             waypoint_pose.header.stamp = timestamp
-            waypoint_pose.header.frame_id = 'odom'
+            waypoint_pose.header.frame_id = self.global_frame
             waypoint_pose.pose.position.x, waypoint_pose.pose.position.y = self.path[index, :]
             waypoint_pose.pose.orientation.z = self.des_yaw_list[index]
             path_msg.poses.append(waypoint_pose)
@@ -769,13 +820,13 @@ class KinematicCoupledAcadosMPCNode(Node):
         # Publish the points MPC is considering, i.e state reference
         path_msg = Path()
         path_msg.header.stamp = timestamp
-        path_msg.header.frame_id = "odom"
+        path_msg.header.frame_id = self.global_frame
 
         for k in range(self.xref.shape[0]):
             # todo: publish velocity or publish as odometry instead
             reference_pose = PoseStamped()
             reference_pose.header.stamp = timestamp
-            reference_pose.header.frame_id = 'odom'
+            reference_pose.header.frame_id = self.global_frame
 
             reference_pose.pose.position.x, reference_pose.pose.position.y = self.xref[k, 0], self.xref[k, 1]
             # self.get_logger().info(f"x: {self.xref[0, index]}, y: {self.xref[1, index]}, yaw: {self.xref[3, index]}\n")
@@ -793,7 +844,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         for k in range(self.mpc_predicted_states.shape[0]):
             predicted_pose = PoseStamped()
             predicted_pose.header.stamp = timestamp
-            predicted_pose.header.frame_id = 'odom'
+            predicted_pose.header.frame_id = self.global_frame
             predicted_pose.pose.position.x = self.mpc_predicted_states[k, 0]
             predicted_pose.pose.position.y = self.mpc_predicted_states[k, 1]
 

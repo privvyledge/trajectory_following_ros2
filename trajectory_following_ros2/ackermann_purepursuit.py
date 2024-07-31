@@ -17,9 +17,11 @@ PP Pipeline:
     Publish steering
 
 Todo:
-    Use path message instead of loading from CSV
+    Use path message instead of loading from CSV [done]
+    Add derivative in PI controller [done]
+    Switch to Purepursuit class
+    Switch to PID class
     Add a flag for stamped or unstamped message
-    Add derivative in PI controller
     Make speed command optional
     Move PID speed controller to separate node
     Add adaptive lookahead
@@ -45,6 +47,9 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy
+from rclpy.qos import DurabilityPolicy
+from rclpy.qos import HistoryPolicy
 
 # TF
 from tf2_ros import TransformException, LookupException
@@ -56,7 +61,7 @@ import tf2_geometry_msgs
 # messages
 from rcl_interfaces.msg import ParameterDescriptor
 from visualization_msgs.msg import Marker, MarkerArray
-from std_msgs.msg import Float32, Float64
+from std_msgs.msg import Float32, Float64, Float32MultiArray
 from geometry_msgs.msg import Point, Pose, PoseStamped, PoseArray, Quaternion, PolygonStamped, Polygon, Point32, \
     PoseWithCovarianceStamped, PointStamped, TransformStamped, TwistStamped, AccelWithCovarianceStamped
 from nav_msgs.msg import Odometry, Path
@@ -70,9 +75,43 @@ class PurePursuitNode(Node):
         """Constructor for PurePursuitNode"""
         super(PurePursuitNode, self).__init__('purepursuit')
         # declare parameters
-        self.declare_parameter('file_path', "/f1tenth_ws/data/test_waypoints.csv")
-        self.declare_parameter('path_source', 'file')  # from csv file (file) or ros path message (path)
-        self.declare_parameter('csv_columns', (0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14))  # what columns to load if loading from a CSV file
+        # todo: transform from/to the global and robot frames
+        self.declare_parameter('robot_frame', 'base_link',
+                               ParameterDescriptor(description='The frame attached to the car. '
+                                                               'The relative/local frame. '
+                                                               'Usually the ground projection of the center '
+                                                               'of the rear axle of a car or the center of gravity '
+                                                               'of a differential robot. '
+                                                               'Actuation commands, speed and acceleration are '
+                                                               'relative to this frame.'
+                                                               'E.g base_link, base_footprint, '
+                                                               'ego_vehicle (Carla). '
+                                                               'Obstacle positions could be specified '
+                                                               'relative to this frame or the global frame.'))
+        self.declare_parameter('global_frame', 'odom',
+                               ParameterDescriptor(description='The global/world/map frame. '
+                                                               'This frame is static and ideally its origin should '
+                                                               'not change during the lifetime of motion. '
+                                                               'Position errors are usually calculated relative '
+                                                               'to this frame, e.g X, Y, Psi '
+                                                               'for MPC, purepursuit, etc. '
+                                                               'Target/goal positions are also specified here.'
+                                                               'Usually the ground projection of the center '
+                                                               'of the rear axle of a car or the center of gravity '
+                                                               'of a differential robot. '
+                                                               'Obstacle positions could be specified '
+                                                               'relative to this frame or the robots frame.'
+                                                               'E.g odom, map. '
+                                                               'ROS2 Nav2 local costmaps are usually '
+                                                               'in this frame, i.e "odom", '
+                                                               'odometry messages are also in the "odom" frame '
+                                                               'whereas waypoints and goal poses are usually '
+                                                               'specified in the "map" or "gnss" frame so it makes '
+                                                               'sense to transform the goal points (waypoints) to the '
+                                                               '"odom" frame. '
+                                                               'Since Carla does not use the odom frame, '
+                                                               'set to "map", '
+                                                               'otherwise use "odom".'))  # global frame: odom, map
         self.declare_parameter('control_rate', 20.0)
         self.declare_parameter('goal_tolerance', 0.5)
         self.declare_parameter('lookahead_distance', 0.4)  # (0.4) [m] lookahead distance
@@ -85,22 +124,24 @@ class PurePursuitNode(Node):
         self.declare_parameter('min_steer', -23.0,
                                ParameterDescriptor(description='The minimum lateral command (steering) to apply.'))  # in degrees
         self.declare_parameter('max_steer', 23.0)  # in degrees
+        self.declare_parameter('path_topic', '/trajectory/path')
+        self.declare_parameter('speed_topic', '/trajectory/speed')
         self.declare_parameter('odom_topic', '/vehicle/odometry/filtered')
         self.declare_parameter('acceleration_topic', '/vehicle/accel/filtered')
         self.declare_parameter('ackermann_cmd_topic', '/drive')
+        self.declare_parameter('publish_twist_topic', True)
+        self.declare_parameter('twist_topic', '/cmd_vel')
 
         '''Speed stuff'''
         self.declare_parameter('max_speed', 1.0)
         self.declare_parameter('speed_Kp', 1.0)
         self.declare_parameter('speed_Ki', 0.1)
         self.declare_parameter('speed_Kd', 0.0)
-        self.declare_parameter('desired_speed', 0.7)
+        self.declare_parameter('desired_speed', 0.0)
 
-        # get parameters
-        self.file_path = self.get_parameter('file_path').value
-        self.path_source = self.get_parameter('path_source').value
-        self.csv_columns = self.get_parameter('csv_columns').value
-
+        # get parameter values
+        self.robot_frame = self.get_parameter('robot_frame').value
+        self.global_frame = self.get_parameter('global_frame').value
         self.control_rate = self.get_parameter('control_rate').value
         self.goal_tolerance = self.get_parameter('goal_tolerance').value
         self.desired_lookahead = self.get_parameter('lookahead_distance').value
@@ -117,10 +158,13 @@ class PurePursuitNode(Node):
         self.use_adaptive_lookahead = self.get_parameter('use_adaptive_lookahead').value
         self.lookahead_gain = self.get_parameter('max_lookahead').value  # look forward gain
 
+        self.path_topic = self.get_parameter('path_topic').value
+        self.speed_topic = self.get_parameter('speed_topic').value
         self.odom_topic = self.get_parameter('odom_topic').value
         self.acceleration_topic = self.get_parameter('acceleration_topic').value
         self.ackermann_cmd_topic = self.get_parameter('ackermann_cmd_topic').value
-
+        self.publish_twist_topic = self.get_parameter('publish_twist_topic').value
+        self.twist_topic = self.get_parameter('twist_topic').value
 
         if not self.use_adaptive_lookahead:
             self.lookahead_gain = 0.0
@@ -140,10 +184,13 @@ class PurePursuitNode(Node):
         # State of the vehicle.
         self.initial_pose_received = False
         self.initial_accel_received = False
+        self.path_received = False
+        self.desired_speed_received = False
         self.x = 0.0
         self.y = 0.0
         self.yaw = 0.0
         self.speed = 0.0
+        self.direction = 1.0
         self.yaw_rate = 0.0
         self.acceleration = 0.0
         self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))
@@ -154,27 +201,38 @@ class PurePursuitNode(Node):
         self.desired_steering_angle = 0.0
         self.desired_yaw_rate = 0.0
 
-        # Get waypoints
-        if self.path_source == 'file':
-            # todo: rename self.waypoints to self.path
-            self.frame_id_list, self.waypoints, self.des_yaw_list, self.speeds = self.get_waypoints_from_csv(
-                    self.file_path, columns=self.csv_columns)
-            self.dist_arr = np.zeros(len(self.waypoints))
-
         # setup waypoint variables
         self.stop_flag = False
-        self.last_idx = None  # self.waypoints.shape[0] - 1
-        self.final_idx = len(self.waypoints) - 1
-        self.final_goal = self.waypoints[-1, :]
-        self.desired_speed = self.target_speed = self.get_parameter('desired_speed').value  # self.speeds[self.target_ind] todo: get from speeds above or some other message
-        self.goal = self.target_point = [0., 0.]
+        self.desired_speed = self.target_speed = self.get_parameter(
+            'desired_speed').value  # self.speeds[self.target_ind] todo: get from speeds above or some other message
+        self.final_idx = None
+        self.final_goal = None
+        self.target_ind = 0  # current_idx. 0 or None
+        self.goal = None  #  self.target_point
+        self.dist_arr = None
 
         # Setup transformations to transform pose from one frame to another
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.state_frame_id = ''  # the frame ID of the pose state received. odom, map
+        self.state_frame_id = ''  # the frame ID of the pose state received. odom, map. todo: transform <-> self.global frame
 
+        self.waypoints = None
+        self.des_yaw_list = None
+        self.speeds = None
+        self.reference_path = None  # todo: remove
+
+        latching_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         # Setup subscribers
+        self.path_sub = self.create_subscription(
+                Path,
+                self.path_topic,
+                self.path_callback,
+                qos_profile=latching_qos)  # to get the desired/reference states of the robot
+        self.speed_sub = self.create_subscription(
+                Float32MultiArray,
+                self.speed_topic,
+                self.desired_speed_callback,
+                qos_profile=latching_qos)  # to get the desired/reference states of the robot
         self.odom_sub = self.create_subscription(
                 Odometry,
                 self.odom_topic,
@@ -196,6 +254,8 @@ class PurePursuitNode(Node):
         self.steer_pub = self.create_publisher(Float32, '/purepursuit/des_steer', 1)
         self.speed_pub = self.create_publisher(Float32, '/purepursuit/des_speed', 1)
         self.yaw_rate_pub = self.create_publisher(Float32, '/purepursuit/des_yaw_rate', 1)
+        if self.publish_twist_topic:
+            self.twist_cmd_pub = self.create_publisher(TwistStamped, self.twist_topic, 1)
 
         self.purepursuit_goal_pub = self.create_publisher(PointStamped, '/purepursuit/goal_point', 1)
         self.purepursuit_lookahead_pub = self.create_publisher(PointStamped, '/purepursuit/lookahead_point', 1)
@@ -207,12 +267,59 @@ class PurePursuitNode(Node):
 
         # setup purepursuit timer
         self.purepursuit_timer = self.create_timer(self.sample_time, self.purepursuit_callback)
-        self.debug_timer = self.create_timer(self.sample_time, self.publish_debug_topics)
+        self.debug_timer = self.create_timer(0.5, self.publish_debug_topics)
 
         self.get_logger().info('purepursuit node started. ')
 
-        if self.initial_pose_received:
-            self.get_target_point()
+        # if self.initial_pose_received:
+        #     self.get_target_point()
+
+    def path_callback(self, data):
+        path_frame_id = data.header.frame_id
+        path_time = data.header.stamp
+
+        frame_id_list = []
+        coordinate_list = []
+        yaw_list = []
+        for pose_msg in data.poses:
+            node_time = pose_msg.header.stamp
+            node_frame_id = pose_msg.header.frame_id
+            frame_id_list.append(node_frame_id)
+
+            node_position = pose_msg.pose.position
+            node_x = node_position.x
+            node_y = node_position.y
+            node_z = node_position.z
+            coordinate_list.append([node_x, node_y])
+
+            node_orientation_quaternion = pose_msg.pose.orientation
+            node_qx = node_orientation_quaternion.x
+            node_qy = node_orientation_quaternion.y
+            node_qz = node_orientation_quaternion.z
+            node_qw = node_orientation_quaternion.w
+
+            _, _, node_yaw = tf_transformations.euler_from_quaternion([node_qx, node_qy, node_qz, node_qw])
+            yaw_list.append(node_yaw)
+
+        self.waypoints = np.array(coordinate_list)
+        self.des_yaw_list = np.array(yaw_list)
+        self.frame_id_list = frame_id_list
+        self.path_received = True
+        self.final_idx = self.waypoints.shape[0] - 1
+        self.final_goal = self.waypoints[self.final_idx, :]  # self.waypoints[-1, :]
+
+        self.goal = self.waypoints[self.target_ind, :]  #  self.target_point
+        self.dist_arr = np.zeros(len(self.waypoints))  # array of distances used to check closes path
+        if self.desired_speed_received:
+            self.reference_path = np.array(
+                    [self.waypoints[:, 0], self.waypoints[:, 1], self.speeds, self.des_yaw_list]).T  # todo: remove
+
+    def desired_speed_callback(self, data):
+        speed_list = []
+        for speed in data.data:
+            speed_list.append(speed)
+        self.speeds = np.array(speed_list)
+        self.desired_speed_received = True
 
     def get_distance(self, location, waypoint):
         """
@@ -244,12 +351,13 @@ class PurePursuitNode(Node):
         return angle
 
     def odom_callback(self, data):
-        self.initial_pose_received = True
         self.state_frame_id = data.header.frame_id
+        # todo: transform to the desired global frame. self.global_frame
+
         # msg_time = data.header.stamp
         # time_delta = self.get_clock().now() - rclpy.time.Time.from_msg(msg_time)
         # delta_in_seconds = time_delta.nanoseconds
-        #print(f"Odom callback time delta: {delta_in_seconds}")
+        #self.get_logger().info(f"Odom callback time delta: {delta_in_seconds}")
         pose = data.pose.pose
         twist = data.twist.twist
 
@@ -271,8 +379,16 @@ class PurePursuitNode(Node):
         self.vz = twist.linear.z
         self.omega = twist.angular.z
 
-        #self.speed = np.linalg.norm([self.vx, self.vy, self.vz])  # todo: multiply by direction
-        self.speed = twist.linear.x
+        try:
+            self.direction = self.vx / abs(self.vx)
+        except ZeroDivisionError:
+            self.direction = 1.0
+
+        # self.speed = self.direction * np.linalg.norm([self.vx, self.vy, self.vz])
+        self.speed = self.vx
+
+        if not self.initial_pose_received:
+            self.initial_pose_received = True
 
     def acceleration_callback(self, data):
         self.initial_accel_received = True
@@ -290,22 +406,33 @@ class PurePursuitNode(Node):
         self.acceleration = longitudinal_acc
 
     def purepursuit_callback(self):
-        self.get_target_point()
-        self.stop_flag = self.stop(self.target_ind, self.final_idx, self.location, self.final_goal, self.goal_tolerance)
-        if self.initial_pose_received and not self.stop_flag:
-            self.get_desired_steering_angle()
-            # self.speed_error = self.desired_speed - self.speed
-            #print(f"Speed (before) error: {self.speed_error}, desired: {self.desired_speed}, actual: {self.speed}")
-            target_speed = self.speeds[self.last_idx]
-            target_speed = (target_speed / abs(target_speed)) * self.desired_speed  # todo: catch ZeroDivisionError
-            speed_cmd = self.set_speed(target_speed, self.speed)  #self.set_speed(self.desired_speed, self.speed)
-            #print(f"Speed (after) error: {self.speed_error}, desired: {self.desired_speed}, actual: {self.speed}")
-            #print(f"Desired steering angle: {self.desired_steering_angle}")
-            if not (self.MAX_SPEED >= speed_cmd >= -self.MAX_SPEED):
-                print(f"Desired speed of {speed_cmd} is higher than limit set. Saturating...")
-            speed_cmd = np.clip(speed_cmd, -self.MAX_SPEED, self.MAX_SPEED)
-            print(f"Sending speed cmd of {speed_cmd}")
-            self.publish_command(self.desired_steering_angle, speed_cmd)
+        if self.initial_pose_received and self.path_received:
+            self.get_target_point()
+            self.stop_flag = self.stop(self.target_ind, self.final_idx, self.location, self.final_goal, self.goal_tolerance)
+            if not self.stop_flag:
+                self.get_desired_steering_angle()
+                # self.speed_error = self.desired_speed - self.speed
+                #self.get_logger().info(f"Speed (before) error: {self.speed_error}, desired: {self.desired_speed}, actual: {self.speed}")
+                target_speed = 0.0
+                if self.desired_speed_received and self.desired_speed == 0.0:
+                    # get the speed from the CSV/topic
+                    target_speed = self.speeds[self.target_ind]
+                else:
+                    # overwrite the speed from the CSV file or topic with the desired speed
+                    target_speed = self.desired_speed  # todo: add direction from velocity profile
+
+                speed_cmd = target_speed
+                if abs(self.speed_Kp) > 0.0:
+                    #speed_cmd = self.set_speed(target_speed, self.speed)  # todo: test speed PID
+                    pass
+
+                #self.get_logger().info(f"Speed (after) error: {self.speed_error}, desired: {self.desired_speed}, actual: {self.speed}")
+                #self.get_logger().info(f"Desired steering angle: {self.desired_steering_angle}")
+                if not (self.MAX_SPEED >= speed_cmd >= -self.MAX_SPEED):
+                    self.get_logger().info(f"Desired speed of {speed_cmd} is higher than limit set. Saturating...")
+                speed_cmd = np.clip(speed_cmd, -self.MAX_SPEED, self.MAX_SPEED)
+                # self.get_logger().info(f"Sending cmd speed: {speed_cmd}, steering: {self.desired_steering_angle}, idx: {self.target_ind}")
+                self.publish_command(self.desired_steering_angle, speed_cmd)
 
     def get_desired_steering_angle(self):
         """
@@ -316,12 +443,12 @@ class PurePursuitNode(Node):
         # v1 = target_point - [self.x, self.y]
         # v2 = [np.cos(self.yaw), np.sin(self.yaw)]
         # alpha = find_angle(v1, v2)
-        self.alpha = math.atan2(self.target_point[1] - self.y, self.target_point[0] - self.x) - self.yaw
+        self.alpha = math.atan2(self.goal[1] - self.y, self.goal[0] - self.x) - self.yaw
 
         ''' (Optional) Get cross-track error: 
         the lateral distance between the heading vector and the goal point in body frame'''
         crosstrack_error = math.sin(self.alpha) * self.lookahead
-        # crosstrack_error = self.target_point[1] - self.y  # todo: calculate in body frame
+        # crosstrack_error = self.goal[1] - self.y  # todo: calculate in body frame
 
         '''(Optional) Calculate turn radius, r = 1 / curvature'''
         turn_radius = self.lookahead ** 2 / (2 * abs(crosstrack_error))
@@ -339,7 +466,7 @@ class PurePursuitNode(Node):
         # desired_steering_angle = math.atan2(2.0 * abs(crosstrack_error), self.lookahead ** 2)  # Might be wrong
 
         if not (self.MAX_STEER_ANGLE >= desired_steering_angle >= self.MIN_STEER_ANGLE):
-            print(f"Desired steering of {desired_steering_angle} is higher than limit set. Saturating...")
+            self.get_logger().info(f"Desired steering of {desired_steering_angle} is higher than limit set. Saturating...")
 
         self.desired_steering_angle = np.clip(desired_steering_angle, self.MIN_STEER_ANGLE, self.MAX_STEER_ANGLE)
 
@@ -353,13 +480,13 @@ class PurePursuitNode(Node):
         :param acceleration: float, acceleration
         :param steering_angle: float, heading control.
 
-        Todo: either use this or from Odom callback maybe by checking the time of the last odom message.
+        Todo: either use this or from Odom callback maybe by checking the time of the last odom message. Should be used for prediction
         """
-        self.x += self.speed * math.cos(self.yaw) * self.dt
-        self.y += self.speed * math.sin(self.yaw) * self.dt
-        self.yaw += self.speed * math.tan(steering_angle) / self.WHEELBASE * self.dt
-        self.speed += acceleration * self.dt
-        # if x, and y are relative to CoG
+        #self.x += self.speed * math.cos(self.yaw) * self.dt
+        #self.y += self.speed * math.sin(self.yaw) * self.dt
+        #self.yaw += self.speed * math.tan(steering_angle) / self.WHEELBASE * self.dt
+        #self.speed += acceleration * self.dt
+        ## if x, and y are relative to CoG
         self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))
         self.rear_y = self.y - ((self.WHEELBASE / 2) * math.sin(self.yaw))
         self.location = [self.x, self.y]
@@ -367,8 +494,8 @@ class PurePursuitNode(Node):
         # Publish vehicle kinematic state
         odom = Odometry()
         odom.header.stamp = self.get_clock().now().to_msg()
-        odom.header.frame_id = 'odom'
-        odom.child_frame_id = 'base_link'
+        odom.header.frame_id = self.global_frame
+        odom.child_frame_id = self.robot_frame
         odom.pose.pose.position.x = self.x
         odom.pose.pose.position.y = self.y
 
@@ -405,22 +532,23 @@ class PurePursuitNode(Node):
         self.update_states(acceleration=self.acceleration, steering_angle=self.desired_steering_angle)
 
         # To speed up nearest point search, doing it at only first time.
-        if (self.last_idx is None) and self.speedup_first_lookup:
+        if (self.target_ind == 0) and self.speedup_first_lookup:
             distances = self.get_distance(self.location, self.waypoints)
-            self.last_idx = np.argmin(distances)
+            self.target_ind = np.argmin(distances)
+            self.speedup_first_lookup = False  # so this condition does not repeat
         else:
             self.dist_arr = self.get_distance(self.location, self.waypoints)
             # Use points greater than lookahead as heuristics
             goal_candidates = np.where((self.dist_arr > self.lookahead))[0]
             if len(goal_candidates) > 0:
-                indices_greater_than_last = np.where(goal_candidates >= self.last_idx)[0]
+                indices_greater_than_last = np.where(goal_candidates >= self.target_ind)[0]
 
                 if len(indices_greater_than_last) > 0:
                     goal_candidates = goal_candidates[indices_greater_than_last]
-                    self.last_idx = np.min(goal_candidates)
+                    self.target_ind = np.min(goal_candidates)
 
-        self.target_ind = self.last_idx
-        self.target_point = self.get_point(self.target_ind)
+        self.goal = self.get_point(self.target_ind)
+        #self.get_logger().info(f"Get target point callback... Target_ind: {self.target_ind}, goal point: {self.goal}")
 
     def get_point(self, index):
         point = self.waypoints[index]
@@ -431,27 +559,29 @@ class PurePursuitNode(Node):
         distance = self.get_distance(current_location, final_waypoint)
         if current_idx >= final_idx and distance <= tolerance:
             stop = True
-            print("Stop conditions met.")
+            self.get_logger().info("Stop conditions met.")
         return stop
 
     def set_speed(self, target, measurement):
-        # todo: tune PID gains
         # use PID here
         self.speed_error = target - measurement
 
         self.speed_Pterm = self.speed_Kp * self.speed_error
         self.speed_Iterm += self.speed_error * self.speed_Ki * self.dt
+        # todo: clip integral to avoid integral windup
 
         if self.speed_last_error is not None:
-            self.speed_Dterm = (self.speed_error - self.speed_last_error)/self.dt*self.speed_Kd
+            self.speed_Dterm = self.speed_Kd * (self.speed_error - self.speed_last_error) / self.dt
 
         self.speed_last_error = self.speed_error
 
-        #speed_cmd = self.speed_Pterm + self.speed_Iterm + self.speed_Dterm
-        #speed_cmd = self.target_speed
-        speed_cmd = target
-        #  speed_cmd = self.speeds[self.target_ind]
-        #print(f"Desired speed: {target}, current_speed: {measurement}, speed cmd: {speed_cmd}, Speed error: {self.speed_error}, P term: {self.speed_Pterm}, I term: {self.speed_Iterm}, D term: {self.speed_Dterm}")
+        speed_cmd = self.speed_Pterm + self.speed_Iterm + self.speed_Dterm
+        # todo: clip total and add ramping
+        # self.get_logger().info(f"Desired speed: {target}, "
+        #                        f"current_speed: {measurement}, "
+        #                        f"speed cmd: {speed_cmd}, "
+        #                        f"Speed error: {self.speed_error}, "
+        #                        f"P term: {self.speed_Pterm}, I term: {self.speed_Iterm}, D term: {self.speed_Dterm}")
 
         return speed_cmd
 
@@ -459,7 +589,7 @@ class PurePursuitNode(Node):
         # Publish Ackermann command
         ackermann_cmd = AckermannDriveStamped()
         ackermann_cmd.header.stamp = self.get_clock().now().to_msg()
-        ackermann_cmd.header.frame_id = 'base_link'  # self.frame_id
+        ackermann_cmd.header.frame_id = self.robot_frame  # self.frame_id
         ackermann_cmd.drive.steering_angle = steering_angle
         ackermann_cmd.drive.speed = longitudinal_velocity
         self.ackermann_cmd_pub.publish(ackermann_cmd)
@@ -470,60 +600,58 @@ class PurePursuitNode(Node):
         self.speed_pub.publish(Float32(data=float(longitudinal_velocity)))
         self.yaw_rate_pub.publish(Float32(data=float(self.yaw_rate)))
 
+    def publish_twist(self, lateral_velocity=0.0):
+        # # todo: also add an option to publish Twist() message and get bool parameter to select type
+        # twist_stamped_cmd = TwistStamped()
+        # twist_stamped_cmd.header.stamp = self.get_clock().now().to_msg()
+        # twist_stamped_cmd.header.frame_id = self.robot_frame  # self.frame_id
+        # twist_stamped_cmd.twist.linear.x = self.velocity_cmd
+        # twist_stamped_cmd.twist.linear.y = lateral_velocity
+        # twist_stamped_cmd.twist.angular.z = (self.velocity_cmd / self.WHEELBASE) * math.tan(self.delta_cmd)
+        # self.twist_cmd_pub.publish(twist_stamped_cmd)
+        return
+
     def publish_debug_topics(self):
         """
         Publish markers and path.
         Todo: could transform poses into other frames
         """
         timestamp = self.get_clock().now().to_msg()
-        frame_id = 'base_link'
+        frame_id = self.robot_frame
 
-        # publish the position of the current lookahead
-        point_msg = PointStamped()
-        point_msg.header.stamp = timestamp
-        point_msg.header.frame_id = 'base_link'
-        point_msg.point.x = self.lookahead
-        self.purepursuit_lookahead_pub.publish(point_msg)
+        if self.initial_pose_received and self.path_received:
+            # publish the position of the current lookahead.
+            # todo: either publish this directly to the robots frame, i.e base link or add to the robots global pose and publish in the global frame.
+            point_msg = PointStamped()
+            point_msg.header.stamp = timestamp
+            point_msg.header.frame_id = self.robot_frame  # self.robot_frame or self.global_frame. Todo: publishing to global frame does not account for orientation, transform first, else use base_link
+            point_msg.point.x = self.x  # self.lookahead, self.lookahead + self.x
+            point_msg.point.y = self.y  # 0.0 or self.y
+            self.purepursuit_lookahead_pub.publish(point_msg)
 
-        # publish the position of the current goal point
-        point_msg = PointStamped()
-        point_msg.header.stamp = timestamp
-        point_msg.header.frame_id = 'odom'
-        point_msg.point.x, point_msg.point.y = self.target_point
-        self.purepursuit_goal_pub.publish(point_msg)
+            # publish the position of the current goal point
+            point_msg = PointStamped()
+            point_msg.header.stamp = timestamp
+            point_msg.header.frame_id = self.global_frame
+            point_msg.point.x, point_msg.point.y = self.goal
+            self.purepursuit_goal_pub.publish(point_msg)
 
-        # Publish a few points in the path left
-        path_msg = Path()
-        path_msg.header.stamp = timestamp
-        path_msg.header.frame_id = "odom"
+            # Publish a few points in the path left
+            path_msg = Path()
+            path_msg.header.stamp = timestamp
+            path_msg.header.frame_id = self.global_frame
 
-        start_idx = self.last_idx
-        end_idx = self.last_idx + 30
-        end_idx = min(end_idx, len(self.waypoints))
-        for index in range(start_idx, end_idx):
-            waypoint_pose = PoseStamped()
-            waypoint_pose.header.stamp = timestamp
-            waypoint_pose.header.frame_id = 'odom'
-            waypoint_pose.pose.position.x, waypoint_pose.pose.position.y = self.waypoints[index, :]
-            waypoint_pose.pose.orientation.z = self.des_yaw_list[index]
-            path_msg.poses.append(waypoint_pose)
-        self.purepursuit_path_pub.publish(path_msg)
-
-    def get_waypoints_from_csv(self, path_to_csv, columns=None):
-        """
-        frame_id, timestamp, x, y, z, yaw angle, qx, qy, qz, qw, vx, vy, speed, omega
-        frame_id_list, self.waypoints, des_yaw_list, speed
-        """
-
-        # to import as a struct with column indexing
-        csv_array = np.genfromtxt(path_to_csv, delimiter=',', skip_header=1, usecols=columns, dtype=float)[35:468, :]
-        # csv_struct = np.genfromtxt(path_to_csv, delimiter=',', names=True, usecols=columns, dtype=float)
-
-        frame_ids = ['odom'] * len(csv_array)  # todo: get from CSV or don't hardcode
-        waypoints_array = csv_array[:, 3:5]
-        des_yaw_list = csv_array[:, 6]
-        des_speed_list = csv_array[:, 11]
-        return frame_ids, waypoints_array, des_yaw_list, des_speed_list
+            start_idx = self.target_ind
+            end_idx = self.target_ind + 30
+            end_idx = min(end_idx, len(self.waypoints))
+            for index in range(start_idx, end_idx):
+                waypoint_pose = PoseStamped()
+                waypoint_pose.header.stamp = timestamp
+                waypoint_pose.header.frame_id = self.global_frame
+                waypoint_pose.pose.position.x, waypoint_pose.pose.position.y = self.waypoints[index, :]
+                waypoint_pose.pose.orientation.z = self.des_yaw_list[index]
+                path_msg.poses.append(waypoint_pose)
+            self.purepursuit_path_pub.publish(path_msg)
 
 
 def main(args=None):

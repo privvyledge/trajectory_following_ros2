@@ -2,6 +2,7 @@
 Path and trajectory following kinematic model.
 
 Todo:
+    * publish odom transform
     * don't hardcode model into do-mpc, instead use vectors
     * setup do-mpc to return the mpc object only.
     * setup do-mpc update
@@ -54,7 +55,7 @@ class KinematicAcadosMPCSimulationNode(Node):
         super(KinematicAcadosMPCSimulationNode, self).__init__('kinematic_acados_simulator')
         # declare parameters
         self.declare_parameter('model_type', "continuous")  # todo: also augmented, etc
-        self.declare_parameter('csv_columns', (0, 2, 3, 5, 10))  # what columns to load if loading from a CSV file
+        # self.declare_parameter('csv_columns', (0, 2, 3, 5, 10))  # what columns to load if loading from a CSV file
         self.declare_parameter('update_rate', 50.0)
         self.declare_parameter('wheelbase', 0.256)
         self.declare_parameter('min_steer', -30.0,
@@ -77,6 +78,14 @@ class KinematicAcadosMPCSimulationNode(Node):
         self.declare_parameter('acceleration_topic', '/vehicle/accel/filtered')
         self.declare_parameter('ackermann_cmd_topic', '/drive')
         self.declare_parameter('debug', False)  # displays solver output
+
+        # todo: could get from rviz or a topic
+        self.declare_parameter('initial_x', 0.0)
+        self.declare_parameter('initial_y', 0.0)
+        self.declare_parameter('initial_yaw', 0.0)
+        self.declare_parameter('initial_speed', 0.0)
+        self.declare_parameter('initial_yaw_rate', 0.0)
+        self.declare_parameter('initial_acceleration', 0.0)
 
         # get parameters
         self.update_rate = self.get_parameter('update_rate').value
@@ -105,24 +114,28 @@ class KinematicAcadosMPCSimulationNode(Node):
         self.msg_time_prev = 0.0  # time when image is received
         self.msg_time = 0.0
 
-        # Setup mode
-        self.acc_cmd, self.delta_cmd, self.velocity_cmd = 0.0, 0.0, 0.0
-        self.zk = np.zeros((self.NX, 1))  # x, y, psi, velocity, psi
-        self.uk = np.array([[self.acc_cmd, self.delta_cmd]]).T
-        self.u_prev = np.zeros((self.NU, 1))
-
         # State of the vehicle.
         self.initial_pose_received = False
         self.initial_accel_received = False
-        self.x = 0.0  # todo: remove
-        self.y = 0.0  # todo: remove
-        self.yaw = 0.0  # todo: remove
-        self.speed = 0.0  # todo: remove
-        self.yaw_rate = 0.0  # todo: remove
-        self.acceleration = 0.0  # todo: remove
-        self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))  # todo: remove
-        self.rear_y = self.y - ((self.WHEELBASE / 2) * math.sin(self.yaw))  # todo: remove
-        self.location = [self.x, self.y]  # todo: remove
+        self.x = self.get_parameter('initial_x').value
+        self.y = self.get_parameter('initial_y').value
+        self.yaw = self.get_parameter('initial_yaw').value
+        self.speed = self.get_parameter('initial_speed').value
+        self.yaw_rate = self.get_parameter('initial_yaw_rate').value
+        self.acceleration = self.get_parameter('initial_yaw_rate').value
+        self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))
+        self.rear_y = self.y - ((self.WHEELBASE / 2) * math.sin(self.yaw))
+        self.location = [self.x, self.y]  # or self.rear_x, self.rear_y
+
+        # Setup mode
+        self.acc_cmd, self.delta_cmd, self.velocity_cmd = 0.0, 0.0, 0.0
+        self.zk = np.zeros((self.NX, 1))  # x, y, psi, velocity, psi
+        self.zk[0, 0] = self.x
+        self.zk[1, 0] = self.y
+        self.zk[2, 0] = self.speed
+        self.zk[3, 0] = self.yaw
+        self.uk = np.array([[self.acc_cmd, self.delta_cmd]]).T
+        self.u_prev = np.zeros((self.NU, 1))
 
         # Setup transformations to transform pose from one frame to another
         self.tf_buffer = Buffer()
@@ -151,7 +164,7 @@ class KinematicAcadosMPCSimulationNode(Node):
         self.odom_pub = self.create_publisher(Odometry, self.odom_topic, 1)
         self.accel_pub = self.create_publisher(AccelWithCovarianceStamped, self.acceleration_topic, 1)
 
-        # setup purepursuit timer
+        # setup simulation callback timer
         self.simulation_timer = self.create_timer(self.sample_time, self.update_timer_callback)
 
         self.get_logger().info('kinematic_acados_simulator node started. ')
@@ -166,7 +179,10 @@ class KinematicAcadosMPCSimulationNode(Node):
 
         self.delta_cmd = data.drive.steering_angle
         self.velocity_cmd = data.drive.speed
-        self.acc_cmd = (self.velocity_cmd - self.speed) / self.sample_time  # i.e dv/dt todo: use an augmented ode to calculate instead
+        if data.drive.acceleration != 0.0:
+            self.acc_cmd = data.drive.acceleration
+        else:
+            self.acc_cmd = (self.velocity_cmd - self.speed) / self.sample_time  # i.e dv/dt
         self.uk[0, 0] = self.acc_cmd
         self.uk[1, 0] = self.delta_cmd
 
@@ -242,6 +258,7 @@ class KinematicAcadosMPCSimulationNode(Node):
         accel_msg.accel.accel.linear.x = self.acceleration
         accel_msg.accel.accel.angular.z = self.yaw_rate / self.sample_time
         # accel_msg.accel.covariance = [0., 0., 0., 0., 0., 0.]
+        self.accel_pub.publish(accel_msg)
 
 
 def main(args=None):

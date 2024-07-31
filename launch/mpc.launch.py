@@ -34,6 +34,8 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time')
     params_file = LaunchConfiguration('params_file')
     log_level = LaunchConfiguration('log_level')
+    robot_frame = LaunchConfiguration('robot_frame')
+    global_frame = LaunchConfiguration('global_frame')
     frequency = LaunchConfiguration('frequency')
     publish_twist_topic = LaunchConfiguration('publish_twist_topic')
     wheelbase = LaunchConfiguration('wheelbase')
@@ -61,6 +63,7 @@ def generate_launch_description():
     Rd_diagonal = LaunchConfiguration('Rd_diagonal')
     Q_diagonal = LaunchConfiguration('Q_diagonal')
     Qf_diagonal = LaunchConfiguration('Qf_diagonal')
+    scale_cost = LaunchConfiguration('scale_cost')
     max_iterations = LaunchConfiguration('max_iterations')
     termination_condition = LaunchConfiguration('termination_condition')
     stage_cost_type = LaunchConfiguration('stage_cost_type')
@@ -95,6 +98,48 @@ def generate_launch_description():
             'params_file',
             default_value=config_file_path,
             description='Path to config file for localization nodes'
+    )
+    robot_frame_la = DeclareLaunchArgument(
+            'robot_frame',
+            default_value='base_link',
+            description='The frame attached to the car. '
+                        'The relative/local frame. '
+                        'Usually the ground projection of the center '
+                        'of the rear axle of a car or the center of gravity '
+                        'of a differential robot. '
+                        'Actuation commands, speed and acceleration are '
+                        'relative to this frame.'
+                        'E.g base_link, base_footprint, '
+                        'ego_vehicle (Carla). '
+                        'Obstacle positions could be specified '
+                        'relative to this frame or the global frame.'
+    )
+    global_frame_la = DeclareLaunchArgument(
+            'global_frame',
+            default_value='odom',
+            description='The global/world/map frame. '
+                        'This frame is static and ideally its origin should '
+                        'not change during the lifetime of motion. '
+                        'Position errors are usually calculated relative '
+                        'to this frame, e.g X, Y, Psi '
+                        'for MPC, purepursuit, etc. '
+                        'Target/goal positions are also specified here.'
+                        'Usually the ground projection of the center '
+                        'of the rear axle of a car or the center of gravity '
+                        'of a differential robot. '
+                        'Obstacle positions could be specified '
+                        'relative to this frame or the robots frame.'
+                        'E.g odom, map. '
+                        'ROS2 Nav2 local costmaps are usually '
+                        'in this frame, i.e "odom", '
+                        'odometry messages are also in the "odom" frame '
+                        'whereas waypoints and goal poses are usually '
+                        'specified in the "map" or "gnss" frame so it makes '
+                        'sense to transform the goal points (waypoints) to the '
+                        '"odom" frame. '
+                        'Since Carla does not use the odom frame, '
+                        'set to "map", '
+                        'otherwise use "odom".'
     )
     frequency_la = DeclareLaunchArgument(
             'frequency',
@@ -220,6 +265,11 @@ def generate_launch_description():
             default_value='[0.04, 0.04, 0.1, 0.01]',
             description='List containing the diagonal for the Qf matrix.'
     )
+    scale_cost_la = DeclareLaunchArgument(
+            'scale_cost',
+            default_value='False',
+            description='Whether to scale the cost by (horizon / final time).'
+    )
     max_iterations_la = DeclareLaunchArgument(
             'max_iterations',
             default_value='15',
@@ -302,147 +352,160 @@ def generate_launch_description():
 
     # Create Launch Description
     ld = LaunchDescription(
-            [declare_use_sim_time_cmd, params_file_la, frequency_la, publish_twist_topic_la, wheelbase_la, ode_type_la,
+            [declare_use_sim_time_cmd, params_file_la,
+             robot_frame_la, global_frame_la,
+             frequency_la, publish_twist_topic_la, wheelbase_la, ode_type_la,
              load_waypoints_la, waypoints_csv_la,
              saturate_inputs_la, allow_reversing_la, max_speed_la, min_speed_la, max_accel_la, max_decel_la,
              max_steer_la, min_steer_la, max_steer_rate_la,
              mpc_toolbox_la, horizon_la, sample_time_la, prediction_time_la,
-             R_diagonal_la, Rd_diagonal_la, Q_diagonal_la, Qf_diagonal_la,
+             R_diagonal_la, Rd_diagonal_la, Q_diagonal_la, Qf_diagonal_la, scale_cost_la,
              max_iterations_la, termination_condition_la,
              stage_cost_type_la, terminal_cost_type_la,
              generate_mpc_model_la, build_with_cython_la, model_directory_la,
              distance_tolerance_la, speed_tolerance_la,
              declare_log_level_cmd,
-             odom_topic_la, ackermann_cmd_topic_la, twist_topic_la, acceleration_topic_la, path_topic_la, speed_topic_la]
+             odom_topic_la, ackermann_cmd_topic_la, twist_topic_la, acceleration_topic_la, path_topic_la,
+             speed_topic_la]
     )
 
     # Load Nodes
     waypoint_loader_node = Node(
-                condition=IfCondition(load_waypoints),
-                package='trajectory_following_ros2',
-                executable='waypoint_loader',
-                name='waypoint_loader_node',
-                output='screen',
-                parameters=[
-                    {'use_sim_time': use_sim_time},
-                    {'file_path': waypoints_csv},
-                    {'publish_frequency': frequency},
-                ],
-                arguments=['--ros-args', '--log-level', log_level],
-                remappings=[
-                    ('/waypoint_loader/path', path_topic),
-                    ('/waypoint_loader/speed', speed_topic),
-                ]
-        )
+            condition=IfCondition(load_waypoints),
+            package='trajectory_following_ros2',
+            executable='waypoint_loader',
+            name='waypoint_loader_node',
+            output='screen',
+            parameters=[
+                {'use_sim_time': use_sim_time},
+                {'file_path': waypoints_csv},
+                # {'global_frame': global_frame}  # todo
+            ],
+            arguments=['--ros-args', '--log-level', log_level],
+            remappings=[
+                ('/waypoint_loader/path', path_topic),
+                ('/waypoint_loader/speed', speed_topic),
+            ]
+    )
 
     # todo: use SetParameter and Group Action to avoid repeating MPC parameters.
     acados_mpc_node = Node(
-                condition=LaunchConfigurationEquals('mpc_toolbox', 'acados'),
-                package='trajectory_following_ros2',
-                executable='coupled_kinematic_acados',
-                name='acados_mpc_node',
-                output='screen',
-                parameters=[
-                    params_file,
-                    {'use_sim_time': use_sim_time},
-                    {'control_rate': frequency},
-                    {'publish_twist_topic': publish_twist_topic},
-                    {'wheelbase': wheelbase},
-                    {'ode_type': ode_type},
-                    {'max_speed': max_speed},
-                    {'min_speed': min_speed},
-                    {'max_accel': max_accel},
-                    {'max_decel': max_decel},
-                    {'max_steer': max_steer},
-                    {'min_steer': min_steer},
-                    {'max_steer_rate': max_steer_rate},
-                    {'saturate_inputs': saturate_inputs},
-                    {'allow_reversing': allow_reversing},
-                    {'horizon': horizon},
-                    {'sample_time': sample_time},
-                    {'prediction_time': prediction_time},
-                    {'R_diagonal': R_diagonal},
-                    {'Rd_diagonal': Rd_diagonal},
-                    {'Q_diagonal': Q_diagonal},
-                    {'Qf_diagonal': Qf_diagonal},
-                    {'max_iter': max_iterations},
-                    {'termination_condition': termination_condition},
-                    {'generate_mpc_model': generate_mpc_model},
-                    {'build_with_cython': build_with_cython},
-                    {'model_directory': model_directory},
-                    {'stage_cost_type': stage_cost_type},
-                    {'terminal_cost_type': terminal_cost_type},
-                    {'distance_tolerance': distance_tolerance},
-                    {'speed_tolerance': speed_tolerance},
-                    {
-                        'odom_topic': odom_topic,
-                        'ackermann_cmd_topic': ackermann_cmd_topic,
-                        'twist_topic': twist_topic,
-                        'acceleration_topic': acceleration_topic,
-                        'path_topic': path_topic,
-                        'speed_topic': speed_topic,
-                    },
-                ],
-                arguments=['--ros-args', '--log-level', log_level],
-                # remappings=[
-                #     ('/waypoint_loader/path', '/trajectory/path'),
-                #     ('/waypoint_loader/speed', '/trajectory/speed'),
-                # ]
-        )
+            condition=LaunchConfigurationEquals('mpc_toolbox', 'acados'),
+            package='trajectory_following_ros2',
+            executable='coupled_kinematic_acados',
+            name='acados_mpc_node',
+            output='screen',
+            parameters=[
+                params_file,
+                {'use_sim_time': use_sim_time},
+                {
+                    'robot_frame': robot_frame,
+                    'global_frame': global_frame,
+                },
+                {'control_rate': frequency},
+                {'publish_twist_topic': publish_twist_topic},
+                {'wheelbase': wheelbase},
+                {'ode_type': ode_type},
+                {'max_speed': max_speed},
+                {'min_speed': min_speed},
+                {'max_accel': max_accel},
+                {'max_decel': max_decel},
+                {'max_steer': max_steer},
+                {'min_steer': min_steer},
+                {'max_steer_rate': max_steer_rate},
+                {'saturate_inputs': saturate_inputs},
+                {'allow_reversing': allow_reversing},
+                {'horizon': horizon},
+                {'sample_time': sample_time},
+                {'prediction_time': prediction_time},
+                {'R_diagonal': R_diagonal},
+                {'Rd_diagonal': Rd_diagonal},
+                {'Q_diagonal': Q_diagonal},
+                {'Qf_diagonal': Qf_diagonal},
+                {'scale_cost': scale_cost},
+                {'max_iter': max_iterations},
+                {'termination_condition': termination_condition},
+                {'generate_mpc_model': generate_mpc_model},
+                {'build_with_cython': build_with_cython},
+                {'model_directory': model_directory},
+                {'stage_cost_type': stage_cost_type},
+                {'terminal_cost_type': terminal_cost_type},
+                {'distance_tolerance': distance_tolerance},
+                {'speed_tolerance': speed_tolerance},
+                {
+                    'odom_topic': odom_topic,
+                    'ackermann_cmd_topic': ackermann_cmd_topic,
+                    'twist_topic': twist_topic,
+                    'acceleration_topic': acceleration_topic,
+                    'path_topic': path_topic,
+                    'speed_topic': speed_topic,
+                },
+            ],
+            arguments=['--ros-args', '--log-level', log_level],
+            # remappings=[
+            #     ('/waypoint_loader/path', '/trajectory/path'),
+            #     ('/waypoint_loader/speed', '/trajectory/speed'),
+            # ]
+    )
 
     do_mpc_node = Node(
-                condition=LaunchConfigurationEquals('mpc_toolbox', 'do_mpc'),
-                package='trajectory_following_ros2',
-                executable='coupled_kinematic_do_mpc',
-                name='do_mpc_node',
-                output='screen',
-                parameters=[
-                    params_file,
-                    {'use_sim_time': use_sim_time},
-                    {'control_rate': frequency},
-                    {'publish_twist_topic', publish_twist_topic},
-                    {'wheelbase': wheelbase},
-                    {'ode_type': ode_type},
-                    {'max_speed': max_speed},
-                    {'min_speed': min_speed},
-                    {'max_accel': max_accel},
-                    {'max_decel': max_decel},
-                    {'max_steer': max_steer},
-                    {'min_steer': min_steer},
-                    {'max_steer_rate': max_steer_rate},
-                    {'saturate_inputs': saturate_inputs},
-                    {'allow_reversing': allow_reversing},
-                    {'horizon': horizon},
-                    {'sample_time': sample_time},
-                    {'prediction_time': prediction_time},
-                    {'R_diagonal': R_diagonal},
-                    {'Rd_diagonal': Rd_diagonal},
-                    {'Q_diagonal': Q_diagonal},
-                    {'Qf_diagonal': Qf_diagonal},
-                    {'max_iter': max_iterations},
-                    {'termination_condition': termination_condition},
-                    {'generate_mpc_model': generate_mpc_model},
-                    {'build_with_cython': build_with_cython},
-                    {'model_directory': model_directory},
-                    # {'stage_cost_type': stage_cost_type},
-                    # {'terminal_cost_type': terminal_cost_type},
-                    {'distance_tolerance': distance_tolerance},
-                    {'speed_tolerance': speed_tolerance},
-                    {
-                        'odom_topic': odom_topic,
-                        'ackermann_cmd_topic': ackermann_cmd_topic,
-                        'twist_topic': twist_topic,
-                        'acceleration_topic': acceleration_topic,
-                        'path_topic': path_topic,
-                        'speed_topic': speed_topic,
-                    },
-                ],
-                arguments=['--ros-args', '--log-level', log_level],
-                # remappings=[
-                #     ('/waypoint_loader/path', '/trajectory/path'),
-                #     ('/waypoint_loader/speed', '/trajectory/speed'),
-                # ]
-        )
+            condition=LaunchConfigurationEquals('mpc_toolbox', 'do_mpc'),
+            package='trajectory_following_ros2',
+            executable='coupled_kinematic_do_mpc',
+            name='do_mpc_node',
+            output='screen',
+            parameters=[
+                params_file,
+                {'use_sim_time': use_sim_time},
+                {
+                    'robot_frame': robot_frame,
+                    'global_frame': global_frame,
+                },
+                {'control_rate': frequency},
+                {'publish_twist_topic', publish_twist_topic},
+                {'wheelbase': wheelbase},
+                {'ode_type': ode_type},
+                {'max_speed': max_speed},
+                {'min_speed': min_speed},
+                {'max_accel': max_accel},
+                {'max_decel': max_decel},
+                {'max_steer': max_steer},
+                {'min_steer': min_steer},
+                {'max_steer_rate': max_steer_rate},
+                {'saturate_inputs': saturate_inputs},
+                {'allow_reversing': allow_reversing},
+                {'horizon': horizon},
+                {'sample_time': sample_time},
+                {'prediction_time': prediction_time},
+                {'R_diagonal': R_diagonal},
+                {'Rd_diagonal': Rd_diagonal},
+                {'Q_diagonal': Q_diagonal},
+                {'Qf_diagonal': Qf_diagonal},
+                {'scale_cost': scale_cost},
+                {'max_iter': max_iterations},
+                {'termination_condition': termination_condition},
+                {'generate_mpc_model': generate_mpc_model},
+                {'build_with_cython': build_with_cython},
+                {'model_directory': model_directory},
+                # {'stage_cost_type': stage_cost_type},
+                # {'terminal_cost_type': terminal_cost_type},
+                {'distance_tolerance': distance_tolerance},
+                {'speed_tolerance': speed_tolerance},
+                {
+                    'odom_topic': odom_topic,
+                    'ackermann_cmd_topic': ackermann_cmd_topic,
+                    'twist_topic': twist_topic,
+                    'acceleration_topic': acceleration_topic,
+                    'path_topic': path_topic,
+                    'speed_topic': speed_topic,
+                },
+            ],
+            arguments=['--ros-args', '--log-level', log_level],
+            # remappings=[
+            #     ('/waypoint_loader/path', '/trajectory/path'),
+            #     ('/waypoint_loader/speed', '/trajectory/speed'),
+            # ]
+    )
 
     casadi_mpc_node = None
 
@@ -454,7 +517,7 @@ def generate_launch_description():
                 acados_mpc_node,
                 do_mpc_node,
                 # casadi_mpc_node,
-    ])
+            ])
 
     # Add the actions to launch all of the mpc nodes
     ld.add_action(load_nodes)

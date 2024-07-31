@@ -50,7 +50,11 @@ import scipy
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.duration import Duration
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy
+from rclpy.qos import DurabilityPolicy
+from rclpy.qos import HistoryPolicy
 
 # TF
 from tf2_ros import TransformException, LookupException, ConnectivityException, ExtrapolationException
@@ -80,6 +84,43 @@ class KinematicCoupledDoMPCNode(Node):
         """Constructor for KinematicCoupledDoMPCNode"""
         super(KinematicCoupledDoMPCNode, self).__init__('kinematic_coupled_do_mpc_controller')
         # declare parameters
+        # todo: transform from/to the global and robot frames
+        self.declare_parameter('robot_frame', 'base_link',
+                               ParameterDescriptor(description='The frame attached to the car. '
+                                                               'The relative/local frame. '
+                                                               'Usually the ground projection of the center '
+                                                               'of the rear axle of a car or the center of gravity '
+                                                               'of a differential robot. '
+                                                               'Actuation commands, speed and acceleration are '
+                                                               'relative to this frame.'
+                                                               'E.g base_link, base_footprint, '
+                                                               'ego_vehicle (Carla). '
+                                                               'Obstacle positions could be specified '
+                                                               'relative to this frame or the global frame.'))
+        self.declare_parameter('global_frame', 'odom',
+                               ParameterDescriptor(description='The global/world/map frame. '
+                                                               'This frame is static and ideally its origin should '
+                                                               'not change during the lifetime of motion. '
+                                                               'Position errors are usually calculated relative '
+                                                               'to this frame, e.g X, Y, Psi '
+                                                               'for MPC, purepursuit, etc. '
+                                                               'Target/goal positions are also specified here.'
+                                                               'Usually the ground projection of the center '
+                                                               'of the rear axle of a car or the center of gravity '
+                                                               'of a differential robot. '
+                                                               'Obstacle positions could be specified '
+                                                               'relative to this frame or the robots frame.'
+                                                               'E.g odom, map. '
+                                                               'ROS2 Nav2 local costmaps are usually '
+                                                               'in this frame, i.e "odom", '
+                                                               'odometry messages are also in the "odom" frame '
+                                                               'whereas waypoints and goal poses are usually '
+                                                               'specified in the "map" or "gnss" frame so it makes '
+                                                               'sense to transform the goal points (waypoints) to the '
+                                                               '"odom" frame. '
+                                                               'Since Carla does not use the odom frame, '
+                                                               'set to "map", '
+                                                               'otherwise use "odom".'))  # global frame: odom, map
         self.declare_parameter('ode_type', "continuous_kinematic_coupled")  # todo: also augmented, etc
         self.declare_parameter('control_rate', 20.0)
         self.declare_parameter('distance_tolerance', 0.2)  # todo: move to goal checker node
@@ -103,6 +144,7 @@ class KinematicCoupledDoMPCNode(Node):
         self.declare_parameter('n_states', 4)  # todo: remove and get from import model
         self.declare_parameter('n_inputs', 2)  # todo: remove and get from import model
         self.declare_parameter('horizon', 25)
+        self.declare_parameter('prediction_time', 0.0)
         self.declare_parameter('max_iter', 15)  # it usually doesnt take more than 15 iterations
         self.declare_parameter('termination_condition',
                                1e-6)  # iteration finish param. todo: pass to mpc initializer solver options
@@ -112,6 +154,7 @@ class KinematicCoupledDoMPCNode(Node):
         self.declare_parameter('Rd', [10., 100.])
         self.declare_parameter('Q', [1.0, 1.0, 1.0, 0.01])
         self.declare_parameter('Qf', [0.04, 0.04, 0.1, 0.01])
+        self.declare_parameter('scale_cost', False)
 
         self.declare_parameter('path_topic', '/trajectory/path')  # todo: replace with custom message or action
         self.declare_parameter('speed_topic', '/trajectory/speed')  # todo: replace with custom message or action
@@ -121,7 +164,7 @@ class KinematicCoupledDoMPCNode(Node):
         self.declare_parameter('publish_twist_topic', True)
         self.declare_parameter('twist_topic', '/cmd_vel')
 
-        self.declare_parameter('desired_speed')  # todo: get from topic/trajectory message
+        self.declare_parameter('desired_speed', 10.0)  # todo: get from topic/trajectory message
         self.declare_parameter('loop', False)  # todo: remove and pass to waypoint publisher
         self.declare_parameter('n_ind_search', 10)  # the number of points to check for when searching for the closest
         self.declare_parameter('smooth_yaw', False)
@@ -131,6 +174,9 @@ class KinematicCoupledDoMPCNode(Node):
         self.declare_parameter('model_directory',
                                '/f1tenth_ws/src/trajectory_following_ros2/data/model')  # don't use absolute paths
 
+        # get parameter values
+        self.robot_frame = self.get_parameter('robot_frame').value
+        self.global_frame = self.get_parameter('global_frame').value
         self.control_rate = self.get_parameter('control_rate').value
         self.distance_tolerance = self.get_parameter('distance_tolerance').value
         self.speed_tolerance = self.get_parameter('speed_tolerance').value
@@ -159,7 +205,10 @@ class KinematicCoupledDoMPCNode(Node):
             self.Qf = np.diag(self.get_parameter('Qf').value)
         else:
             self.Qf = self.Q
+        self.scale_cost = self.get_parameter('scale_cost').value
         self.horizon = int(self.get_parameter('horizon').value)
+        self.prediction_time = self.get_parameter('prediction_time').value
+
         self.max_iter = int(self.get_parameter('max_iter').value)
         self.termination_condition = self.get_parameter('termination_condition').value
 
@@ -180,6 +229,8 @@ class KinematicCoupledDoMPCNode(Node):
         self.debug = self.get_parameter('debug').value
 
         self.dt = self.sample_time = 1 / self.control_rate  # [s] sample time. # todo: get from ros Duration
+        if (self.prediction_time is None) or (self.prediction_time == 0.0):
+            self.prediction_time = self.sample_time * self.horizon
 
         # initialize trajectory class
         self.trajectory_instance = Trajectory(search_index_number=10,
@@ -221,17 +272,46 @@ class KinematicCoupledDoMPCNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.state_frame_id = ''  # the frame ID of the pose state received. odom, map
 
+        self.path = None
+        self.des_yaw_list = None
+        self.speeds = None
+
+        # setup waypoint variables. todo: make mpc not need the path to be initialized
+        self.reference_path = None  # todo: remove
+        self.current_idx = 0
+        self.final_idx = None
+        self.final_goal = None
+        self.final_goal_reached = False
+        self.stop_flag = False
+
+        # Initialize MPC
+        self.mpc_reference_states = np.zeros((self.horizon + 1, self.NX))
+        self.mpc_reference_inputs = np.zeros((self.horizon, self.NU))
+        self.mpc_predicted_states = np.zeros((self.horizon + 1, self.NX))
+        self.mpc_predicted_inputs = np.zeros((self.horizon, self.NU))
+        self.solution_time = 0.0
+        self.solver_iteration_count = 0
+        self.run_count = 0
+        self.solution_status = False
+        self.Controller = None
+
+        self.constraint = None
+        self.model = None
+        self.controller = None
+        self.ocp = None
+
+        latching_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         # Setup subscribers
         self.path_sub = self.create_subscription(
                 Path,
                 self.path_topic,
                 self.path_callback,
-                1)  # to get the desired/reference states of the robot
+                qos_profile=latching_qos)  # to get the desired/reference states of the robot
         self.speed_sub = self.create_subscription(
                 Float32MultiArray,
                 self.speed_topic,
                 self.desired_speed_callback,
-                1)  # to get the desired/reference states of the robot
+                qos_profile=latching_qos)  # to get the desired/reference states of the robot
         self.odom_sub = self.create_subscription(
                 Odometry,
                 self.odom_topic,
@@ -265,32 +345,10 @@ class KinematicCoupledDoMPCNode(Node):
         self.mpc_odom_pub = self.create_publisher(Odometry, '/mpc/current_state', 1)
         self.mpc_pose_pub = self.create_publisher(PoseStamped, '/mpc/current_pose', 1)
 
-        # setup mpc timer
+        # setup mpc timer. todo: either publish debug topics in a separate node or use Reentrant MultiThreadedExecutor
         self.mpc_timer = self.create_timer(self.sample_time, self.mpc_callback)
-        # self.debug_timer = self.create_timer(self.sample_time, self.publish_debug_topics)  # todo
-
-        self.path = None
-        self.des_yaw_list = None
-        self.speeds = None
-
-        # setup waypoint variables. todo: make mpc not need the path to be initialized
-        self.reference_path = None  # todo: remove
-        self.current_idx = 0
-        self.final_idx = None
-        self.final_goal = None
-        self.final_goal_reached = False
-        self.stop_flag = False
-
-        # Initialize MPC
-        self.mpc_reference_states = np.zeros((self.horizon + 1, self.NX))
-        self.mpc_reference_inputs = np.zeros((self.horizon, self.NU))
-        self.mpc_predicted_states = np.zeros((self.horizon + 1, self.NX))
-        self.mpc_predicted_inputs = np.zeros((self.horizon, self.NU))
-        self.solution_time = 0.0
-        self.solver_iteration_count = 0
-        self.run_count = 0
-        self.solution_status = False
-        self.Controller = None
+        self.debug_timer = self.create_timer(1.0,
+                                             self.publish_debug_topics)  # todo: test publishing within the main function
 
         self.get_logger().info('kinematic_coupled_do_mpc_controller node started. ')
 
@@ -324,14 +382,14 @@ class KinematicCoupledDoMPCNode(Node):
         self.path = np.array(coordinate_list)
         self.des_yaw_list = np.array(yaw_list)
         self.frame_id_list = frame_id_list
-        # self.dist_arr = np.zeros(len(self.path))  # array of distances used to check closes path
+        self.path_received = True
+        self.final_idx = self.path.shape[0] - 1
+        self.final_goal = self.path[self.final_idx, :]
+        # self.dist_arr = np.zeros(len(
+        # self.path))  # array of distances used to check closes path
         if self.desired_speed_received:
             self.reference_path = np.array(
-                [self.path[:, 0], self.path[:, 1], self.speeds, self.des_yaw_list]).T  # todo: remove
-            self.final_idx = self.path.shape[0] - 1
-            self.final_goal = self.path[self.final_idx, :]
-
-            self.path_received = True
+                    [self.path[:, 0], self.path[:, 1], self.speeds, self.des_yaw_list]).T  # todo: remove
 
     def desired_speed_callback(self, data):
         speed_list = []
@@ -341,6 +399,7 @@ class KinematicCoupledDoMPCNode(Node):
         self.desired_speed_received = True
 
     def initialize_mpc(self):
+        # todo: initialize during init phase as this causes the model to not be generated until path, speed and odom messages arrive
         _, self.Controller, _ = initialize_mpc_problem(reference_path=self.reference_path,
                                                        horizon=self.horizon,
                                                        sample_time=self.sample_time,
@@ -364,6 +423,7 @@ class KinematicCoupledDoMPCNode(Node):
     def odom_callback(self, data):
         """
         Todo: transform coordinates
+        todo: add flag to convert to and from center of mass to rear axle
         :param data:
         :return:
         """
@@ -400,13 +460,21 @@ class KinematicCoupledDoMPCNode(Node):
         self.speed = self.direction * np.linalg.norm([self.vx, self.vy, self.vz])
         # self.speed = self.vx
 
+        # todo: use flag to convert from the center of mass <--> rear axle
+        # great tutorial: https://dingyan89.medium.com/simple-understanding-of-kinematic-bicycle-model-81cac6420357
+        # # if x, and y are relative to CoG
+        # self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))
+        # self.rear_y = self.y - ((self.WHEELBASE / 2) * math.sin(self.yaw))
+        # self.location = [self.rear_x, self.rear_x_y]  # [self.x, self.y]
+        # todo: to convert from rear axle to cog see new eagles misc report
+
         self.zk[0, 0] = self.x
         self.zk[1, 0] = self.y
         self.zk[2, 0] = self.speed
         self.zk[3, 0] = self.yaw
 
         if not self.initial_pose_received:
-            #if self.mpc_initialized: todo: remove from here
+            # if self.mpc_initialized: todo: remove from here
             #    # warmstart
             #    self.Controller.mpc.x0 = self.zk
             #    self.Controller.mpc.set_initial_guess()
@@ -448,13 +516,20 @@ class KinematicCoupledDoMPCNode(Node):
                                                                  self.current_idx, self.path.shape[0])
             if self.stop_flag:
                 # if self.current_idx >= len(self.path[:, 0]):
-                #     print("Target index out of bounds")
+                #     self.get_logger().info("Target index out of bounds")
                 #     return
 
-                print("Goal reached")
+                self.get_logger().info("Goal reached")
                 return
 
             if self.initial_pose_received and not self.stop_flag:
+                '''update: reference trajectory, reference input, previous input, current state (warmstart)'''
+                # copy to prevent overwriting/race conditions due to odom callback update. Todo: Use thread locks instead
+                x = self.x  # float(self.zk[0, 0])
+                y = self.y
+                vel = self.speed
+                psi = self.yaw
+
                 # update previous input
                 self.u_prev = self.uk.copy()
                 current_speed = self.speed
@@ -516,10 +591,11 @@ class KinematicCoupledDoMPCNode(Node):
                 self.solution_status = self.Controller.mpc.solver_stats['success']
 
                 self.run_count += 1
-                return
+                # return
 
+        # todo: replace with an else block and just  print that the model isn't initialized
         if self.path_received and self.desired_speed_received and not self.mpc_initialized:
-            self.initialize_mpc()
+            self.initialize_mpc()  # todo: initialize during init phase as this causes the model to not be generated early when replaying rosbags
 
     def input_saturation(self):
         # saturate inputs
@@ -534,9 +610,12 @@ class KinematicCoupledDoMPCNode(Node):
         # Publish Ackermann command
         ackermann_cmd = AckermannDriveStamped()
         ackermann_cmd.header.stamp = self.get_clock().now().to_msg()
-        ackermann_cmd.header.frame_id = 'base_link'  # self.frame_id
+        ackermann_cmd.header.frame_id = self.robot_frame  # self.frame_id
         ackermann_cmd.drive.steering_angle = self.delta_cmd
+        # ackermann_cmd.drive.steering_angle_velocity = 0.0
         ackermann_cmd.drive.speed = self.velocity_cmd
+        ackermann_cmd.drive.acceleration = self.acc_cmd
+        # ackermann_cmd.drive.jerk = 0.0
         self.ackermann_cmd_pub.publish(ackermann_cmd)
 
         steer_msg = Float32()
@@ -545,9 +624,10 @@ class KinematicCoupledDoMPCNode(Node):
         self.speed_pub.publish(Float32(data=float(self.velocity_cmd)))
 
     def publish_twist(self, lateral_velocity=0.0):
+        # todo: also add an option to publish Twist() message and get bool parameter to select type
         twist_stamped_cmd = TwistStamped()
         twist_stamped_cmd.header.stamp = self.get_clock().now().to_msg()
-        twist_stamped_cmd.header.frame_id = 'base_link'  # self.frame_id
+        twist_stamped_cmd.header.frame_id = self.robot_frame  # self.frame_id
         twist_stamped_cmd.twist.linear.x = self.velocity_cmd
         twist_stamped_cmd.twist.linear.y = lateral_velocity
         twist_stamped_cmd.twist.angular.z = (self.velocity_cmd / self.WHEELBASE) * math.tan(self.delta_cmd)
@@ -557,24 +637,26 @@ class KinematicCoupledDoMPCNode(Node):
         """
         Publish markers and path.
         Todo: check if mpc is initialized first
+        Todo: publish car path travelled as a Path message
+        Todo: speedup or use thread locks to copy
         """
         if (not self.mpc_initialized) or self.run_count == 0:
             return
 
         timestamp = self.get_clock().now().to_msg()
-        frame_id = 'base_link'
+        frame_id = self.robot_frame
 
         # publish the position of the current goal point
         point_msg = PointStamped()
         point_msg.header.stamp = timestamp
-        point_msg.header.frame_id = 'odom'
+        point_msg.header.frame_id = self.global_frame
         point_msg.point.x, point_msg.point.y = self.target_point[0:2]
         self.mpc_goal_pub.publish(point_msg)
 
         # Publish a few points in the path left
         path_msg = Path()
         path_msg.header.stamp = timestamp
-        path_msg.header.frame_id = "odom"
+        path_msg.header.frame_id = self.global_frame
 
         # todo: remove
         start_idx = self.current_idx
@@ -583,7 +665,7 @@ class KinematicCoupledDoMPCNode(Node):
         for index in range(start_idx, end_idx):
             waypoint_pose = PoseStamped()
             waypoint_pose.header.stamp = timestamp
-            waypoint_pose.header.frame_id = 'odom'
+            waypoint_pose.header.frame_id = self.global_frame
             waypoint_pose.pose.position.x, waypoint_pose.pose.position.y = self.path[index, :]
             waypoint_pose.pose.orientation.z = self.des_yaw_list[index]
             path_msg.poses.append(waypoint_pose)
@@ -592,16 +674,16 @@ class KinematicCoupledDoMPCNode(Node):
         # Publish the points MPC is considering, i.e state reference
         path_msg = Path()
         path_msg.header.stamp = timestamp
-        path_msg.header.frame_id = "odom"
+        path_msg.header.frame_id = self.global_frame
 
         for k in range(self.xref.shape[0]):
             # todo: publish velocity or publish as odometry instead
             reference_pose = PoseStamped()
             reference_pose.header.stamp = timestamp
-            reference_pose.header.frame_id = 'odom'
+            reference_pose.header.frame_id = self.global_frame
 
             reference_pose.pose.position.x, reference_pose.pose.position.y = self.xref[k, 0], self.xref[k, 1]
-            # print(f"x: {self.xref[0, index]}, y: {self.xref[1, index]}, yaw: {self.xref[3, index]}\n")
+            # self.get_logger().info(f"x: {self.xref[0, index]}, y: {self.xref[1, index]}, yaw: {self.xref[3, index]}\n")
 
             reference_quaternion = tf_transformations.quaternion_from_euler(0, 0, self.xref[k, 3])
             reference_pose.pose.orientation.x = reference_quaternion[0]
@@ -616,7 +698,7 @@ class KinematicCoupledDoMPCNode(Node):
         for k in range(self.mpc_predicted_states.shape[0]):
             predicted_pose = PoseStamped()
             predicted_pose.header.stamp = timestamp
-            predicted_pose.header.frame_id = 'odom'
+            predicted_pose.header.frame_id = self.global_frame
             predicted_pose.pose.position.x = self.mpc_predicted_states[k, 0]
             predicted_pose.pose.position.y = self.mpc_predicted_states[k, 1]
 
