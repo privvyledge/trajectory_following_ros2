@@ -5,6 +5,8 @@ See:
     * https://github.com/commaai/openpilot/blob/master/selfdrive/controls/lib/lateral_mpc_lib/lat_mpc.py
     * https://github.com/commaai/openpilot/blob/master/selfdrive/controls/tests/test_lateral_mpc.py
     * https://github.com/mlab-upenn/mpcc/blob/master/scripts/acados/acados_settings.py#L126
+
+Todo: get actuation limit values from arguments instead of hardcoding here
 """
 
 import types

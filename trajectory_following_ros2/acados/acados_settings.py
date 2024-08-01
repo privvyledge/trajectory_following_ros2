@@ -11,6 +11,8 @@ See:
 
 Perfomance Tips:
     * https://discourse.acados.org/t/solver-runs-slower-in-nvidia-jetson-tx2-platform/531/2
+
+Todo: get actuation limit values from arguments instead of hardcoding in the imported model
 """
 import numpy as np
 import scipy.linalg

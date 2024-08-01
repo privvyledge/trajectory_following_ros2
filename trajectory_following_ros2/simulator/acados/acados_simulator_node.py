@@ -29,6 +29,7 @@ from rclpy.duration import Duration
 # TF
 from tf2_ros import TransformException, LookupException
 from tf2_ros.transform_listener import TransformListener
+from tf2_ros import TransformBroadcaster
 from tf2_ros.buffer import Buffer
 import tf_transformations
 import tf2_geometry_msgs
@@ -142,6 +143,9 @@ class KinematicAcadosMPCSimulationNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.state_frame_id = ''  # the frame ID of the pose state received. odom, map
 
+        # Setup transform publisher, e.g odom to base_link
+        self.br = TransformBroadcaster(self)
+
         # Initialize Simulator
         self.solution_time = 0.0
         self.run_count = 0
@@ -214,6 +218,7 @@ class KinematicAcadosMPCSimulationNode(Node):
         self.yaw_rate = (self.speed / self.WHEELBASE) * math.tan(uk[1, 0])
         self.acceleration = self.speed / self.sample_time
 
+        self.publish_transform()  # todo: test
         self.publish_odometry()
         self.publish_acceleration()
 
@@ -259,6 +264,23 @@ class KinematicAcadosMPCSimulationNode(Node):
         accel_msg.accel.accel.angular.z = self.yaw_rate / self.sample_time
         # accel_msg.accel.covariance = [0., 0., 0., 0., 0., 0.]
         self.accel_pub.publish(accel_msg)
+
+    def publish_transform(self):
+        # todo: test
+        t = TransformStamped()
+        t.header.stamp = self.get_clock().now().to_msg()
+        t.header.frame_id = 'odom'
+        t.child_frame_id = 'base_link'
+        t.transform.translation.x = self.x
+        t.transform.translation.y = self.y
+        t.transform.translation.z = 0.0
+
+        tf_quaternion = tf_transformations.quaternion_from_euler(0, 0, self.yaw)
+        t.transform.rotation.x = tf_quaternion[0]
+        t.transform.rotation.y = tf_quaternion[1]
+        t.transform.rotation.z = tf_quaternion[2]
+        t.transform.rotation.w = tf_quaternion[3]
+        self.br.sendTransform(t)
 
 
 def main(args=None):

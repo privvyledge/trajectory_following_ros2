@@ -387,9 +387,8 @@ class KinematicCoupledDoMPCNode(Node):
         self.final_goal = self.path[self.final_idx, :]
         # self.dist_arr = np.zeros(len(
         # self.path))  # array of distances used to check closes path
-        if self.desired_speed_received:
-            self.reference_path = np.array(
-                    [self.path[:, 0], self.path[:, 1], self.speeds, self.des_yaw_list]).T  # todo: remove
+        #if self.desired_speed_received:
+            #self.reference_path = np.array([self.path[:, 0], self.path[:, 1], self.speeds, self.des_yaw_list]).T  # todo: remove
 
     def desired_speed_callback(self, data):
         speed_list = []
@@ -491,8 +490,8 @@ class KinematicCoupledDoMPCNode(Node):
 
         longitudinal_acc, lateral_acc = linear_acceleration.x, linear_acceleration.y
         roll_acceleration, pitch_acceleration, yaw_acceleration = angular_acceleration.x, \
-                                                                  angular_acceleration.y, \
-                                                                  angular_acceleration.z
+            angular_acceleration.y, \
+            angular_acceleration.z
         _, _, yaw_rate = roll_acceleration * self.dt, pitch_acceleration * self.dt, yaw_acceleration * self.dt
         self.acceleration = longitudinal_acc
 
@@ -501,15 +500,16 @@ class KinematicCoupledDoMPCNode(Node):
         if self.mpc_initialized:
             # get target point and update reference. todo: setup interpolation of all states and references for the horizon
             xref, self.current_idx, _ = self.trajectory_instance.calc_ref_trajectory(self.x,
-                                                                                                self.y,
-                                                                                                self.path[:, 0],
-                                                                                                self.path[:, 1],
-                                                                                                self.des_yaw_list, 0,
-                                                                                                self.speeds, 1.,
-                                                                                                self.current_idx,
-                                                                                                n_states=self.NX,
-                                                                                                horizon_length=self.horizon,
-                                                                                                dt=self.sample_time)
+                                                                                     self.y,
+                                                                                     self.path[:, 0],
+                                                                                     self.path[:, 1],
+                                                                                     self.des_yaw_list, 0,
+                                                                                     self.speeds, 1.,
+                                                                                     self.current_idx,
+                                                                                     n_states=self.NX,
+                                                                                     horizon_length=self.horizon,
+                                                                                     dt=self.sample_time,
+                                                                                     lookahead=self.distance_tolerance)
             self.xref[:, :] = xref.T
             # break out of loop (optional)
             self.stop_flag = self.trajectory_instance.check_goal(self.x, self.y, self.speed, self.final_goal,
@@ -534,7 +534,8 @@ class KinematicCoupledDoMPCNode(Node):
                 self.u_prev = self.uk.copy()
                 current_speed = self.speed
                 self.Controller.vehicle.wp_id = self.current_idx
-                self.Controller.vehicle.current_waypoint = [self.path[self.current_idx, 0], self.path[self.current_idx, 1],
+                self.Controller.vehicle.current_waypoint = [self.path[self.current_idx, 0],
+                                                            self.path[self.current_idx, 1],
                                                             self.speeds[self.current_idx],
                                                             self.des_yaw_list[self.current_idx],
                                                             0]
@@ -579,8 +580,10 @@ class KinematicCoupledDoMPCNode(Node):
                 # Controller.mpc.data.prediction(('_x', 'pos_x'), t_ind=simulation_instance.count)[0]
                 x_state_ref = self.Controller.mpc.data.prediction(('_tvp', 'x_ref', 0), t_ind=time_index).reshape(-1, 1)
                 y_state_ref = self.Controller.mpc.data.prediction(('_tvp', 'y_ref', 0), t_ind=time_index).reshape(-1, 1)
-                vel_state_ref = self.Controller.mpc.data.prediction(('_tvp', 'vel_ref', 0), t_ind=time_index).reshape(-1, 1)
-                psi_state_ref = self.Controller.mpc.data.prediction(('_tvp', 'psi_ref', 0), t_ind=time_index).reshape(-1, 1)
+                vel_state_ref = self.Controller.mpc.data.prediction(('_tvp', 'vel_ref', 0), t_ind=time_index).reshape(
+                    -1, 1)
+                psi_state_ref = self.Controller.mpc.data.prediction(('_tvp', 'psi_ref', 0), t_ind=time_index).reshape(
+                    -1, 1)
                 self.xref[:, :] = np.hstack([x_state_ref, y_state_ref, vel_state_ref, psi_state_ref])  # todo: refactor
                 self.target_point = self.xref[0, :].tolist()  # todo: refactor
 
@@ -595,6 +598,7 @@ class KinematicCoupledDoMPCNode(Node):
 
         # todo: replace with an else block and just  print that the model isn't initialized
         if self.path_received and self.desired_speed_received and not self.mpc_initialized:
+            self.reference_path = np.array([self.path[:, 0], self.path[:, 1], self.speeds, self.des_yaw_list]).T  # todo: remove
             self.initialize_mpc()  # todo: initialize during init phase as this causes the model to not be generated early when replaying rosbags
 
     def input_saturation(self):

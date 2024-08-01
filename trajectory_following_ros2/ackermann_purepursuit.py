@@ -21,6 +21,8 @@ Todo:
     Add derivative in PI controller [done]
     Switch to Purepursuit class
     Switch to PID class
+    Test debug and purepursuit queues and speedup
+    setup Queues for actuation commands, odom, accel, etc
     Add a flag for stamped or unstamped message
     Make speed command optional
     Move PID speed controller to separate node
@@ -41,6 +43,7 @@ import numpy as np
 import os
 import sys
 import csv
+import queue
 import threading
 import numpy as np
 
@@ -50,6 +53,9 @@ from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 from rclpy.qos import DurabilityPolicy
 from rclpy.qos import HistoryPolicy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import SingleThreadedExecutor, MultiThreadedExecutor
+from rclpy.executors import ExternalShutdownException
 
 # TF
 from tf2_ros import TransformException, LookupException
@@ -221,33 +227,55 @@ class PurePursuitNode(Node):
         self.speeds = None
         self.reference_path = None  # todo: remove
 
+        # Setup queues for multi-thread access
+        self.mutex = threading.Lock()  # or threading.RLock()
+        queue_size = 10
+        self.location_queue = queue.Queue(maxsize=queue_size)
+        self.orientation_queue = queue.Queue(maxsize=queue_size)
+        self.yaw_queue = queue.Queue(maxsize=queue_size)
+        self.goal_queue = queue.Queue(maxsize=queue_size)
+
+        # ReentrantCallbackGroup() or MutuallyExclusiveCallbackGroup()
+        self.subscription_group = ReentrantCallbackGroup()
+        self.purepursuit_group = ReentrantCallbackGroup()
+        self.debug_group = ReentrantCallbackGroup()  # can use either
+
         latching_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         # Setup subscribers
         self.path_sub = self.create_subscription(
                 Path,
                 self.path_topic,
                 self.path_callback,
-                qos_profile=latching_qos)  # to get the desired/reference states of the robot
+                qos_profile=latching_qos,
+                # callback_group=self.subscription_group
+        )  # to get the desired/reference states of the robot
         self.speed_sub = self.create_subscription(
                 Float32MultiArray,
                 self.speed_topic,
                 self.desired_speed_callback,
-                qos_profile=latching_qos)  # to get the desired/reference states of the robot
+                qos_profile=latching_qos,
+#                 callback_group=self.subscription_group
+        )  # to get the desired/reference states of the robot
         self.odom_sub = self.create_subscription(
                 Odometry,
                 self.odom_topic,
                 self.odom_callback,
-                1)  # to get the current state of the robot
+                1,
+                callback_group=self.subscription_group
+        )  # to get the current state of the robot
         #self.pose_sub = self.create_subscription(
         #        PoseWithCovarianceStamped,
         #        self.pose_topic,
         #        self.pose_callback,
-        #        1)
+        #        1,
+        #        callback_group=self.subscription_group)
         self.accel_sub = self.create_subscription(
                 AccelWithCovarianceStamped,
                 self.acceleration_topic,
                 self.acceleration_callback,
-                1)
+                1,
+                callback_group=self.subscription_group
+        )
 
         # Setup publishers. Todo: publish purepursuit path
         self.ackermann_cmd_pub = self.create_publisher(AckermannDriveStamped, self.ackermann_cmd_topic, 1)
@@ -266,13 +294,26 @@ class PurePursuitNode(Node):
         self.purepursuit_pose_pub = self.create_publisher(PoseStamped, '/purepursuit/current_pose', 1)
 
         # setup purepursuit timer
-        self.purepursuit_timer = self.create_timer(self.sample_time, self.purepursuit_callback)
-        self.debug_timer = self.create_timer(0.5, self.publish_debug_topics)
+        self.purepursuit_timer = self.create_timer(self.sample_time, self.purepursuit_callback,
+                                                   callback_group=self.purepursuit_group)
+        self.debug_timer = self.create_timer(self.sample_time, self.publish_debug_topics, callback_group=self.debug_group)
 
         self.get_logger().info('purepursuit node started. ')
 
         # if self.initial_pose_received:
         #     self.get_target_point()
+
+    def update_queue(self, data_queue, data, overwrite_if_full=True):
+        if data_queue.full():
+            if overwrite_if_full:
+                # acquire lock
+                if data_queue.full():
+                    drop = data_queue.get(block=True)  # remove one item
+                else:
+                    data_queue.put(data, block=True)
+                # release the lock
+        else:
+            data_queue.put(data, block=True)
 
     def path_callback(self, data):
         path_frame_id = data.header.frame_id
@@ -309,6 +350,7 @@ class PurePursuitNode(Node):
         self.final_goal = self.waypoints[self.final_idx, :]  # self.waypoints[-1, :]
 
         self.goal = self.waypoints[self.target_ind, :]  #  self.target_point
+        self.update_queue(self.goal_queue, self.goal)
         self.dist_arr = np.zeros(len(self.waypoints))  # array of distances used to check closes path
         if self.desired_speed_received:
             self.reference_path = np.array(
@@ -369,6 +411,7 @@ class PurePursuitNode(Node):
         # get current pose
         self.x, self.y = position.x, position.y
         self.location = [self.x, self.y]
+        self.update_queue(self.location_queue, self.location)
         qx, qy, qz, qw = orientation.x, orientation.y, orientation.z, orientation.w
         _, _, self.yaw = tf_transformations.euler_from_quaternion([qx, qy, qz, qw])
         self.yaw_rate = twist.angular.z
@@ -408,7 +451,9 @@ class PurePursuitNode(Node):
     def purepursuit_callback(self):
         if self.initial_pose_received and self.path_received:
             self.get_target_point()
-            self.stop_flag = self.stop(self.target_ind, self.final_idx, self.location, self.final_goal, self.goal_tolerance)
+            self.stop_flag = self.stop(self.target_ind, self.final_idx,
+                                       self.location, self.final_goal,
+                                       self.goal_tolerance)
             if not self.stop_flag:
                 self.get_desired_steering_angle()
                 # self.speed_error = self.desired_speed - self.speed
@@ -490,6 +535,7 @@ class PurePursuitNode(Node):
         self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))
         self.rear_y = self.y - ((self.WHEELBASE / 2) * math.sin(self.yaw))
         self.location = [self.x, self.y]
+        # self.update_queue(self.location_queue, self.location)
 
         # Publish vehicle kinematic state
         odom = Odometry()
@@ -548,6 +594,7 @@ class PurePursuitNode(Node):
                     self.target_ind = np.min(goal_candidates)
 
         self.goal = self.get_point(self.target_ind)
+        self.update_queue(self.goal_queue, self.goal)
         #self.get_logger().info(f"Get target point callback... Target_ind: {self.target_ind}, goal point: {self.goal}")
 
     def get_point(self, index):
@@ -620,21 +667,33 @@ class PurePursuitNode(Node):
         frame_id = self.robot_frame
 
         if self.initial_pose_received and self.path_received:
+            goal = None
+            location = None
+            # get items from queues
+            if not self.goal_queue.empty():
+                goal = self.goal_queue.get(block=True)
+
+            if not self.location_queue.empty():
+                location = self.location_queue.get(block=True)
+
             # publish the position of the current lookahead.
             # todo: either publish this directly to the robots frame, i.e base link or add to the robots global pose and publish in the global frame.
-            point_msg = PointStamped()
-            point_msg.header.stamp = timestamp
-            point_msg.header.frame_id = self.robot_frame  # self.robot_frame or self.global_frame. Todo: publishing to global frame does not account for orientation, transform first, else use base_link
-            point_msg.point.x = self.x  # self.lookahead, self.lookahead + self.x
-            point_msg.point.y = self.y  # 0.0 or self.y
-            self.purepursuit_lookahead_pub.publish(point_msg)
 
-            # publish the position of the current goal point
-            point_msg = PointStamped()
-            point_msg.header.stamp = timestamp
-            point_msg.header.frame_id = self.global_frame
-            point_msg.point.x, point_msg.point.y = self.goal
-            self.purepursuit_goal_pub.publish(point_msg)
+            if location is not None:
+                point_msg = PointStamped()
+                point_msg.header.stamp = timestamp
+                point_msg.header.frame_id = self.robot_frame  # self.robot_frame or self.global_frame. Todo: publishing to global frame does not account for orientation, transform first, else use base_link
+                point_msg.point.x = location[0]  # self.x  # self.lookahead, self.lookahead + self.x
+                point_msg.point.y = location[0]  # self.y  # 0.0 or self.y
+                self.purepursuit_lookahead_pub.publish(point_msg)
+
+            if goal is not None:
+                # publish the position of the current goal point
+                point_msg = PointStamped()
+                point_msg.header.stamp = timestamp
+                point_msg.header.frame_id = self.global_frame
+                point_msg.point.x, point_msg.point.y = goal  # self.goal
+                self.purepursuit_goal_pub.publish(point_msg)
 
             # Publish a few points in the path left
             path_msg = Path()
@@ -656,15 +715,32 @@ class PurePursuitNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    pp_node = PurePursuitNode()
-    rclpy.spin(pp_node)
+    try:
+        pp_node = PurePursuitNode()
+        executor = MultiThreadedExecutor(num_threads=4)  # todo: could get as an argument
+        executor.add_node(pp_node)
+        
+        try:
+            executor.spin()
+        finally:
+            executor.shutdown()
+            #pp_node.waypoint_file.close()   # for waypoint node
+            pp_node.destroy_node()
+
+    except KeyboardInterrupt:
+        pass
+    except ExternalShutdownException:
+        sys.exit(1)
+
+    finally:
+        rclpy.shutdown()
 
     # # Destroy the node explicitly
     # # (optional - otherwise it will be done automatically
     # # when the garbage collector destroys the node object)
-    pp_node.waypoint_file.close()
-    pp_node.destroy_node()
-    rclpy.shutdown()
+    # pp_node.waypoint_file.close()
+    # pp_node.destroy_node()
+    # rclpy.shutdown()
 
 
 if __name__ == '__main__':

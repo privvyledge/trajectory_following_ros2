@@ -21,6 +21,7 @@ class BicycleKinematicModel(object):
 
         # waypoint
         self.wp_id = 0
+        self.current_waypoint = [0, 0, 0, 0, 0]  # todo: remove
 
         if self.reference_path is not None:
             self.current_waypoint = [self.reference_path[self.wp_id, 0], self.reference_path[self.wp_id, 1],

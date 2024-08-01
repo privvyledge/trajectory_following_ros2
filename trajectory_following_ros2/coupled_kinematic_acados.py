@@ -19,9 +19,12 @@ Todo:
     * Create a common class/module or function file for common MPC/Purepursuit functions
     * refactor acados settings and model
     * add a flag to convert from center of mass (or gravity) to rear axle, e.g for carla.
-    Also see https://dingyan89.medium.com/simple-understanding-of-kinematic-bicycle-model-81cac6420357 and New Eagles CoM odometry to base link conversion
+        Also see https://dingyan89.medium.com/simple-understanding-of-kinematic-bicycle-model-81cac6420357 and New Eagles CoM odometry to base link conversion
     * declare/initialize arrays and update instead of redeclaring each iteration (e.g using contiguous array)
-    * switch to Multithreaded executor and reentrant callback group (plus threading lock) to run MPC and visualization on different threads
+    * switch to Multithreaded executor and reentrant callback group (plus threading lock) to run MPC and visualization on different threads.
+        See carla example: https://github.com/carla-simulator/ros-bridge/blob/master/carla_ad_agent/src/carla_ad_agent/ad_agent.py
+        See ROS2 examples: https://github.com/ros2/examples/blob/humble/rclpy/executors/examples_rclpy_executors/callback_group.py
+        Particle filter thread lock example: https://github.com/f1tenth/particle_filter/blob/foxy-devel/particle_filter/particle_filter.py#L393
     * setup point stabilization, i.e go to goal from RVIz pose
     * set default reference speed to 0 and set velocity cost weight to close to 0
     * Fix/detect time jump, e.g when using ROSBags (https://github.com/ros2/geometry2/issues/606#issuecomment-1589927587 | https://github.com/ros2/geometry2/pull/608#discussion_r1229877511)
@@ -361,7 +364,7 @@ class KinematicCoupledAcadosMPCNode(Node):
 
         # setup mpc timer. todo: either publish debug topics in a separate node or use Reentrant MultiThreadedExecutor
         self.mpc_timer = self.create_timer(self.sample_time, self.mpc_callback)
-        self.debug_timer = self.create_timer(1.0,
+        self.debug_timer = self.create_timer(0.5,
                                              self.publish_debug_topics)  # todo: test publishing within the main function
 
         self.get_logger().info('kinematic_coupled_acados_mpc_controller node started. ')
@@ -471,6 +474,9 @@ class KinematicCoupledAcadosMPCNode(Node):
                             self.zk.flatten())  # can only be set if x0 was provided. Otherwise set 'x'. Raises Exception
         self.controller.set(0, "ubx", self.zk.flatten())
 
+        # todo: setup actuator constraints (https://docs.acados.org/python_interface/index.html#acados_template.acados_ocp_solver.AcadosOcpSolver.constraints_set)
+        # self.controller.constraints_set(i, 'lbu', blah)
+
         # solve/get initial guess
         status = self.controller.solve()
         self.mpc_initialized = True
@@ -529,6 +535,8 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.zk[1, 0] = self.y
         self.zk[2, 0] = self.speed
         self.zk[3, 0] = self.yaw
+
+        # todo: publish odometry
 
         if not self.initial_pose_received:
             # if self.mpc_initialized: todo: remove from here
@@ -641,9 +649,10 @@ class KinematicCoupledAcadosMPCNode(Node):
                 #                       warmstart_variables['z_ws'][:, self.horizon])
 
                 start_time = time.process_time()
+                # https://docs.acados.org/python_interface/index.html#acados_template.acados_ocp_solver.AcadosOcpSolver.get_status
                 # 0 – success, 1 – failure, 2 – maximum number of iterations reached,
                 # 3 – minimum step size in QP solver reached, 4 – qp solver failed
-                status = self.controller.solve()
+                status = self.controller.solve()  # todo: switch to solve_for_x0(). https://docs.acados.org/python_interface/index.html#acados_template.acados_ocp_solver.AcadosOcpSolver.solve_for_x0
                 solver_dt = time.process_time() - start_time
                 if status != 0:
                     # acados_solver.print_statistics()
