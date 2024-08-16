@@ -4,6 +4,7 @@ Load path from waypoints and set QoS profile to transient.
 Todo:
     switch to pandas [done]
     Check if the file exists [done: no need]
+    Switch to the new trajectory class and add other columns
     Make the marker type configurable and choose what to display
     add a flag to replace zero speeds with a default value
     Add flag to publish initialpose as the first data row
@@ -43,6 +44,8 @@ from std_msgs.msg import Float32, Float32MultiArray, MultiArrayDimension  # todo
 
 # Custom messages
 from trajectory_following_ros2.utils.Trajectory import Trajectory
+import trajectory_following_ros2.utils.filters as filters
+import trajectory_following_ros2.utils.trajectory_utils as trajectory_utils
 
 
 class WaypointLoaderNode(Node):
@@ -63,6 +66,10 @@ class WaypointLoaderNode(Node):
                                ParameterDescriptor(description='Should a poses be published in the default frame '
                                                                'if there is no valid '
                                                                'transformation to the target frame.'))
+        self.declare_parameter('remove_duplicates', True)
+        self.declare_parameter('smooth_path', False)
+        self.declare_parameter('smooth_speed', False)
+        self.declare_parameter('smooth_yaw', False)
 
         # get parameters
         self.file_path = str(self.get_parameter('file_path').value)
@@ -72,28 +79,33 @@ class WaypointLoaderNode(Node):
         self.target_frame_id = self.get_parameter('target_frame_id').value
         self.publish_if_transform_fails = self.get_parameter('publish_if_transform_fails').value
 
+        self.remove_duplicates = self.get_parameter('remove_duplicates').value
+        self.smooth_path = self.get_parameter('smooth_path').value
+        self.smooth_speed = self.get_parameter('smooth_speed').value
+        self.smooth_yaw = self.get_parameter('smooth_yaw').value
+
         # Load waypoints (csv_data: frame_id, time_delta (dt), x, y, z, yaw, qx, qy, qz, qw, speed)
         self.csv_data = self.get_waypoints_from_csv(self.file_path)
-        # # optional smoothing
-        # self.trajectory_instance = Trajectory(search_index_number=10,
-        #                                       goal_tolerance=self.distance_tolerance,
-        #                                       stop_speed=self.speed_tolerance
-        #                                       )
-        # self.csv_data[:, 2:4] = self.trajectory_instance.smooth_and_interpolate_coordinates(
-        #         coordinates=self.csv_data[:, 2:4],
-        #         method='moving_average',
-        #         window_length=9,
-        #         kernel_type='box')
-        # self.csv_data[:, 5] = self.trajectory_instance.smooth_yaw(self.csv_data[:, 5])
-        # self.csv_data[:, 10] = self.trajectory_instance.calc_speed_profile(self.csv_data[:, 2], self.csv_data[:, 3],
-        #                                                                    self.csv_data[:, 5], self.desired_speed)
-        # # to smooth speed. todo: use an optimization function or let the MPC do it
-        # # todo: don't use Bspline interpolation for speed as it does not necessarily respect the kinematics of a car
-        # # todo: instead use an optimization function for the velocity profile
-        # interpolation_function, b_spline_coefficients = scipy.interpolate.splprep(
-        #         [np.arange(self.speeds.shape[0]), self.speeds], s=0.3,
-        #         k=3)  # we use splprep to handle nonunique and not strictly ascending x
-        # _, self.speeds = scipy.interpolate.splev(b_spline_coefficients, interpolation_function)
+
+        if self.remove_duplicates:
+            self.csv_data = self.csv_data.drop_duplicates(subset=["x", "y"], keep='first')
+
+        # optional smoothing
+        if self.smooth_path:
+            self.csv_data.loc[:, "x": "y"] = filters.smooth_path(
+                    coordinates=self.csv_data.loc[:, "x": "y"], method='bspline', polynomial_order=3, weight_smooth=0.3)
+
+        if self.smooth_speed:
+            velocity_time_constant = 0.3
+            self.csv_data["speed"] = trajectory_utils.dynamic_smoothing_velocity(
+                    0, 8.9, 3.0, velocity_time_constant,
+                    self.csv_data.loc[:, ['x', 'y', 'speed']])
+
+            # or
+            self.csv_data["speed"] = trajectory_utils.interpolate_speed(self.csv_data.loc[:, ['x', 'y']], method=1)
+
+        if self.smooth_yaw:
+            pass
 
         # todo: just do the unpacking where needed
         self.frame_ids = self.csv_data["frame_id"].tolist()

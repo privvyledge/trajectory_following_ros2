@@ -74,6 +74,8 @@ from ackermann_msgs.msg import AckermannDriveStamped
 
 # Custom messages. todo: probably remove Vehicle and trajectory stuff but import casadi model instead
 from trajectory_following_ros2.utils.Trajectory import Trajectory
+import trajectory_following_ros2.utils.filters as filters
+import trajectory_following_ros2.utils.trajectory_utils as trajectory_utils
 from trajectory_following_ros2.do_mpc.mpc_setup import initialize_mpc_problem
 
 
@@ -233,10 +235,10 @@ class KinematicCoupledDoMPCNode(Node):
             self.prediction_time = self.sample_time * self.horizon
 
         # initialize trajectory class
-        self.trajectory_instance = Trajectory(search_index_number=10,
-                                              goal_tolerance=self.distance_tolerance,
-                                              stop_speed=self.speed_tolerance
-                                              )
+        self.trajectory = Trajectory(search_index_number=10,
+                                     goal_tolerance=self.distance_tolerance,
+                                     stop_speed=self.speed_tolerance
+                                     )
 
         self.acc_cmd, self.delta_cmd, self.velocity_cmd = 0.0, 0.0, 0.0
         self.zk = np.zeros((self.NX, 1))  # x, y, psi, velocity, psi
@@ -262,6 +264,7 @@ class KinematicCoupledDoMPCNode(Node):
         self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))  # todo: remove
         self.rear_y = self.y - ((self.WHEELBASE / 2) * math.sin(self.yaw))  # todo: remove
         self.location = [self.x, self.y]  # todo: remove
+        self.cumulative_distance = 0.0
         self.alpha = 0.0  # yaw error  # todo: remove
         self.desired_curvature = 0.0  # todo: remove
         self.desired_steering_angle = 0.0  # todo: remove
@@ -353,6 +356,11 @@ class KinematicCoupledDoMPCNode(Node):
         self.get_logger().info('kinematic_coupled_do_mpc_controller node started. ')
 
     def path_callback(self, data):
+        """
+        Todo: add flag to remove duplicates, smooth path, speed, yaw, etc.
+        :param data:
+        :return:
+        """
         path_frame_id = data.header.frame_id
         path_time = data.header.stamp
 
@@ -385,16 +393,45 @@ class KinematicCoupledDoMPCNode(Node):
         self.path_received = True
         self.final_idx = self.path.shape[0] - 1
         self.final_goal = self.path[self.final_idx, :]
-        # self.dist_arr = np.zeros(len(
-        # self.path))  # array of distances used to check closes path
-        #if self.desired_speed_received:
-            #self.reference_path = np.array([self.path[:, 0], self.path[:, 1], self.speeds, self.des_yaw_list]).T  # todo: remove
+
+        self.trajectory.trajectory = np.zeros(
+                (self.path.shape[0], len(self.trajectory.trajectory_keys)))
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['x']] = self.path[:, 0]
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['y']] = self.path[:, 1]
+
+        self.trajectory.trajectory[:,
+        self.trajectory.trajectory_key_to_column['yaw']] = self.des_yaw_list
+
+        # self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['dt']] = csv_df.dt.values
+        # self.trajectory.trajectory[:,
+        # self.trajectory.trajectory_key_to_column['total_time_elapsed']] = csv_df.total_time_elapsed.values
+
+        cdists = trajectory_utils.cumulative_distance_along_path(
+                self.trajectory.trajectory[:, [self.trajectory.trajectory_key_to_column['x'],
+                                               self.trajectory.trajectory_key_to_column['y']]])
+        curvs_all = trajectory_utils.calculate_curvature_all(cdists,
+                                                             self.trajectory.trajectory[:,
+                                                             self.trajectory.trajectory_key_to_column['yaw']],
+                                                             smooth=True)
+
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['curvature']] = curvs_all
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['cum_dist']] = cdists
 
     def desired_speed_callback(self, data):
+        """
+        Todo: add flag to remove duplicates, smooth path, speed, yaw, etc.
+        :param data:
+        :return:
+        """
         speed_list = []
         for speed in data.data:
             speed_list.append(speed)
         self.speeds = np.array(speed_list)
+
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['speed']] = self.speeds
+        # self.trajectory.trajectory[:,
+        # self.trajectory.trajectory_key_to_column['omega']] = csv_df.omega.values  # todo
+        self.desired_speed_received = True
         self.desired_speed_received = True
 
     def initialize_mpc(self):
@@ -498,29 +535,67 @@ class KinematicCoupledDoMPCNode(Node):
     def mpc_callback(self):
         # todo: refactor this method
         if self.mpc_initialized:
-            # get target point and update reference. todo: setup interpolation of all states and references for the horizon
-            xref, self.current_idx, _ = self.trajectory_instance.calc_ref_trajectory(self.x,
-                                                                                     self.y,
-                                                                                     self.path[:, 0],
-                                                                                     self.path[:, 1],
-                                                                                     self.des_yaw_list, 0,
-                                                                                     self.speeds, 1.,
-                                                                                     self.current_idx,
-                                                                                     n_states=self.NX,
-                                                                                     horizon_length=self.horizon,
-                                                                                     dt=self.sample_time,
-                                                                                     lookahead=self.distance_tolerance)
-            self.xref[:, :] = xref.T
-            # break out of loop (optional)
-            self.stop_flag = self.trajectory_instance.check_goal(self.x, self.y, self.speed, self.final_goal,
-                                                                 self.current_idx, self.path.shape[0])
-            if self.stop_flag:
-                # if self.current_idx >= len(self.path[:, 0]):
-                #     self.get_logger().info("Target index out of bounds")
-                #     return
+            # update trajectory state and reference
+            # get the robots current state, waypoint index and normalize the angle from -pi to pi or [0, 2PI). todo: update state in purepursuit and MPC node
+            self.trajectory.current_index = self.current_idx
+            self.trajectory.state[0, self.trajectory.state_key_to_column['x']] = self.x
+            self.trajectory.state[0, self.trajectory.state_key_to_column['y']] = self.y
+            self.trajectory.state[0, self.trajectory.state_key_to_column['speed']] = self.speed
+            self.trajectory.state[0, self.trajectory.state_key_to_column['yaw']] = self.yaw
+            self.trajectory.state[0, self.trajectory.state_key_to_column['omega']] = self.omega
+            self.trajectory.state[
+                0, self.trajectory.state_key_to_column['curvature']] = trajectory_utils.calculate_curvature_single(
+                    self.trajectory.trajectory[:,
+                    [self.trajectory.trajectory_key_to_column['x'],
+                     self.trajectory.trajectory_key_to_column['y']]],
+                    goal_index=self.current_idx)
+            self.trajectory.state[0, self.trajectory.state_key_to_column['cum_dist']] = self.cumulative_distance
 
+            # break out of loop (optional)
+            self.stop_flag = self.trajectory.check_goal(self.x, self.y, self.speed, self.final_goal,
+                                                        self.current_idx, self.path.shape[0])
+
+            if self.stop_flag:
                 self.get_logger().info("Goal reached")
                 return
+
+            # get target point and update reference. todo: setup interpolation of all states and references for the horizon
+            # xref, self.current_idx, _ = self.trajectory.calc_ref_trajectory(self.x,
+            #                                                                 self.y,
+            #                                                                 self.path[:, 0],
+            #                                                                 self.path[:, 1],
+            #                                                                 self.des_yaw_list, 0,
+            #                                                                 self.speeds, 1.,
+            #                                                                 self.current_idx,
+            #                                                                 n_states=self.NX,
+            #                                                                 horizon_length=self.horizon,
+            #                                                                 dt=self.sample_time,
+            #                                                                 lookahead=self.distance_tolerance)
+
+            self.current_idx, reference_traj, _, _, _ = self.trajectory.calc_ref_trajectory(
+                    state=None, trajectory=None, current_index=None,
+                    dt=self.sample_time, prediction_horizon=self.horizon,
+                    lookahead_time=1.0, lookahead=30.0,  # lookahead=pp_controller.lookahead
+                    num_points_to_interpolate=self.horizon
+            )
+
+            self.xref[:, :] = np.array(
+                    [reference_traj['x_ref'], reference_traj['y_ref'],
+                     reference_traj['vel_ref'], reference_traj['yaw_ref']]).T
+
+            self.trajectory.current_index = self.current_idx
+
+            # break out of loop (optional)
+            # self.stop_flag = self.trajectory.check_goal(self.x, self.y, self.speed, self.final_goal,
+            #                                             self.current_idx, self.path.shape[0])
+
+            # if self.stop_flag:
+            #     # if self.current_idx >= len(self.path[:, 0]):
+            #     #     self.get_logger().info("Target index out of bounds")
+            #     #     return
+            #
+            #     self.get_logger().info("Goal reached")
+            #     return
 
             if self.initial_pose_received and not self.stop_flag:
                 '''update: reference trajectory, reference input, previous input, current state (warmstart)'''
@@ -529,6 +604,12 @@ class KinematicCoupledDoMPCNode(Node):
                 y = self.y
                 vel = self.speed
                 psi = self.yaw
+
+                normalized_yaw_diff = trajectory_utils.normalize_angle(psi - xref[3, 0],
+                                                                       minus_pi_to_pi=True, pi_is_negative=True,
+                                                                       degrees=False)
+                self.cumulative_distance += trajectory_utils.calculate_current_arc_length(
+                        self.speed, normalized_yaw_diff, self.sample_time)
 
                 # update previous input
                 self.u_prev = self.uk.copy()
@@ -581,9 +662,9 @@ class KinematicCoupledDoMPCNode(Node):
                 x_state_ref = self.Controller.mpc.data.prediction(('_tvp', 'x_ref', 0), t_ind=time_index).reshape(-1, 1)
                 y_state_ref = self.Controller.mpc.data.prediction(('_tvp', 'y_ref', 0), t_ind=time_index).reshape(-1, 1)
                 vel_state_ref = self.Controller.mpc.data.prediction(('_tvp', 'vel_ref', 0), t_ind=time_index).reshape(
-                    -1, 1)
+                        -1, 1)
                 psi_state_ref = self.Controller.mpc.data.prediction(('_tvp', 'psi_ref', 0), t_ind=time_index).reshape(
-                    -1, 1)
+                        -1, 1)
                 self.xref[:, :] = np.hstack([x_state_ref, y_state_ref, vel_state_ref, psi_state_ref])  # todo: refactor
                 self.target_point = self.xref[0, :].tolist()  # todo: refactor
 
@@ -598,7 +679,7 @@ class KinematicCoupledDoMPCNode(Node):
 
         # todo: replace with an else block and just  print that the model isn't initialized
         if self.path_received and self.desired_speed_received and not self.mpc_initialized:
-            self.reference_path = np.array([self.path[:, 0], self.path[:, 1], self.speeds, self.des_yaw_list]).T  # todo: remove
+            self.reference_path = np.array([self.path[:, 0], self.path[:, 1], self.speeds, self.des_yaw_list]).T
             self.initialize_mpc()  # todo: initialize during init phase as this causes the model to not be generated early when replaying rosbags
 
     def input_saturation(self):

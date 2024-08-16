@@ -19,14 +19,20 @@ PP Pipeline:
 Todo:
     Use path message instead of loading from CSV [done]
     Add derivative in PI controller [done]
+    Increase carla simulation sample size and time
+    Test live with F1/10
+    Add timeout to queue get and put blocking methods
+    Update purepursuit class with the latest changes
     Switch to Purepursuit class
     Switch to PID class
+    Move PID speed controller to separate node
     Test debug and purepursuit queues and speedup
-    setup Queues for actuation commands, odom, accel, etc
+    setup Queues for actuation commands, odom, accel, etc or thread locks
+    Test Queues with smaller timeouts
     Add a flag for stamped or unstamped message
     Make speed command optional
-    Move PID speed controller to separate node
-    Add adaptive lookahead
+    Rename topics to purepursuit namespace
+    Test adaptive lookahead
     Implement transformations
     Implement collision avoidance
     Implement regulated pp
@@ -39,6 +45,7 @@ Todo:
     Test adaptive lookahead
 """
 import math
+import time
 import numpy as np
 import os
 import sys
@@ -72,6 +79,11 @@ from geometry_msgs.msg import Point, Pose, PoseStamped, PoseArray, Quaternion, P
     PoseWithCovarianceStamped, PointStamped, TransformStamped, TwistStamped, AccelWithCovarianceStamped
 from nav_msgs.msg import Odometry, Path
 from ackermann_msgs.msg import AckermannDriveStamped
+
+# Custom messages.
+from trajectory_following_ros2.utils.Trajectory import Trajectory
+import trajectory_following_ros2.utils.filters as filters
+import trajectory_following_ros2.utils.trajectory_utils as trajectory_utils
 
 
 class PurePursuitNode(Node):
@@ -140,8 +152,8 @@ class PurePursuitNode(Node):
 
         '''Speed stuff'''
         self.declare_parameter('max_speed', 1.0)
-        self.declare_parameter('speed_Kp', 1.0)
-        self.declare_parameter('speed_Ki', 0.1)
+        self.declare_parameter('speed_Kp', 2.0)  # uses PID if P gain > 0
+        self.declare_parameter('speed_Ki', 0.2)
         self.declare_parameter('speed_Kd', 0.0)
         self.declare_parameter('desired_speed', 0.0)
 
@@ -222,6 +234,13 @@ class PurePursuitNode(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.state_frame_id = ''  # the frame ID of the pose state received. odom, map. todo: transform <-> self.global frame
 
+        # initialize trajectory class
+        self.trajectory = Trajectory(search_index_number=10,
+                                     goal_tolerance=self.distance_tolerance,
+                                     stop_speed=self.speed_tolerance
+                                     )
+        self.trajectory_initialized = False
+
         self.waypoints = None
         self.des_yaw_list = None
         self.speeds = None
@@ -229,11 +248,15 @@ class PurePursuitNode(Node):
 
         # Setup queues for multi-thread access
         self.mutex = threading.Lock()  # or threading.RLock()
-        queue_size = 10
+        queue_size = 100
         self.location_queue = queue.Queue(maxsize=queue_size)
         self.orientation_queue = queue.Queue(maxsize=queue_size)
         self.yaw_queue = queue.Queue(maxsize=queue_size)
         self.goal_queue = queue.Queue(maxsize=queue_size)
+
+        # todo: remove
+        self.purepursuit_dt = None
+        self.debug_dt = None
 
         # ReentrantCallbackGroup() or MutuallyExclusiveCallbackGroup()
         self.subscription_group = ReentrantCallbackGroup()
@@ -254,7 +277,7 @@ class PurePursuitNode(Node):
                 self.speed_topic,
                 self.desired_speed_callback,
                 qos_profile=latching_qos,
-#                 callback_group=self.subscription_group
+                # callback_group=self.subscription_group
         )  # to get the desired/reference states of the robot
         self.odom_sub = self.create_subscription(
                 Odometry,
@@ -316,6 +339,11 @@ class PurePursuitNode(Node):
             data_queue.put(data, block=True)
 
     def path_callback(self, data):
+        """
+        Todo: add flag to remove duplicates, smooth path, speed, yaw, etc.
+        :param data:
+        :return:
+        """
         path_frame_id = data.header.frame_id
         path_time = data.header.stamp
 
@@ -352,15 +380,46 @@ class PurePursuitNode(Node):
         self.goal = self.waypoints[self.target_ind, :]  #  self.target_point
         self.update_queue(self.goal_queue, self.goal)
         self.dist_arr = np.zeros(len(self.waypoints))  # array of distances used to check closes path
-        if self.desired_speed_received:
-            self.reference_path = np.array(
-                    [self.waypoints[:, 0], self.waypoints[:, 1], self.speeds, self.des_yaw_list]).T  # todo: remove
+
+        self.trajectory.current_index = self.current_idx
+        self.trajectory.trajectory = np.zeros(
+                (self.path.shape[0], len(self.trajectory.trajectory_keys)))
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['x']] = self.path[:, 0]
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['y']] = self.path[:, 1]
+
+        self.trajectory.trajectory[:,
+        self.trajectory.trajectory_key_to_column['yaw']] = self.des_yaw_list
+
+        # self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['dt']] = csv_df.dt.values
+        # self.trajectory.trajectory[:,
+        # self.trajectory.trajectory_key_to_column['total_time_elapsed']] = csv_df.total_time_elapsed.values
+
+        cdists = trajectory_utils.cumulative_distance_along_path(
+                self.trajectory.trajectory[:, [self.trajectory.trajectory_key_to_column['x'],
+                                               self.trajectory.trajectory_key_to_column['y']]])
+        curvs_all = trajectory_utils.calculate_curvature_all(cdists,
+                                                             self.trajectory.trajectory[:,
+                                                             self.trajectory.trajectory_key_to_column['yaw']],
+                                                             smooth=True)
+
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['curvature']] = curvs_all
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['cum_dist']] = cdists
 
     def desired_speed_callback(self, data):
+        """
+        Todo: add flag to remove duplicates, smooth path, speed, yaw, etc.
+        :param data:
+        :return:
+        """
         speed_list = []
         for speed in data.data:
             speed_list.append(speed)
         self.speeds = np.array(speed_list)
+
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['speed']] = self.speeds
+        # self.trajectory.trajectory[:,
+        # self.trajectory.trajectory_key_to_column['omega']] = csv_df.omega.values  # todo
+
         self.desired_speed_received = True
 
     def get_distance(self, location, waypoint):
@@ -449,11 +508,31 @@ class PurePursuitNode(Node):
         self.acceleration = longitudinal_acc
 
     def purepursuit_callback(self):
+        # self.get_logger().info(f"##### Entered purepursuit callback")
+        # start_time = time.time()
+        # current_time = self.get_clock().now()
+        # if self.purepursuit_dt is not None:
+        #     time_delta = current_time - self.purepursuit_dt
+        #     time_delta = time_delta.nanoseconds / 1e+9
+        #     self.get_logger().info(f"##### Purepursuit Time delta: {time_delta}")
+        #
+        # self.purepursuit_dt = current_time
+
+        if self.path_received and self.desired_speed_received and not self.trajectory_initialized:
+            # todo: account for no speed topic but desired speed != 0
+            self.reference_path = np.array(
+                    [self.waypoints[:, 0], self.waypoints[:, 1], self.speeds, self.des_yaw_list]).T
+            self.trajectory_initialized = True
+
         if self.initial_pose_received and self.path_received:
-            self.get_target_point()
-            self.stop_flag = self.stop(self.target_ind, self.final_idx,
-                                       self.location, self.final_goal,
-                                       self.goal_tolerance)
+            self.get_target_point()  # self.get_target_point_old()
+            # self.stop_flag = self.stop(self.target_ind, self.final_idx,
+            #                            self.location, self.final_goal,
+            #                            self.goal_tolerance)
+
+            self.stop_flag = self.trajectory.check_goal(self.x, self.y, self.speed,
+                                                        self.final_goal, self.target_ind, self.final_idx)
+
             if not self.stop_flag:
                 self.get_desired_steering_angle()
                 # self.speed_error = self.desired_speed - self.speed
@@ -468,8 +547,7 @@ class PurePursuitNode(Node):
 
                 speed_cmd = target_speed
                 if abs(self.speed_Kp) > 0.0:
-                    #speed_cmd = self.set_speed(target_speed, self.speed)  # todo: test speed PID
-                    pass
+                    speed_cmd = self.set_speed(target_speed, self.speed)
 
                 #self.get_logger().info(f"Speed (after) error: {self.speed_error}, desired: {self.desired_speed}, actual: {self.speed}")
                 #self.get_logger().info(f"Desired steering angle: {self.desired_steering_angle}")
@@ -478,6 +556,8 @@ class PurePursuitNode(Node):
                 speed_cmd = np.clip(speed_cmd, -self.MAX_SPEED, self.MAX_SPEED)
                 # self.get_logger().info(f"Sending cmd speed: {speed_cmd}, steering: {self.desired_steering_angle}, idx: {self.target_ind}")
                 self.publish_command(self.desired_steering_angle, speed_cmd)
+
+        # self.get_logger().info(f"##### Left purepursuit callback after {abs(time.time() - start_time)} seconds")
 
     def get_desired_steering_angle(self):
         """
@@ -563,7 +643,7 @@ class PurePursuitNode(Node):
             self.lookahead = np.clip(lookahead, self.MIN_LOOKAHEAD, self.MAX_LOOKAHEAD)
             return
 
-    def get_target_point(self):
+    def get_target_point_old(self):
         """
         Get the next look ahead point
         :param pos: list, vehicle position
@@ -596,6 +676,19 @@ class PurePursuitNode(Node):
         self.goal = self.get_point(self.target_ind)
         self.update_queue(self.goal_queue, self.goal)
         #self.get_logger().info(f"Get target point callback... Target_ind: {self.target_ind}, goal point: {self.goal}")
+
+    def get_target_point(self):
+        self.update_lookahead()
+        # todo: get acceleration from Kalman Filter node
+        self.update_states(acceleration=self.acceleration, steering_angle=self.desired_steering_angle)
+
+        self.target_ind, _, _, _, _, _ = self.trajectory.calc_ref_trajectory(
+            state=None, trajectory=None, current_index=None,
+            dt=0.02, prediction_horizon=50,
+            lookahead_time=1.0, lookahead=self.lookahead,
+            num_points_to_interpolate=50)
+        self.goal = self.get_point(self.target_ind)
+        self.update_queue(self.goal_queue, self.goal)
 
     def get_point(self, index):
         point = self.waypoints[index]
@@ -666,6 +759,16 @@ class PurePursuitNode(Node):
         timestamp = self.get_clock().now().to_msg()
         frame_id = self.robot_frame
 
+        # self.get_logger().info(f"##### Entered debug callback")
+        # start_time = time.time()
+        # current_time = self.get_clock().now()
+        # if self.debug_dt is not None:
+        #     time_delta = current_time - self.debug_dt
+        #     time_delta = time_delta.nanoseconds / 1e+9
+        #     self.get_logger().info(f"##### debug Time delta: {time_delta}")
+        #
+        # self.debug_dt = current_time
+
         if self.initial_pose_received and self.path_received:
             goal = None
             location = None
@@ -711,6 +814,8 @@ class PurePursuitNode(Node):
                 waypoint_pose.pose.orientation.z = self.des_yaw_list[index]
                 path_msg.poses.append(waypoint_pose)
             self.purepursuit_path_pub.publish(path_msg)
+
+        # self.get_logger().info(f"##### Left debug callback after {abs(time.time() - start_time)} seconds")
 
 
 def main(args=None):

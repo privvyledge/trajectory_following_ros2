@@ -4,7 +4,7 @@
 
 import numpy as np
 # from casadi import *
-from casadi import mtimes, vertcat
+from casadi import mtimes, vertcat, vertsplit
 # from casadi.tools import *
 import do_mpc
 from trajectory_following_ros2.do_mpc.model import BicycleKinematicModel
@@ -19,7 +19,6 @@ class MPC(object):
                  vel_bound=(-5.0, 5.0), delta_bound=(-23.0, 23.0), acc_bound=(-3.0, 3.0),
                  max_iterations=20, tolerance=1e-6, suppress_ipopt_output=True):
         """Constructor for MPC"""
-        self.vehicle = vehicle
         self.model = vehicle.model
 
         self.horizon = horizon
@@ -29,10 +28,7 @@ class MPC(object):
         self.Rd = Rd
 
         self.Ts = sample_time
-        self.length = wheelbase  # todo: set as parameters
-        self.width = 0.192  # todo: set as parameters
-
-        self.current_prediction = None
+        self.reference_states = np.zeros((self.horizon + 1, self.Q.shape[0]))
 
         self.mpc = self.initialize_mpc(model=self.model, horizon=self.horizon,
                                        timestep=self.Ts, store_full_solution=True)
@@ -94,49 +90,10 @@ class MPC(object):
     def tvp_fun(self, t_now):
         """
         provides data into time-varying parameters.
-        todo: change how reference trajectories are generated, e.g using velocity
-        todo: pass trajectories or trajectory generator function to initializer and call here
         """
-        # # Method 1
-        # for k in range(self.horizon):
-        #     # extract information from current waypoint
-        #     current_waypoint = self.vehicle.reference_path[
-        #             self.vehicle.wp_id + k
-        #     ]
-        #     self.tvp_template['_tvp', k, 'x_ref'] = current_waypoint[0]
-        #     self.tvp_template['_tvp', k, 'y_ref'] = current_waypoint[1]
-        #
-        #     if current_waypoint[2] is not None:
-        #         self.tvp_template['_tvp', k,
-        #                           'vel_ref'] = current_waypoint[2]
-        #     else:
-        #         self.tvp_template['_tvp', k, 'vel_ref'] = 0
-        #
-        #     self.tvp_template['_tvp', k, 'psi_ref'] = current_waypoint[3]
-        #     # self.tvp_template['_tvp', k, 'ey_lb'] = ey_lb[k]
-        #     # self.tvp_template['_tvp', k, 'ey_ub'] = ey_ub[k]
-
-        # method 2
-        current_waypoint = self.vehicle.reference_path[self.vehicle.wp_id]
-        xk = current_waypoint[0]
-        yk = current_waypoint[1]
-        vel_k = current_waypoint[2]  # sp[ind] or state.vel
-        psi_k = current_waypoint[3]
-        try:
-            delta = int(self.mpc.data['_u', 'delta'][0])
-        except IndexError:
-            delta = 0.0
-
-        for k in range(self.horizon + 1):
-            self.tvp_template['_tvp', k, 'x_ref'] = xk
-            self.tvp_template['_tvp', k, 'y_ref'] = yk
-            self.tvp_template['_tvp', k, 'vel_ref'] = vel_k
-            self.tvp_template['_tvp', k, 'psi_ref'] = psi_k
-
-            xk += (vel_k * np.cos(psi_k)) * self.Ts
-            yk += (vel_k * np.sin(psi_k)) * self.Ts
-            vel_k += 0.0 * self.Ts
-            psi_k += ((vel_k / self.vehicle.length) * np.tan(delta)) * self.Ts
+        # self.tvp_template['_tvp', 0] = [xk, yk, vel_k, psi_k]
+        self.tvp_template['_tvp', :] = np.vsplit(self.reference_states, self.horizon + 1)
+        # or self.tvp_template['_tvp', 0:(self.horizon + 1)] = casadi.vertsplit(self.reference_states)
 
         return self.tvp_template
 
@@ -220,6 +177,11 @@ class MPC(object):
 
         return u0
 
+    def update(self, reference):
+        # todo: to update reference used by tvp instead of calculating
+        self.reference_states = reference
+        pass
+
     def distance_update(self, states, s):
         vel, psi = states[2], states[3]
 
@@ -235,17 +197,18 @@ class MPC(object):
 def initialize_mpc_problem(reference_path, horizon=15, sample_time=0.02,
                            Q=None, R=None, Qf=None, Rd=None, wheelbase=0.256,
                            delta_min=-23.0, delta_max=23.0, vel_min=-10.0, vel_max=10.0,
-                           ay_max=4.0, acc_min=-3.0, acc_max=3.0, max_iterations=100, tolerance=1e-6, suppress_ipopt_output=True):
+                           ay_max=4.0, acc_min=-3.0, acc_max=3.0,
+                           max_iterations=100, tolerance=1e-6, suppress_ipopt_output=True, model_type='continuous'):
     """
     Get configured do-mpc modules:
     """
     # model setup
-    Vehicle = BicycleKinematicModel(length=wheelbase, width=0.192, sample_time=sample_time)
+    Vehicle = BicycleKinematicModel(wheelbase=wheelbase, width=0.192, sample_time=sample_time, model_type=model_type)
     # Vehicle.model_setup()
-    Vehicle.reference_path = reference_path
-    Vehicle.current_waypoint = [Vehicle.reference_path[Vehicle.wp_id, 0], Vehicle.reference_path[Vehicle.wp_id, 1],
-                                Vehicle.reference_path[Vehicle.wp_id, 2], Vehicle.reference_path[Vehicle.wp_id, 3],
-                                0]
+    # Vehicle.reference_path = reference_path
+    # Vehicle.current_waypoint = [Vehicle.reference_path[Vehicle.wp_id, 0], Vehicle.reference_path[Vehicle.wp_id, 1],
+    #                             Vehicle.reference_path[Vehicle.wp_id, 2], Vehicle.reference_path[Vehicle.wp_id, 3],
+    #                             0]
 
     Controller = MPC(Vehicle, horizon=horizon, sample_time=sample_time, Q=Q, R=R, Qf=Qf, Rd=Rd, wheelbase=wheelbase,
                      vel_bound=(vel_min, vel_max), delta_bound=(delta_min, delta_max), acc_bound=(acc_min, acc_max),

@@ -108,8 +108,8 @@ def kinematic_model(symbol_type='MX'):
     model.vel_min = -1.5
     model.vel_max = 1.5
 
-    model.psi_min = -2 * np.pi
-    model.psi_max = 2 * np.pi
+    model.psi_min = -np.pi
+    model.psi_max = np.pi
 
     # input bounds
     model.acc_min = -3.0

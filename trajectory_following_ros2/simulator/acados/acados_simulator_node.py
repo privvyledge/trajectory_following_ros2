@@ -2,16 +2,10 @@
 Path and trajectory following kinematic model.
 
 Todo:
-    * publish odom transform
-    * don't hardcode model into do-mpc, instead use vectors
-    * setup do-mpc to return the mpc object only.
-    * setup do-mpc update
-    * setup do-mpc warmstart
-    * setup parameter type
-    * setup point stabilization, i.e go to goal from RVIz pose
-    * change model input to velocity instead of acceleration or use a model
-    * speed up do-mpc
-    * load compiled model
+    * publish odom transform [done]
+    * add global and robot frames
+    * add clock publisher using python time, e.g see Carla ros-bridge bridge.py
+    * improve the accuracy of the simulator
 """
 import math
 import time
@@ -55,6 +49,43 @@ class KinematicAcadosMPCSimulationNode(Node):
         """Constructor for KinematicCoupledMPCNode"""
         super(KinematicAcadosMPCSimulationNode, self).__init__('kinematic_acados_simulator')
         # declare parameters
+        # todo: transform from/to the global and robot frames
+        self.declare_parameter('robot_frame', 'base_link',
+                               ParameterDescriptor(description='The frame attached to the car. '
+                                                               'The relative/local frame. '
+                                                               'Usually the ground projection of the center '
+                                                               'of the rear axle of a car or the center of gravity '
+                                                               'of a differential robot. '
+                                                               'Actuation commands, speed and acceleration are '
+                                                               'relative to this frame.'
+                                                               'E.g base_link, base_footprint, '
+                                                               'ego_vehicle (Carla). '
+                                                               'Obstacle positions could be specified '
+                                                               'relative to this frame or the global frame.'))
+        self.declare_parameter('global_frame', 'odom',
+                               ParameterDescriptor(description='The global/world/map frame. '
+                                                               'This frame is static and ideally its origin should '
+                                                               'not change during the lifetime of motion. '
+                                                               'Position errors are usually calculated relative '
+                                                               'to this frame, e.g X, Y, Psi '
+                                                               'for MPC, purepursuit, etc. '
+                                                               'Target/goal positions are also specified here.'
+                                                               'Usually the ground projection of the center '
+                                                               'of the rear axle of a car or the center of gravity '
+                                                               'of a differential robot. '
+                                                               'Obstacle positions could be specified '
+                                                               'relative to this frame or the robots frame.'
+                                                               'E.g odom, map. '
+                                                               'ROS2 Nav2 local costmaps are usually '
+                                                               'in this frame, i.e "odom", '
+                                                               'odometry messages are also in the "odom" frame '
+                                                               'whereas waypoints and goal poses are usually '
+                                                               'specified in the "map" or "gnss" frame so it makes '
+                                                               'sense to transform the goal points (waypoints) to the '
+                                                               '"odom" frame. '
+                                                               'Since Carla does not use the odom frame, '
+                                                               'set to "map", '
+                                                               'otherwise use "odom".'))  # global frame: odom, map
         self.declare_parameter('model_type', "continuous")  # todo: also augmented, etc
         # self.declare_parameter('csv_columns', (0, 2, 3, 5, 10))  # what columns to load if loading from a CSV file
         self.declare_parameter('update_rate', 50.0)
@@ -89,6 +120,8 @@ class KinematicAcadosMPCSimulationNode(Node):
         self.declare_parameter('initial_acceleration', 0.0)
 
         # get parameters
+        self.robot_frame = self.get_parameter('robot_frame').value
+        self.global_frame = self.get_parameter('global_frame').value
         self.update_rate = self.get_parameter('update_rate').value
 
         self.WHEELBASE = self.get_parameter('wheelbase').value  # [m] wheelbase of the vehicle
@@ -218,7 +251,7 @@ class KinematicAcadosMPCSimulationNode(Node):
         self.yaw_rate = (self.speed / self.WHEELBASE) * math.tan(uk[1, 0])
         self.acceleration = self.speed / self.sample_time
 
-        self.publish_transform()  # todo: test
+        self.publish_transform()
         self.publish_odometry()
         self.publish_acceleration()
 
@@ -232,8 +265,8 @@ class KinematicAcadosMPCSimulationNode(Node):
         :return:
         """
         odom_msg = Odometry()
-        odom_msg.header.frame_id = 'odom'
-        odom_msg.child_frame_id = 'base_link'
+        odom_msg.header.frame_id = self.global_frame
+        odom_msg.child_frame_id = self.robot_frame
         odom_msg.header.stamp = self.get_clock().now().to_msg()
 
         odom_msg.pose.pose.position.x = self.x
@@ -258,7 +291,7 @@ class KinematicAcadosMPCSimulationNode(Node):
 
     def publish_acceleration(self):
         accel_msg = AccelWithCovarianceStamped()
-        accel_msg.header.frame_id = 'base_link'
+        accel_msg.header.frame_id = self.robot_frame
 
         accel_msg.accel.accel.linear.x = self.acceleration
         accel_msg.accel.accel.angular.z = self.yaw_rate / self.sample_time
@@ -266,11 +299,10 @@ class KinematicAcadosMPCSimulationNode(Node):
         self.accel_pub.publish(accel_msg)
 
     def publish_transform(self):
-        # todo: test
         t = TransformStamped()
         t.header.stamp = self.get_clock().now().to_msg()
-        t.header.frame_id = 'odom'
-        t.child_frame_id = 'base_link'
+        t.header.frame_id = self.global_frame
+        t.child_frame_id = self.robot_frame
         t.transform.translation.x = self.x
         t.transform.translation.y = self.y
         t.transform.translation.z = 0.0

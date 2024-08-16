@@ -11,6 +11,12 @@ Tips:
     5. ROS2 Nav2 Controller plugin explanation (https://navigation.ros.org/plugin_tutorials/docs/writing_new_nav2controller_plugin.html)
     6. For an interesting cost function, see (https://discourse.acados.org/t/how-to-set-weights-of-costs-according-to-the-time-interval-in-mpc-prediction-horizon/1001)
 Todo:
+    * normalize angle difference between current and desired yaw to [-pi, pi) or [0, 2pi).
+        Since acados does not give an interface to manipulate the cost function:
+        1. get the difference and normalize
+        2. pass the normalized difference to the cost function as the current yaw/psi states
+        3. pass 0.0 as the desired yaw/psi state
+    * initialize MPC during init phase
     * use desired speed parameter
     * change current desired speed topic to desired speed array
     * add desired speed topic to a Float64 message and optionally generate a velocity profile
@@ -81,8 +87,10 @@ from geometry_msgs.msg import Point, Pose, PoseStamped, PoseArray, Quaternion, P
 from nav_msgs.msg import Odometry, Path
 from ackermann_msgs.msg import AckermannDriveStamped
 
-# Custom messages. todo: probably remove Vehicle and trajectory stuff but import casadi model instead
+# Custom messages.
 from trajectory_following_ros2.utils.Trajectory import Trajectory
+import trajectory_following_ros2.utils.filters as filters
+import trajectory_following_ros2.utils.trajectory_utils as trajectory_utils
 from trajectory_following_ros2.acados.acados_settings import acados_settings
 
 
@@ -184,7 +192,6 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('model_directory',
                                '/f1tenth_ws/src/trajectory_following_ros2/data/model')  # don't use absolute paths
 
-
         # get parameter values
         self.robot_frame = self.get_parameter('robot_frame').value
         self.global_frame = self.get_parameter('global_frame').value
@@ -251,10 +258,10 @@ class KinematicCoupledAcadosMPCNode(Node):
             self.prediction_time = self.sample_time * self.horizon
 
         # initialize trajectory class
-        self.trajectory_instance = Trajectory(search_index_number=10,
-                                              goal_tolerance=self.distance_tolerance,
-                                              stop_speed=self.speed_tolerance
-                                              )
+        self.trajectory = Trajectory(search_index_number=10,
+                                     goal_tolerance=self.distance_tolerance,
+                                     stop_speed=self.speed_tolerance
+                                     )
 
         self.acc_cmd, self.delta_cmd, self.velocity_cmd = 0.0, 0.0, 0.0
         self.zk = np.zeros((self.NX, 1))  # x, y, psi, velocity, psi
@@ -280,6 +287,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))  # todo: remove
         self.rear_y = self.y - ((self.WHEELBASE / 2) * math.sin(self.yaw))  # todo: remove
         self.location = [self.x, self.y]  # todo: remove
+        self.cumulative_distance = 0.0
         self.alpha = 0.0  # yaw error  # todo: remove
         self.desired_curvature = 0.0  # todo: remove
         self.desired_steering_angle = 0.0  # todo: remove
@@ -370,6 +378,11 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.get_logger().info('kinematic_coupled_acados_mpc_controller node started. ')
 
     def path_callback(self, data):
+        """
+        Todo: add flag to remove duplicates, smooth path, speed, yaw, etc.
+        :param data:
+        :return:
+        """
         path_frame_id = data.header.frame_id
         path_time = data.header.stamp
 
@@ -396,23 +409,51 @@ class KinematicCoupledAcadosMPCNode(Node):
             _, _, node_yaw = tf_transformations.euler_from_quaternion([node_qx, node_qy, node_qz, node_qw])
             yaw_list.append(node_yaw)
 
+        # todo: optionally interpolate and speed
         self.path = np.array(coordinate_list)
         self.des_yaw_list = np.array(yaw_list)
         self.frame_id_list = frame_id_list
         self.path_received = True
         self.final_idx = self.path.shape[0] - 1
         self.final_goal = self.path[self.final_idx, :]
-        # self.dist_arr = np.zeros(len(
-        # self.path))  # array of distances used to check closes path
-        if self.desired_speed_received:
-            self.reference_path = np.array(
-                    [self.path[:, 0], self.path[:, 1], self.speeds, self.des_yaw_list]).T  # todo: remove
+
+        self.trajectory.trajectory = np.zeros(
+                (self.path.shape[0], len(self.trajectory.trajectory_keys)))
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['x']] = self.path[:, 0]
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['y']] = self.path[:, 1]
+
+        self.trajectory.trajectory[:,
+        self.trajectory.trajectory_key_to_column['yaw']] = self.des_yaw_list
+
+        # self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['dt']] = csv_df.dt.values
+        # self.trajectory.trajectory[:,
+        # self.trajectory.trajectory_key_to_column['total_time_elapsed']] = csv_df.total_time_elapsed.values
+
+        cdists = trajectory_utils.cumulative_distance_along_path(
+                self.trajectory.trajectory[:, [self.trajectory.trajectory_key_to_column['x'],
+                                               self.trajectory.trajectory_key_to_column['y']]])
+        curvs_all = trajectory_utils.calculate_curvature_all(cdists,
+                                                             self.trajectory.trajectory[:,
+                                                             self.trajectory.trajectory_key_to_column['yaw']],
+                                                             smooth=True)
+
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['curvature']] = curvs_all
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['cum_dist']] = cdists
 
     def desired_speed_callback(self, data):
+        """
+                Todo: add flag to remove duplicates, smooth path, speed, yaw, etc.
+                :param data:
+                :return:
+                """
         speed_list = []
         for speed in data.data:
             speed_list.append(speed)
         self.speeds = np.array(speed_list)
+
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['speed']] = self.speeds
+        # self.trajectory.trajectory[:, 
+        # self.trajectory.trajectory_key_to_column['omega']] = csv_df.omega.values  # todo
         self.desired_speed_received = True
 
     def initialize_mpc(self):
@@ -556,29 +597,46 @@ class KinematicCoupledAcadosMPCNode(Node):
 
         longitudinal_acc, lateral_acc = linear_acceleration.x, linear_acceleration.y
         roll_acceleration, pitch_acceleration, yaw_acceleration = angular_acceleration.x, \
-                                                                  angular_acceleration.y, \
-                                                                  angular_acceleration.z
+            angular_acceleration.y, \
+            angular_acceleration.z
         _, _, yaw_rate = roll_acceleration * self.dt, pitch_acceleration * self.dt, yaw_acceleration * self.dt
         self.acceleration = longitudinal_acc
 
     def mpc_callback(self):
         # todo: refactor this method
         if self.mpc_initialized:
-            # get target point and update reference. todo: setup interpolation of all states and references for the horizon
-            xref, self.current_idx, _ = self.trajectory_instance.calc_ref_trajectory(self.x,
-                                                                                     self.y,
-                                                                                     self.path[:, 0],
-                                                                                     self.path[:, 1],
-                                                                                     self.des_yaw_list, 0,
-                                                                                     self.speeds, 1.,
-                                                                                     self.current_idx,
-                                                                                     n_states=self.NX,
-                                                                                     horizon_length=self.horizon,
-                                                                                     dt=self.sample_time)
-            self.xref[:, :] = xref.T
+            # get the robots current state, waypoint index and normalize the angle from -pi to pi or [0, 2PI). todo: update state in purepursuit and MPC node
+            self.trajectory.current_index = self.current_idx
+            self.trajectory.state[0, self.trajectory.state_key_to_column['x']] = self.x
+            self.trajectory.state[0, self.trajectory.state_key_to_column['y']] = self.y
+            self.trajectory.state[0, self.trajectory.state_key_to_column['speed']] = self.speed
+            self.trajectory.state[0, self.trajectory.state_key_to_column['yaw']] = self.yaw
+            self.trajectory.state[0, self.trajectory.state_key_to_column['omega']] = self.omega
+            self.trajectory.state[
+                0, self.trajectory.state_key_to_column['curvature']] = trajectory_utils.calculate_curvature_single(
+                    self.trajectory.trajectory[:,
+                    [self.trajectory.trajectory_key_to_column['x'],
+                     self.trajectory.trajectory_key_to_column['y']]],
+                    goal_index=self.current_idx)
+            self.trajectory.state[0, self.trajectory.state_key_to_column['cum_dist']] = self.cumulative_distance
+
             # break out of loop (optional)
-            self.stop_flag = self.trajectory_instance.check_goal(self.x, self.y, self.speed, self.final_goal,
-                                                                 self.current_idx, self.path.shape[0])
+            self.stop_flag = self.trajectory.check_goal(self.x, self.y, self.speed, self.final_goal,
+                                                        self.current_idx, self.path.shape[0])
+
+            # get target point and update reference. todo: setup interpolation of all states and references for the horizon
+            xref, self.current_idx, _ = self.trajectory.calc_ref_trajectory(self.x,
+                                                                            self.y,
+                                                                            self.path[:, 0],
+                                                                            self.path[:, 1],
+                                                                            self.des_yaw_list, 0,
+                                                                            self.speeds, 1.,
+                                                                            self.current_idx,
+                                                                            n_states=self.NX,
+                                                                            horizon_length=self.horizon,
+                                                                            dt=self.sample_time)
+            self.xref[:, :] = xref.T
+
             if self.stop_flag:
                 # if self.current_idx >= len(self.path[:, 0]):
                 #     self.get_logger().info("Target index out of bounds")
@@ -594,13 +652,21 @@ class KinematicCoupledAcadosMPCNode(Node):
                 y = self.y
                 vel = self.speed
                 psi = self.yaw
+                # # normalize the angle from -pi to pi or [0, 2PI). todo
+                # psi = (psi + math.pi) % (2 * math.pi) - math.pi
+
+                normalized_yaw_diff = trajectory_utils.normalize_angle(psi - xref[3, 0],
+                                                                       minus_pi_to_pi=True, pi_is_negative=True,
+                                                                       degrees=False)
+                self.cumulative_distance += trajectory_utils.calculate_current_arc_length(
+                        self.speed, normalized_yaw_diff, self.sample_time)
 
                 # update previous input
                 self.u_prev = self.uk.copy()
                 # self.controller.set(0, "u", self.u_prev.flatten())  # for now, not used by Acados
-                current_speed = self.speed
+                # current_speed = self.speed
 
-                # initial condition
+                # initial condition. todo: set vel and other constraints
                 self.controller.constraints_set(0, "lbx", np.array([x, y, vel, psi]))  # zk.flatten()
                 self.controller.constraints_set(0, "ubx", np.array([x, y, vel, psi]))
 
@@ -614,10 +680,9 @@ class KinematicCoupledAcadosMPCNode(Node):
                                                  yref.flatten())  # update reference, cost_set(j, "yref", yref)
 
                     '''
-                    set the value of parameters
-                                                    wheelbase, zref, uref, z_k, u_prev
+                    set the value of parameters: wheelbase, zref, uref, z_k, u_prev
                     '''
-                    self.controller.set(j, "p", np.array([0.256,
+                    self.controller.set(j, "p", np.array([self.WHEELBASE,
                                                           *yref.flatten(),
                                                           *self.zk.flatten(),
                                                           *self.u_prev.flatten()]))
@@ -637,7 +702,7 @@ class KinematicCoupledAcadosMPCNode(Node):
                     self.controller.set(self.horizon, "yref", yref_N.flatten())
                 self.controller.set(self.horizon,
                                     "p",
-                                    np.array([0.256,
+                                    np.array([self.WHEELBASE,
                                               *yref_N.flatten(),
                                               *np.zeros(2),
                                               *self.zk.flatten(),
@@ -750,6 +815,7 @@ class KinematicCoupledAcadosMPCNode(Node):
 
         # todo: replace with an else block and just  print that the model isn't initialized
         if self.path_received and self.desired_speed_received and not self.mpc_initialized:
+            self.reference_path = np.array([self.path[:, 0], self.path[:, 1], self.speeds, self.des_yaw_list]).T
             self.initialize_mpc()  # todo: initialize during init phase as this causes the model to not be generated early when replaying rosbags
 
     def input_saturation(self):

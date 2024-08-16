@@ -6,7 +6,11 @@ Set default parameters
 Choose MPC type
 Remap nav2 path topic to
 
-Todo: setup node name arguments
+Todo:
+    * add purepursuit
+    * add MPC groups
+    * rename from MPC as it includes all controllers now
+    * setup node name arguments
 """
 
 import os

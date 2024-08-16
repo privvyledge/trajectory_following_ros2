@@ -155,7 +155,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
 
         ocp.cost.W = W  # weight matrix at intermediate shooting nodes (1 to N-1)
 
-        # set intial reference. Note: will be overwritten
+        # set initial reference. Note: will be overwritten
         ocp.cost.yref = np.zeros(ny)  # reference at intermediate shooting nodes (1 to N-1) [ny, 1]
 
     elif cost_module.lower() == "NONLINEAR_LS".lower():
@@ -169,7 +169,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         ocp.model.cost_y_expr = y
         ocp.cost.W = W  # weight matrix at intermediate shooting nodes (1 to N-1)
 
-        # set intial reference. Note: will be overwritten
+        # set initial reference. Note: will be overwritten
         ocp.cost.yref = np.zeros(ny)  # reference at intermediate shooting nodes (1 to N-1) [ny, 1]
 
     elif cost_module.lower() == "EXTERNAL".lower():
@@ -183,7 +183,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         # u_rate = casadi.vertcat(u_rate, casadi.diff(u_dv))  # to pack with horizon
 
         u_rate_cost = u_rate.T @ Rd @ u_rate  # doesn't work for now. Add to cost
-        ocp.model.cost_expr_ext_cost = 0.5 * (y - yref).T @ W @ (y - yref)
+        ocp.model.cost_expr_ext_cost = 0.5 * (y - yref).T @ W @ (y - yref)  # todo: normalize angle
 
     else:
         raise AttributeError(f'Invalid cost type ({cost_module}) specified.')
@@ -220,7 +220,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
                 model.x,
         )
         yref_e = yref[:nx]
-        ocp.model.cost_expr_ext_cost_e = 0.5 * (y_e - yref_e).T @ W_e @ (y_e - yref_e)
+        ocp.model.cost_expr_ext_cost_e = 0.5 * (y_e - yref_e).T @ W_e @ (y_e - yref_e)  # todo: normalize angle
 
     else:
         raise AttributeError(f'Invalid cost type ({cost_module_e}) specified.')
@@ -232,9 +232,9 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
 
     # setting constraints
     ocp.constraints.constr_type = 'BGH'  # b: box/decision variables, g: dynamics, h:nonlinear constraints
-    ocp.constraints.lbx = np.array([model.vel_min])  # state lower bound
-    ocp.constraints.ubx = np.array([model.vel_max])  # state upper bound
-    ocp.constraints.idxbx = np.array([2])  # index/indices of states with constraints, else +/-casadi.infinity
+    ocp.constraints.lbx = np.array([model.vel_min, model.psi_min])  # state lower bound
+    ocp.constraints.ubx = np.array([model.vel_max, model.psi_max])  # state upper bound
+    ocp.constraints.idxbx = np.array([2, 3])  # index/indices of states with constraints, else +/-casadi.infinity
 
     ocp.constraints.lbu = np.array([model.acc_min, model.delta_min])  # input lower bound
     ocp.constraints.ubu = np.array([model.acc_max, model.delta_max])  # input upper bound

@@ -6,7 +6,7 @@ Sources:
 
 import numpy as np
 from casadi import *
-# from casadi.tools import *
+from casadi.tools import *
 import matplotlib.pyplot as plt
 import matplotlib.patches as plt_patches
 
@@ -45,18 +45,6 @@ class Simulator(object):
         self.simulator.setup()
 
     def tvp_fun(self, t_now):
-        # extract information from current waypoint
-        current_waypoint = self.vehicle.reference_path[
-                self.vehicle.wp_id
-        ]
-        self.tvp_template['x_ref'] = current_waypoint[0]
-        self.tvp_template['y_ref'] = current_waypoint[1]
-        self.tvp_template['psi_ref'] = current_waypoint[2]
-        if current_waypoint[3] is not None:
-            self.tvp_template['vel_ref'] = current_waypoint[3]
-        else:
-            self.tvp_template['vel_ref'] = 0
-
         return self.tvp_template
 
     #################################################################
