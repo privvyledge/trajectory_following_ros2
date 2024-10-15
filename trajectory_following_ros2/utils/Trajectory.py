@@ -55,8 +55,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy import interpolate, signal, fft, ndimage, spatial
 
-import trajectory_utils
-import filters
+import trajectory_following_ros2.utils.filters as filters
+import trajectory_following_ros2.utils.trajectory_utils as trajectory_utils
 
 
 class Trajectory(object):
@@ -181,8 +181,8 @@ class Trajectory(object):
 
         try:
             target_index = ind[0]  # returns None if at the end of the trajectory
-        except Exception:
-            return None, None, None, None, None, None
+        except IndexError:
+            return current_index, None, None, None, None
 
         # find the next waypoint using the line intersection formula and compare to the above then pick one
         goal_waypoint0 = trajectory[target_index, [self.trajectory_key_to_column['x'], self.trajectory_key_to_column['y']]]  # trajectory[target_index, :]
@@ -270,7 +270,9 @@ class Trajectory(object):
 
     def check_goal(self, x, y, vel, goal, tind, nind):
         """
-
+        Todo:
+            * refactor speed stopping.
+            * enable looping
         :param state:
         :param goal:
         :param tind: target index
@@ -289,9 +291,12 @@ class Trajectory(object):
         if abs(tind - nind) >= 5:
             isgoal = False
 
-        isstop = (abs(vel) <= self.STOP_SPEED)
+        # isstop = (abs(vel) <= self.STOP_SPEED)  # todo: refactor
+        tolerance = 1.0
+        isstop = abs(vel - self.STOP_SPEED) <= tolerance
+        isstop = True
 
-        if isgoal and isstop:
+        if isgoal and isstop:  # and (tind >= nind)
             return True
 
         return False

@@ -132,6 +132,7 @@ class PurePursuitNode(Node):
                                                                'otherwise use "odom".'))  # global frame: odom, map
         self.declare_parameter('control_rate', 20.0)
         self.declare_parameter('goal_tolerance', 0.5)
+        self.declare_parameter('speed_tolerance', 0.5)  # todo: might need to refactor
         self.declare_parameter('lookahead_distance', 0.4)  # (0.4) [m] lookahead distance
         self.declare_parameter('min_lookahead', 0.3)
         self.declare_parameter('max_lookahead', 0.452 + 10.0)
@@ -162,6 +163,7 @@ class PurePursuitNode(Node):
         self.global_frame = self.get_parameter('global_frame').value
         self.control_rate = self.get_parameter('control_rate').value
         self.goal_tolerance = self.get_parameter('goal_tolerance').value
+        self.speed_tolerance = self.get_parameter('speed_tolerance').value
         self.desired_lookahead = self.get_parameter('lookahead_distance').value
         self.MIN_LOOKAHEAD = self.get_parameter('min_lookahead').value
         self.MAX_LOOKAHEAD = self.get_parameter('max_lookahead').value
@@ -214,6 +216,7 @@ class PurePursuitNode(Node):
         self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))
         self.rear_y = self.y - ((self.WHEELBASE / 2) * math.sin(self.yaw))
         self.location = [self.x, self.y]
+        self.cumulative_distance = 0.0
         self.alpha = 0.0  # yaw error
         self.desired_curvature = 0.0
         self.desired_steering_angle = 0.0
@@ -236,7 +239,7 @@ class PurePursuitNode(Node):
 
         # initialize trajectory class
         self.trajectory = Trajectory(search_index_number=10,
-                                     goal_tolerance=self.distance_tolerance,
+                                     goal_tolerance=self.goal_tolerance,
                                      stop_speed=self.speed_tolerance
                                      )
         self.trajectory_initialized = False
@@ -381,11 +384,11 @@ class PurePursuitNode(Node):
         self.update_queue(self.goal_queue, self.goal)
         self.dist_arr = np.zeros(len(self.waypoints))  # array of distances used to check closes path
 
-        self.trajectory.current_index = self.current_idx
+        self.trajectory.current_index = self.target_ind
         self.trajectory.trajectory = np.zeros(
-                (self.path.shape[0], len(self.trajectory.trajectory_keys)))
-        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['x']] = self.path[:, 0]
-        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['y']] = self.path[:, 1]
+                (self.waypoints.shape[0], len(self.trajectory.trajectory_keys)))
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['x']] = self.waypoints[:, 0]
+        self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['y']] = self.waypoints[:, 1]
 
         self.trajectory.trajectory[:,
         self.trajectory.trajectory_key_to_column['yaw']] = self.des_yaw_list
@@ -525,15 +528,19 @@ class PurePursuitNode(Node):
             self.trajectory_initialized = True
 
         if self.initial_pose_received and self.path_received:
-            self.get_target_point()  # self.get_target_point_old()
+            self.stop_flag = self.trajectory.check_goal(self.x, self.y, self.speed,
+                                                        self.final_goal, self.target_ind, self.final_idx)
+
             # self.stop_flag = self.stop(self.target_ind, self.final_idx,
             #                            self.location, self.final_goal,
             #                            self.goal_tolerance)
 
-            self.stop_flag = self.trajectory.check_goal(self.x, self.y, self.speed,
-                                                        self.final_goal, self.target_ind, self.final_idx)
-
             if not self.stop_flag:
+                ref_traj = self.get_target_point()  # self.get_target_point_old()
+                if ref_traj is None:
+                    self.publish_command(0.0, 0.0)
+                    return
+
                 self.get_desired_steering_angle()
                 # self.speed_error = self.desired_speed - self.speed
                 #self.get_logger().info(f"Speed (before) error: {self.speed_error}, desired: {self.desired_speed}, actual: {self.speed}")
@@ -552,16 +559,20 @@ class PurePursuitNode(Node):
                 #self.get_logger().info(f"Speed (after) error: {self.speed_error}, desired: {self.desired_speed}, actual: {self.speed}")
                 #self.get_logger().info(f"Desired steering angle: {self.desired_steering_angle}")
                 if not (self.MAX_SPEED >= speed_cmd >= -self.MAX_SPEED):
-                    self.get_logger().info(f"Desired speed of {speed_cmd} is higher than limit set. Saturating...")
+                    # self.get_logger().info(f"Desired speed of {speed_cmd} is higher than limit set. Saturating...")
+                    pass
                 speed_cmd = np.clip(speed_cmd, -self.MAX_SPEED, self.MAX_SPEED)
                 # self.get_logger().info(f"Sending cmd speed: {speed_cmd}, steering: {self.desired_steering_angle}, idx: {self.target_ind}")
                 self.publish_command(self.desired_steering_angle, speed_cmd)
+
+            else:
+                self.get_logger().info("Stop conditions met.")
+                self.publish_command(0.0, 0.0)
 
         # self.get_logger().info(f"##### Left purepursuit callback after {abs(time.time() - start_time)} seconds")
 
     def get_desired_steering_angle(self):
         """
-        Todo: saturate actuation commands
         """
         '''Calculate the yaw error'''
         # self.alpha = math.atan2(ty - self.rear_y, tx - self.rear_x) - self.yaw
@@ -591,7 +602,8 @@ class PurePursuitNode(Node):
         # desired_steering_angle = math.atan2(2.0 * abs(crosstrack_error), self.lookahead ** 2)  # Might be wrong
 
         if not (self.MAX_STEER_ANGLE >= desired_steering_angle >= self.MIN_STEER_ANGLE):
-            self.get_logger().info(f"Desired steering of {desired_steering_angle} is higher than limit set. Saturating...")
+            # self.get_logger().info(f"Desired steering of {desired_steering_angle} is higher than limit set. Saturating...")
+            pass
 
         self.desired_steering_angle = np.clip(desired_steering_angle, self.MIN_STEER_ANGLE, self.MAX_STEER_ANGLE)
 
@@ -678,17 +690,35 @@ class PurePursuitNode(Node):
         #self.get_logger().info(f"Get target point callback... Target_ind: {self.target_ind}, goal point: {self.goal}")
 
     def get_target_point(self):
+        # update trajectory state and reference
+        # get the robots current state, waypoint index and normalize the angle from -pi to pi or [0, 2PI). todo: update state in purepursuit and MPC node
+        self.trajectory.current_index = self.target_ind
+        self.trajectory.state[0, self.trajectory.state_key_to_column['x']] = self.x
+        self.trajectory.state[0, self.trajectory.state_key_to_column['y']] = self.y
+        self.trajectory.state[0, self.trajectory.state_key_to_column['speed']] = self.speed
+        self.trajectory.state[0, self.trajectory.state_key_to_column['yaw']] = self.yaw
+        self.trajectory.state[0, self.trajectory.state_key_to_column['omega']] = self.omega
+        self.trajectory.state[
+            0, self.trajectory.state_key_to_column['curvature']] = trajectory_utils.calculate_curvature_single(
+                self.trajectory.trajectory[:,
+                [self.trajectory.trajectory_key_to_column['x'],
+                 self.trajectory.trajectory_key_to_column['y']]],
+                goal_index=self.target_ind)
+        # self.trajectory.state[0, self.trajectory.state_key_to_column['cum_dist']] = self.cumulative_distance
+
         self.update_lookahead()
         # todo: get acceleration from Kalman Filter node
-        self.update_states(acceleration=self.acceleration, steering_angle=self.desired_steering_angle)
+        # self.update_states(acceleration=self.acceleration, steering_angle=self.desired_steering_angle)
 
-        self.target_ind, _, _, _, _, _ = self.trajectory.calc_ref_trajectory(
+        self.target_ind, ref_traj, _, _, _ = self.trajectory.calc_ref_trajectory(
             state=None, trajectory=None, current_index=None,
             dt=0.02, prediction_horizon=50,
             lookahead_time=1.0, lookahead=self.lookahead,
             num_points_to_interpolate=50)
         self.goal = self.get_point(self.target_ind)
         self.update_queue(self.goal_queue, self.goal)
+
+        return ref_traj
 
     def get_point(self, index):
         point = self.waypoints[index]
@@ -783,11 +813,12 @@ class PurePursuitNode(Node):
             # todo: either publish this directly to the robots frame, i.e base link or add to the robots global pose and publish in the global frame.
 
             if location is not None:
+                # todo: refactor
                 point_msg = PointStamped()
                 point_msg.header.stamp = timestamp
                 point_msg.header.frame_id = self.robot_frame  # self.robot_frame or self.global_frame. Todo: publishing to global frame does not account for orientation, transform first, else use base_link
-                point_msg.point.x = location[0]  # self.x  # self.lookahead, self.lookahead + self.x
-                point_msg.point.y = location[0]  # self.y  # 0.0 or self.y
+                point_msg.point.x = location[0] + self.lookahead  # self.x  # self.lookahead, self.lookahead + self.x
+                point_msg.point.y = location[1]  # self.y  # 0.0 or self.y
                 self.purepursuit_lookahead_pub.publish(point_msg)
 
             if goal is not None:

@@ -68,7 +68,7 @@ class WaypointLoaderNode(Node):
                                                                'transformation to the target frame.'))
         self.declare_parameter('remove_duplicates', True)
         self.declare_parameter('smooth_path', False)
-        self.declare_parameter('smooth_speed', False)
+        self.declare_parameter('smooth_speed', True)
         self.declare_parameter('smooth_yaw', False)
 
         # get parameters
@@ -90,19 +90,20 @@ class WaypointLoaderNode(Node):
         if self.remove_duplicates:
             self.csv_data = self.csv_data.drop_duplicates(subset=["x", "y"], keep='first')
 
-        # optional smoothing
+        # optional smoothing. todo: get method from parameter, e.g path smoothing method and desired speed
         if self.smooth_path:
             self.csv_data.loc[:, "x": "y"] = filters.smooth_path(
-                    coordinates=self.csv_data.loc[:, "x": "y"], method='bspline', polynomial_order=3, weight_smooth=0.3)
+                    coordinates=self.csv_data.loc[:, "x": "y"].to_numpy(), method='bspline', polynomial_order=3,
+                    weight_smooth=0.3)
 
         if self.smooth_speed:
             velocity_time_constant = 0.3
-            self.csv_data["speed"] = trajectory_utils.dynamic_smoothing_velocity(
+            self.csv_data["speed"], _ = trajectory_utils.dynamic_smoothing_velocity(
                     0, 8.9, 3.0, velocity_time_constant,
-                    self.csv_data.loc[:, ['x', 'y', 'speed']])
+                    self.csv_data.loc[:, ['x', 'y', 'speed']].to_numpy())
 
-            # or
-            self.csv_data["speed"] = trajectory_utils.interpolate_speed(self.csv_data.loc[:, ['x', 'y']], method=1)
+            # # or
+            # self.csv_data["speed"] = trajectory_utils.interpolate_speed(self.csv_data.loc[:, ['x', 'y']], method=1)
 
         if self.smooth_yaw:
             pass

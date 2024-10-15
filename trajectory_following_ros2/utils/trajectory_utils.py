@@ -23,7 +23,7 @@ from scipy.signal import filtfilt
 from scipy.interpolate import splprep, splev, interp1d, CubicSpline
 import pandas as pd  # todo: remove
 
-import filters
+import trajectory_following_ros2.utils.filters as filters
 
 
 def get_distance(node1, node2, metric='euclidean'):
@@ -380,7 +380,7 @@ def calculate_curvature_single(waypoints, goal_index):
     return kappa
 
 
-def calc_path_relative_time(path):
+def calc_path_relative_time(path, speeds, min_dt=0.001):
     """
     Calculate the relative time for each point in the path as well as dt.
     Note: for now the dts are wrong. Todo: fix
@@ -388,7 +388,6 @@ def calc_path_relative_time(path):
     :param path:
     :return:
     """
-    min_dt = 1.0e-4
     t = 0.0
     path_time = []
     path_dt = [0.0]
@@ -406,13 +405,14 @@ def calc_path_relative_time(path):
         dy = y1 - y0
         dz = z1 - z0
         dist = (dx ** 2 + dy ** 2 + dz ** 2) ** 0.5
-        v = max(abs(path[i, 2]), 0.1)  # 1.0, 0.1. to avoid zero division error
+        v = max(abs(speeds[i]), 0.1)  # 1.0, 0.1. to avoid zero division error. np.finfo(float).eps
         dt = max(dist / v, min_dt)
         t += dt
         path_time.append(t)
         path_dt.append(dt)
 
     # dists = np.linalg.norm(waypoints[:-1, :2] - waypoints[1:, :2], axis=-1)
+    # t = np.cumsum(dists / np.maximum(speeds, 0.1))
     return path_time, path_dt
 
 
@@ -746,7 +746,7 @@ def dynamic_smoothing_velocity(start_idx, start_vel, acc_lim, tau, waypoints):
         curr_v += dv
         vel_list[i] = curr_v
 
-    path_times, path_dts = calc_path_relative_time(waypoints)
+    path_times, path_dts = calc_path_relative_time(waypoints, vel_list)
     return vel_list, path_times
 
 
@@ -936,6 +936,38 @@ if __name__ == '__main__':
     current_state_list = current_state.flatten().tolist()
     psi_current = current_state[:, 3].item()
 
+    # generate smooth velocity profile
+    velocity_time_constant = 0.3
+    # use Autowares velocity smoother as it accounts for accel limits
+    smooth_velocity, path_times = dynamic_smoothing_velocity(0, waypoints[0, 2], 3.0,
+                                                             velocity_time_constant, waypoints)
+    smooth_velocity2 = interpolate_speed(waypoints, method=1)
+    smooth_velocity3 = interpolate_speed(waypoints, method=2)
+    smooth_velocity4 = interpolate_speed(waypoints, method=3)
+
+    waypoints[:, 2] = smooth_velocity
+
+    # # plot the raw velocity against the smooth velocity
+    # plt.plot(waypoints[:, 6], waypoints[:, 2], 'r', label='Raw Velocity')
+    # plt.plot(waypoints[:, 6], smooth_velocity, 'b', label='Autoware Smoother')
+    # plt.plot(waypoints[:, 6], smooth_velocity2, 'go', label='BSpline Smoother')
+    # plt.plot(waypoints[:, 6], smooth_velocity3, 'bo', label='Linear Smoother')
+    # plt.plot(waypoints[:, 6], smooth_velocity4, 'r*', label='CubicSpline Smoother')
+    # plt.legend()
+    # plt.show()
+
+    # estimate time and dt
+    relative_times, relative_dts = calc_path_relative_time(waypoints, waypoints[:, 2])
+    # interpolate time and dt using linear interpolation
+    # interpolated_times = np.interp(range(len(waypoints)), range(len(waypoints)), relative_times)
+    # interpolated_dts = np.interp(range(len(waypoints)), range(len(waypoints)), relative_dts)
+
+    interp = interpolate.interp1d(range(len(waypoints)), relative_times, kind="slinear", fill_value='extrapolate')
+    interpolated_times = interp(range(len(waypoints)))
+
+    interp = interpolate.interp1d(range(len(waypoints)), relative_dts, kind="slinear", fill_value='extrapolate')
+    interpolated_dts = interp(range(len(waypoints)))
+
     # get angles
     estimated_angle_list = get_angle_from_position(current_state_list[:2])
     estimated_angle = get_angle_from_position(current_state[:, :2])
@@ -943,7 +975,7 @@ if __name__ == '__main__':
     estimated_angles_normalized = normalize_angle(estimated_angles, minus_pi_to_pi=True, pi_is_negative=True,
                                                   degrees=True)
 
-    # get arc lengths. Note: arc_lenghts and cumulative_distance_along_path are the same
+    # get arc lengths. Note: arc_lengths and cumulative_distance_along_path are the same
     arc_lengths = get_arc_lengths(waypoints[:, :2])
     # cumulative_distance_along_path(waypoints)
     cdists = cumulative_distance_along_path(waypoints[:, :2])
@@ -986,20 +1018,19 @@ if __name__ == '__main__':
     curvs_all = calculate_curvature_all(cdists, waypoints[:, 3], smooth=True)
     curvature_at_index = calculate_curvature_single(waypoints[:, :2], goal_index=current_index)
 
-    relative_times, relative_dts = calc_path_relative_time(waypoints)
-    # todo: interpolate time and dt using linear interpolation
+    # plot the estimated dt against the actual timestamps
+    plt.plot(range(len(waypoints)), interpolated_times, 'r*', label='Interpolated times')
+    # plt.plot(range(len(waypoints)), relative_times, 'bo', label='Estimated times')
+    plt.plot(range(len(waypoints)), waypoints[:, 6], 'g*', label='Actual times')
+    plt.legend()
+    plt.show()
 
-    # # plot the estimated dt against the actual timestamps
-    # plt.plot(range(len(waypoints)), relative_times, label='Estimated dt')
-    # plt.plot(range(len(waypoints)), waypoints[:, 6], label='Actual dt')
-    # plt.legend()
-    # plt.show()
-    #
-    # # plot the estimated dt against the actual dt
-    # plt.plot(range(len(waypoints)), relative_dts, label='Estimated dt')
-    # plt.plot(range(len(waypoints)), waypoints[:, 5], label='Actual dt')
-    # plt.legend()
-    # plt.show()
+    # plot the estimated dt against the actual dt
+    plt.plot(range(len(waypoints)), interpolated_dts, 'r*', label='Interpolated dt')
+    # plt.plot(range(len(waypoints)), relative_dts, 'bo', label='Estimated dt')
+    plt.plot(range(len(waypoints)), waypoints[:, 5], 'g*', label='Actual dt')
+    plt.legend()
+    plt.show()
 
     # update trajectory array. ['x', 'y', 'speed', 'yaw', 'omega', 'curvature', 'cum_dist', 'dt', 'total_time_elapsed']
     # todo: update with smooth/interpolated values using a flag
@@ -1014,24 +1045,6 @@ if __name__ == '__main__':
     trajectory[:, trajectory_key_to_column['cum_dist']] = cdists
     trajectory[:, trajectory_key_to_column['dt']] = waypoints[:, 5]
     trajectory[:, trajectory_key_to_column['total_time_elapsed']] = waypoints[:, 6]
-
-    # generate smooth velocity profile
-    velocity_time_constant = 0.3
-    # use Autowares velocity smoother as it accounts for accel limits
-    smooth_velocity, path_times = dynamic_smoothing_velocity(0, waypoints[0, 2], 3.0,
-                                                             velocity_time_constant, waypoints)
-    smooth_velocity2 = interpolate_speed(waypoints, method=1)
-    smooth_velocity3 = interpolate_speed(waypoints, method=2)
-    smooth_velocity4 = interpolate_speed(waypoints, method=3)
-
-    # # plot the raw velocity against the smooth velocity
-    # plt.plot(waypoints[:, 6], waypoints[:, 2], 'r', label='Raw Velocity')
-    # plt.plot(waypoints[:, 6], smooth_velocity, 'b', label='Autoware Smoother')
-    # plt.plot(waypoints[:, 6], smooth_velocity2, 'go', label='BSpline Smoother')
-    # plt.plot(waypoints[:, 6], smooth_velocity3, 'bo', label='Linear Smoother')
-    # plt.plot(waypoints[:, 6], smooth_velocity4, 'r*', label='CubicSpline Smoother')
-    # plt.legend()
-    # plt.show()
 
     # generate the kdtree from the waypoints
     waypoints_kdtree = KDTree(waypoints[:, :2])
