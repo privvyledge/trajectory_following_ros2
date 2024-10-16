@@ -57,6 +57,7 @@ def generate_launch_description():
     max_steer = LaunchConfiguration('max_steer')
     min_steer = LaunchConfiguration('min_steer')
     max_steer_rate = LaunchConfiguration('max_steer_rate')
+    desired_speed = LaunchConfiguration('desired_speed')
 
     # # MPC parameters
     mpc_toolbox = LaunchConfiguration('mpc_toolbox')
@@ -229,6 +230,12 @@ def generate_launch_description():
             description='Maximum steering angle rate in degrees/s allowed.'
     )
 
+    desired_speed_la = DeclareLaunchArgument(
+            'desired_speed',
+            default_value='0.0',
+            description='Used to set target speed or override trajectory speed..'
+    )
+
     mpc_toolbox_la = DeclareLaunchArgument(
             'mpc_toolbox',
             default_value='acados',
@@ -361,7 +368,7 @@ def generate_launch_description():
              frequency_la, publish_twist_topic_la, wheelbase_la, ode_type_la,
              load_waypoints_la, waypoints_csv_la,
              saturate_inputs_la, allow_reversing_la, max_speed_la, min_speed_la, max_accel_la, max_decel_la,
-             max_steer_la, min_steer_la, max_steer_rate_la,
+             max_steer_la, min_steer_la, max_steer_rate_la, desired_speed_la,
              mpc_toolbox_la, horizon_la, sample_time_la, prediction_time_la,
              R_diagonal_la, Rd_diagonal_la, Q_diagonal_la, Qf_diagonal_la, scale_cost_la,
              max_iterations_la, termination_condition_la,
@@ -417,15 +424,16 @@ def generate_launch_description():
                 {'max_steer': max_steer},
                 {'min_steer': min_steer},
                 {'max_steer_rate': max_steer_rate},
+                {'desired_speed': desired_speed},
                 {'saturate_inputs': saturate_inputs},
                 {'allow_reversing': allow_reversing},
                 {'horizon': horizon},
                 {'sample_time': sample_time},
                 {'prediction_time': prediction_time},
-                {'R_diagonal': R_diagonal},
-                {'Rd_diagonal': Rd_diagonal},
-                {'Q_diagonal': Q_diagonal},
-                {'Qf_diagonal': Qf_diagonal},
+                {'R': R_diagonal},
+                {'Rd': Rd_diagonal},
+                {'Q': Q_diagonal},
+                {'Qf': Qf_diagonal},
                 {'scale_cost': scale_cost},
                 {'max_iter': max_iterations},
                 {'termination_condition': termination_condition},
@@ -466,7 +474,7 @@ def generate_launch_description():
                     'global_frame': global_frame,
                 },
                 {'control_rate': frequency},
-                {'publish_twist_topic', publish_twist_topic},
+                {'publish_twist_topic': publish_twist_topic},
                 {'wheelbase': wheelbase},
                 {'ode_type': ode_type},
                 {'max_speed': max_speed},
@@ -476,15 +484,16 @@ def generate_launch_description():
                 {'max_steer': max_steer},
                 {'min_steer': min_steer},
                 {'max_steer_rate': max_steer_rate},
+                {'desired_speed': desired_speed},
                 {'saturate_inputs': saturate_inputs},
                 {'allow_reversing': allow_reversing},
                 {'horizon': horizon},
                 {'sample_time': sample_time},
                 {'prediction_time': prediction_time},
-                {'R_diagonal': R_diagonal},
-                {'Rd_diagonal': Rd_diagonal},
-                {'Q_diagonal': Q_diagonal},
-                {'Qf_diagonal': Qf_diagonal},
+                {'R': R_diagonal},
+                {'Rd': Rd_diagonal},
+                {'Q': Q_diagonal},
+                {'Qf': Qf_diagonal},
                 {'scale_cost': scale_cost},
                 {'max_iter': max_iterations},
                 {'termination_condition': termination_condition},

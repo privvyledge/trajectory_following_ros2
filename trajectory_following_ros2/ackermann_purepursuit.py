@@ -538,6 +538,7 @@ class PurePursuitNode(Node):
             if not self.stop_flag:
                 ref_traj = self.get_target_point()  # self.get_target_point_old()
                 if ref_traj is None:
+                    self.get_logger().info("Reached end of trajectory.")
                     self.publish_command(0.0, 0.0)
                     return
 

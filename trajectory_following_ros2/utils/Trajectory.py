@@ -157,6 +157,7 @@ class Trajectory(object):
             state = self.state
 
         if trajectory is None:
+            # todo: set as self.trajectory[current_index:, :]
             trajectory = self.trajectory
 
         if current_index is None:

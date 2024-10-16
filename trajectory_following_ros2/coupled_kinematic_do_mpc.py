@@ -544,14 +544,21 @@ class KinematicCoupledDoMPCNode(Node):
                 self.publish_command()
                 return
 
+            # copy to prevent overwriting/race conditions due to odom callback update. Todo: Use thread locks instead
+            x = self.x  # float(self.zk[0, 0])
+            y = self.y
+            vel = self.speed
+            psi = self.yaw
+            omega = self.omega
+
             # update trajectory state and reference
             # get the robots current state, waypoint index and normalize the angle from -pi to pi or [0, 2PI). todo: update state in purepursuit and MPC node
             self.trajectory.current_index = self.current_idx
-            self.trajectory.state[0, self.trajectory.state_key_to_column['x']] = self.x
-            self.trajectory.state[0, self.trajectory.state_key_to_column['y']] = self.y
-            self.trajectory.state[0, self.trajectory.state_key_to_column['speed']] = self.speed
-            self.trajectory.state[0, self.trajectory.state_key_to_column['yaw']] = self.yaw
-            self.trajectory.state[0, self.trajectory.state_key_to_column['omega']] = self.omega
+            self.trajectory.state[0, self.trajectory.state_key_to_column['x']] = x
+            self.trajectory.state[0, self.trajectory.state_key_to_column['y']] = y
+            self.trajectory.state[0, self.trajectory.state_key_to_column['speed']] = vel
+            self.trajectory.state[0, self.trajectory.state_key_to_column['yaw']] = psi
+            self.trajectory.state[0, self.trajectory.state_key_to_column['omega']] = omega
             self.trajectory.state[
                 0, self.trajectory.state_key_to_column['curvature']] = trajectory_utils.calculate_curvature_single(
                     self.trajectory.trajectory[:,
@@ -615,11 +622,10 @@ class KinematicCoupledDoMPCNode(Node):
 
             if self.initial_pose_received and not self.stop_flag:
                 '''update: reference trajectory, reference input, previous input, current state (warmstart)'''
-                # copy to prevent overwriting/race conditions due to odom callback update. Todo: Use thread locks instead
-                x = self.x  # float(self.zk[0, 0])
-                y = self.y
-                vel = self.speed
-                psi = self.yaw
+                self.zk[0, 0] = x
+                self.zk[1, 0] = y
+                self.zk[2, 0] = vel
+                self.zk[3, 0] = psi
 
                 normalized_yaw_diff = trajectory_utils.normalize_angle(psi - self.xref[0, 3],
                                                                        minus_pi_to_pi=True, pi_is_negative=True,
@@ -629,7 +635,7 @@ class KinematicCoupledDoMPCNode(Node):
 
                 # update previous input
                 self.u_prev = self.uk.copy()
-                current_speed = self.speed
+                self.Controller.reference_states[:, :] = self.xref
                 # self.Controller.vehicle.wp_id = self.current_idx
                 # self.Controller.vehicle.current_waypoint = [self.path[self.current_idx, 0],
                 #                                             self.path[self.current_idx, 1],
@@ -697,8 +703,8 @@ class KinematicCoupledDoMPCNode(Node):
         # todo: setup using desired_speed float instead of receiving speed array
         if self.path_received and self.desired_speed_received and not self.mpc_initialized:
             self.reference_path = np.array([self.path[:, 0], self.path[:, 1], self.speeds, self.des_yaw_list]).T
-            relative_dts = np.array([self.sample_time] * self.path.shape[0])
-            relative_times = np.cumsum(relative_dts)
+            # relative_dts = np.array([self.sample_time] * self.path.shape[0])
+            # relative_times = np.cumsum(relative_dts)
 
             relative_times, relative_dts = trajectory_utils.calc_path_relative_time(self.path, self.speeds,
                                                                                     min_dt=self.sample_time)
