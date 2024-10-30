@@ -16,7 +16,7 @@ Todo:
     * setup parameter types (https://github.com/ros2/rclpy/blob/5285e61f02ab87f8b84f11ee33e608ff118a8f06/rclpy/test/test_parameter.py). Types (https://roboticsbackend.com/ros2-rclpy-parameter-callback/#Check_the_parameters_type)
         * See saturate_inputs parameter below
     * setup point stabilization, i.e go to goal from RVIz pose
-    * set default reference speed to 0 and set velocity cost weight to close to 0
+    * set default reference speed to 0 and set velocity cost weight to close to 0 [done]
     * Fix/detect time jump, e.g when using ROSBags (https://github.com/ros2/geometry2/issues/606#issuecomment-1589927587 | https://github.com/ros2/geometry2/pull/608#discussion_r1229877511)
     * change model input to velocity instead of acceleration or use a model
     * speed up do-mpc
@@ -57,6 +57,9 @@ from rclpy.duration import Duration
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 from rclpy.qos import DurabilityPolicy
 from rclpy.qos import HistoryPolicy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import SingleThreadedExecutor, MultiThreadedExecutor
+from rclpy.executors import ExternalShutdownException
 
 # TF
 from tf2_ros import TransformException, LookupException, ConnectivityException, ExtrapolationException
@@ -285,6 +288,7 @@ class KinematicCoupledDoMPCNode(Node):
         # setup waypoint variables. todo: make mpc not need the path to be initialized
         self.reference_path = None  # todo: remove
         self.current_idx = 0
+        self.target_point = None
         self.final_idx = None
         self.final_goal = None
         self.final_goal_reached = False
@@ -306,33 +310,54 @@ class KinematicCoupledDoMPCNode(Node):
         self.controller = None
         self.ocp = None
 
+        # Setup queues for multi-thread access
+        self.mutex = threading.Lock()  # or threading.RLock()
+        queue_size = 5
+        self.location_queue = queue.Queue(maxsize=queue_size)
+        self.mpc_reference_states_queue = queue.Queue(maxsize=queue_size)
+        self.mpc_predicted_states_queue = queue.Queue(maxsize=queue_size)
+        self.goal_queue = queue.Queue(maxsize=queue_size)
+
+        # ReentrantCallbackGroup() or MutuallyExclusiveCallbackGroup()
+        self.subscription_group = ReentrantCallbackGroup()
+        self.mpc_group = ReentrantCallbackGroup()
+        self.debug_group = ReentrantCallbackGroup()  # can use either
+
         latching_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         # Setup subscribers
         self.path_sub = self.create_subscription(
                 Path,
                 self.path_topic,
                 self.path_callback,
-                qos_profile=latching_qos)  # to get the desired/reference states of the robot
+                qos_profile=latching_qos,
+                # callback_group=self.subscription_group
+        )  # to get the desired/reference states of the robot
         self.speed_sub = self.create_subscription(
                 Float32MultiArray,
                 self.speed_topic,
                 self.desired_speed_callback,
-                qos_profile=latching_qos)  # to get the desired/reference states of the robot
+                qos_profile=latching_qos,
+                # callback_group=self.subscription_group
+        )  # to get the desired/reference states of the robot
         self.odom_sub = self.create_subscription(
                 Odometry,
                 self.odom_topic,
                 self.odom_callback,
-                1)  # to get the current state of the robot
+                1,
+                callback_group=self.subscription_group
+        )  # to get the current state of the robot
         # self.pose_sub = self.create_subscription(
         #        PoseWithCovarianceStamped,
         #        self.pose_topic,
         #        self.pose_callback,
-        #        1)
+        #        1,
+        #        callback_group=self.subscription_group)
         self.accel_sub = self.create_subscription(
                 AccelWithCovarianceStamped,
                 self.acceleration_topic,
                 self.acceleration_callback,
-                1)
+                1,
+                callback_group=self.subscription_group)
 
         # Setup publishers.
         self.ackermann_cmd_pub = self.create_publisher(AckermannDriveStamped, self.ackermann_cmd_topic, 1)
@@ -351,12 +376,26 @@ class KinematicCoupledDoMPCNode(Node):
         self.mpc_odom_pub = self.create_publisher(Odometry, '/mpc/current_state', 1)
         self.mpc_pose_pub = self.create_publisher(PoseStamped, '/mpc/current_pose', 1)
 
-        # setup mpc timer. todo: either publish debug topics in a separate node or use Reentrant MultiThreadedExecutor
-        self.mpc_timer = self.create_timer(self.sample_time, self.mpc_callback)
-        self.debug_timer = self.create_timer(1.0,
-                                             self.publish_debug_topics)  # todo: test publishing within the main function
+        # setup mpc timer.
+        self.mpc_timer = self.create_timer(self.sample_time, self.mpc_callback,
+                                           callback_group=self.mpc_group)
+        self.debug_timer = self.create_timer(0.25, self.publish_debug_topics,
+                                             callback_group=self.debug_group)  # todo: setup separate publishing dt
 
         self.get_logger().info('kinematic_coupled_do_mpc_controller node started. ')
+
+    def update_queue(self, data_queue, data, overwrite_if_full=True):
+        # todo: move to utils function to avoid repeating in different nodes
+        if data_queue.full():
+            if overwrite_if_full:
+                # acquire lock
+                if data_queue.full():
+                    drop = data_queue.get(block=True)  # remove one item
+                else:
+                    data_queue.put(data, block=True)
+                # release the lock
+        else:
+            data_queue.put(data, block=True)
 
     def path_callback(self, data):
         """
@@ -396,6 +435,9 @@ class KinematicCoupledDoMPCNode(Node):
         self.path_received = True
         self.final_idx = self.path.shape[0] - 1
         self.final_goal = self.path[self.final_idx, :]
+
+        self.target_point = self.path[self.current_idx, :]
+        self.update_queue(self.goal_queue, self.target_point[0:2])
 
         self.trajectory.trajectory = np.zeros(
                 (self.path.shape[0], len(self.trajectory.trajectory_keys)))
@@ -487,7 +529,8 @@ class KinematicCoupledDoMPCNode(Node):
         self.omega = twist.angular.z
 
         try:
-            self.direction = self.vx / abs(self.vx)  # todo: remove noise as this leads to noisy data at high frequencies
+            self.direction = self.vx / abs(
+                self.vx)  # todo: remove noise as this leads to noisy data at high frequencies
         except ZeroDivisionError:
             self.direction = 1.0
 
@@ -680,7 +723,8 @@ class KinematicCoupledDoMPCNode(Node):
 
                 self.publish_command()
                 if self.publish_twist_topic:
-                    self.publish_twist(lateral_velocity=predicted_y_state[1, 0])
+                    self.publish_twist(
+                        lateral_velocity=predicted_y_state[1, 0])  # todo: test predicted_y_state[1, 0].item()
 
                 # debugging data. Query mpc results and compare tvp ref to xref. # todo: initialize solution_dict above and modify values
                 # Controller.mpc.data.prediction(('_x', 'pos_x'), t_ind=simulation_instance.count)[0]
@@ -701,6 +745,12 @@ class KinematicCoupledDoMPCNode(Node):
                 # todo: publish solver stats
 
                 self.run_count += 1
+
+                # update queues for debug publishing
+                self.update_queue(self.goal_queue, self.target_point[0:2])
+                self.update_queue(self.mpc_reference_states_queue, self.xref)
+                self.update_queue(self.mpc_predicted_states_queue, self.mpc_predicted_states)
+
                 # return
 
         # todo: replace with an else block and just  print that the model isn't initialized
@@ -722,7 +772,8 @@ class KinematicCoupledDoMPCNode(Node):
             relative_dts = interp(range(len(self.path)))
 
             self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['dt']] = relative_dts
-            self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['total_time_elapsed']] = relative_times
+            self.trajectory.trajectory[:,
+            self.trajectory.trajectory_key_to_column['total_time_elapsed']] = relative_times
             self.initialize_mpc()  # todo: initialize during init phase as this causes the model to not be generated early when replaying rosbags
 
     def input_saturation(self):
@@ -765,6 +816,7 @@ class KinematicCoupledDoMPCNode(Node):
         """
         Publish markers and path.
         Todo: check if mpc is initialized first
+        todo: use numpy to list instead of costly for loops
         Todo: publish car path travelled as a Path message
         Todo: speedup or use thread locks to copy
         """
@@ -774,12 +826,31 @@ class KinematicCoupledDoMPCNode(Node):
         timestamp = self.get_clock().now().to_msg()
         frame_id = self.robot_frame
 
-        # publish the position of the current goal point
-        point_msg = PointStamped()
-        point_msg.header.stamp = timestamp
-        point_msg.header.frame_id = self.global_frame
-        point_msg.point.x, point_msg.point.y = self.target_point[0:2]
-        self.mpc_goal_pub.publish(point_msg)
+        goal = None
+        location = None
+        mpc_reference_states = None
+        mpc_predicted_states = None
+
+        # get items from queues
+        if not self.goal_queue.empty():
+            goal = self.goal_queue.get(block=True)
+
+        if not self.location_queue.empty():
+            location = self.location_queue.get(block=True)
+
+        if not self.mpc_predicted_states_queue.empty():
+            mpc_predicted_states = self.mpc_predicted_states_queue.get(block=True)
+
+        if not self.mpc_reference_states_queue.empty():
+            mpc_reference_states = self.mpc_reference_states_queue.get(block=True)
+
+        if goal is not None:
+            # publish the position of the current goal point
+            point_msg = PointStamped()
+            point_msg.header.stamp = timestamp
+            point_msg.header.frame_id = self.global_frame
+            point_msg.point.x, point_msg.point.y = goal  # self.target_point[0:2]
+            self.mpc_goal_pub.publish(point_msg)
 
         # Publish a few points in the path left
         path_msg = Path()
@@ -800,56 +871,81 @@ class KinematicCoupledDoMPCNode(Node):
         self.waypoint_path_pub.publish(path_msg)
 
         # Publish the points MPC is considering, i.e state reference
-        path_msg = Path()
-        path_msg.header.stamp = timestamp
-        path_msg.header.frame_id = self.global_frame
+        if mpc_reference_states is not None:
+            path_msg = Path()
+            path_msg.header.stamp = timestamp
+            path_msg.header.frame_id = self.global_frame
 
-        for k in range(self.xref.shape[0]):
-            # todo: publish velocity or publish as odometry instead
-            reference_pose = PoseStamped()
-            reference_pose.header.stamp = timestamp
-            reference_pose.header.frame_id = self.global_frame
+            for k in range(mpc_reference_states.shape[0]):
+                # todo: publish velocity or publish as odometry instead
+                reference_pose = PoseStamped()
+                reference_pose.header.stamp = timestamp
+                reference_pose.header.frame_id = self.global_frame
 
-            reference_pose.pose.position.x, reference_pose.pose.position.y = self.xref[k, 0], self.xref[k, 1]
-            # self.get_logger().info(f"x: {self.xref[0, index]}, y: {self.xref[1, index]}, yaw: {self.xref[3, index]}\n")
+                reference_pose.pose.position.x, reference_pose.pose.position.y = mpc_reference_states[k, 0], \
+                mpc_reference_states[k, 1]
+                # self.get_logger().info(f"x: {self.xref[0, index]}, y: {self.xref[1, index]}, yaw: {self.xref[3, index]}\n")
 
-            reference_quaternion = tf_transformations.quaternion_from_euler(0, 0, self.xref[k, 3])
-            reference_pose.pose.orientation.x = reference_quaternion[0]
-            reference_pose.pose.orientation.y = reference_quaternion[1]
-            reference_pose.pose.orientation.z = reference_quaternion[2]
-            reference_pose.pose.orientation.w = reference_quaternion[3]
+                reference_quaternion = tf_transformations.quaternion_from_euler(0, 0, mpc_reference_states[k, 3])
+                reference_pose.pose.orientation.x = reference_quaternion[0]
+                reference_pose.pose.orientation.y = reference_quaternion[1]
+                reference_pose.pose.orientation.z = reference_quaternion[2]
+                reference_pose.pose.orientation.w = reference_quaternion[3]
 
-            path_msg.poses.append(reference_pose)
-        self.mpc_reference_path_pub.publish(path_msg)
+                path_msg.poses.append(reference_pose)
+            self.mpc_reference_path_pub.publish(path_msg)
 
-        # Publish the MPC predicted states
-        for k in range(self.mpc_predicted_states.shape[0]):
-            predicted_pose = PoseStamped()
-            predicted_pose.header.stamp = timestamp
-            predicted_pose.header.frame_id = self.global_frame
-            predicted_pose.pose.position.x = self.mpc_predicted_states[k, 0]
-            predicted_pose.pose.position.y = self.mpc_predicted_states[k, 1]
+        if mpc_predicted_states is not None:
+            path_msg = Path()
+            path_msg.header.stamp = timestamp
+            path_msg.header.frame_id = self.global_frame
 
-            predicted_quaternion = tf_transformations.quaternion_from_euler(0, 0, self.mpc_predicted_states[k, 3])
-            predicted_pose.pose.orientation.x = predicted_quaternion[0]
-            predicted_pose.pose.orientation.y = predicted_quaternion[1]
-            predicted_pose.pose.orientation.z = predicted_quaternion[2]
-            predicted_pose.pose.orientation.w = predicted_quaternion[3]
+            # Publish the MPC predicted states
+            for k in range(mpc_predicted_states.shape[0]):
+                predicted_pose = PoseStamped()
+                predicted_pose.header.stamp = timestamp
+                predicted_pose.header.frame_id = self.global_frame
+                predicted_pose.pose.position.x = mpc_predicted_states[k, 0]
+                predicted_pose.pose.position.y = mpc_predicted_states[k, 1]
 
-            path_msg.poses.append(predicted_pose)
-        self.mpc_path_pub.publish(path_msg)
+                predicted_quaternion = tf_transformations.quaternion_from_euler(0, 0, mpc_predicted_states[k, 3])
+                predicted_pose.pose.orientation.x = predicted_quaternion[0]
+                predicted_pose.pose.orientation.y = predicted_quaternion[1]
+                predicted_pose.pose.orientation.z = predicted_quaternion[2]
+                predicted_pose.pose.orientation.w = predicted_quaternion[3]
+
+                path_msg.poses.append(predicted_pose)
+            self.mpc_path_pub.publish(path_msg)
 
 
 def main(args=None):
     rclpy.init(args=args)
-    mpc_node = KinematicCoupledDoMPCNode()
-    rclpy.spin(mpc_node)
+    try:
+        mpc_node = KinematicCoupledDoMPCNode()
+        executor = MultiThreadedExecutor(
+            num_threads=4)  # todo: could get as an argument or initialize in the class to get as a parameter
+        executor.add_node(mpc_node)
+
+        try:
+            executor.spin()
+        finally:
+            executor.shutdown()
+            mpc_node.destroy_node()
+
+    except KeyboardInterrupt:
+        pass
+
+    except ExternalShutdownException:
+        sys.exit(1)
+
+    finally:
+        rclpy.shutdown()
 
     # # Destroy the node explicitly
     # # (optional - otherwise it will be done automatically
     # # when the garbage collector destroys the node object)
-    mpc_node.destroy_node()
-    rclpy.shutdown()
+    # mpc_node.destroy_node()
+    # rclpy.shutdown()
 
 
 if __name__ == '__main__':

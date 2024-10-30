@@ -251,7 +251,7 @@ class PurePursuitNode(Node):
 
         # Setup queues for multi-thread access
         self.mutex = threading.Lock()  # or threading.RLock()
-        queue_size = 100
+        queue_size = 5
         self.location_queue = queue.Queue(maxsize=queue_size)
         self.orientation_queue = queue.Queue(maxsize=queue_size)
         self.yaw_queue = queue.Queue(maxsize=queue_size)
@@ -322,7 +322,8 @@ class PurePursuitNode(Node):
         # setup purepursuit timer
         self.purepursuit_timer = self.create_timer(self.sample_time, self.purepursuit_callback,
                                                    callback_group=self.purepursuit_group)
-        self.debug_timer = self.create_timer(self.sample_time, self.publish_debug_topics, callback_group=self.debug_group)
+        self.debug_timer = self.create_timer(0.25, self.publish_debug_topics,
+                                             callback_group=self.debug_group)  # todo: setup separate publishing dt
 
         self.get_logger().info('purepursuit node started. ')
 
@@ -330,6 +331,7 @@ class PurePursuitNode(Node):
         #     self.get_target_point()
 
     def update_queue(self, data_queue, data, overwrite_if_full=True):
+        # todo: move to utils function to avoid repeating in different nodes
         if data_queue.full():
             if overwrite_if_full:
                 # acquire lock
@@ -818,8 +820,8 @@ class PurePursuitNode(Node):
                 point_msg = PointStamped()
                 point_msg.header.stamp = timestamp
                 point_msg.header.frame_id = self.robot_frame  # self.robot_frame or self.global_frame. Todo: publishing to global frame does not account for orientation, transform first, else use base_link
-                point_msg.point.x = location[0] + self.lookahead  # self.x  # self.lookahead, self.lookahead + self.x
-                point_msg.point.y = location[1]  # self.y  # 0.0 or self.y
+                point_msg.point.x = self.lookahead  # self.x  # self.lookahead, self.lookahead + self.x, location[0] + self.lookahead
+                point_msg.point.y = 0.0  # self.y  # 0.0 or self.y, location[1]
                 self.purepursuit_lookahead_pub.publish(point_msg)
 
             if goal is not None:
@@ -854,7 +856,7 @@ def main(args=None):
     rclpy.init(args=args)
     try:
         pp_node = PurePursuitNode()
-        executor = MultiThreadedExecutor(num_threads=4)  # todo: could get as an argument
+        executor = MultiThreadedExecutor(num_threads=4)  # todo: could get as an argument or initialize in the class to get as a parameter
         executor.add_node(pp_node)
         
         try:
