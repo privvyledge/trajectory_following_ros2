@@ -135,6 +135,7 @@ class WaypointRecorderNode(Node):
             delta_in_seconds = time_delta.nanoseconds / 1e+9
             self.dt = abs(delta_in_seconds)
 
+        # wrong. Todo: should be done where the waypoints are being saved
         self.msg_time = msg_time
         self.total_time_elapsed = self.msg_time.sec + (self.msg_time.nanosec / 1e+9)
 

@@ -198,7 +198,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         ocp.cost.Vx_e = Vx_e
         ocp.cost.W_e = W_e  # weight matrix at terminal shooting node (N)
 
-        # set intial reference. Note: will be overwritten
+        # set initial reference. Note: will be overwritten
         ocp.cost.yref_e = np.zeros(ny_e)  # cost reference at terminal shooting node (N)  [nx, 1]
 
     elif cost_module_e.lower() == "NONLINEAR_LS".lower():
@@ -211,7 +211,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         ocp.model.cost_y_expr_e = y_e
 
         ocp.cost.W_e = W_e  # weight matrix at terminal shooting node (N)
-        # set intial reference. Note: will be overwritten
+        # set initial reference. Note: will be overwritten
         ocp.cost.yref_e = np.zeros(ny_e)  # cost reference at terminal shooting node (N)  [nx, 1]
 
     elif cost_module_e.lower() == "EXTERNAL".lower():
@@ -266,7 +266,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     # ocp.constraints.ush = np.zeros(nsh)
     # ocp.constraints.idxsh = np.array(range(nsh))
 
-    # set intial condition (optional). Note: will be overwritten
+    # set initial condition (optional). Note: will be overwritten
     if x0 is None:
         try:
             ocp.constraints.x0 = model.x0

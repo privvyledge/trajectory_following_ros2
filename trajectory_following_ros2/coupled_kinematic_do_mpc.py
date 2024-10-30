@@ -44,6 +44,7 @@ import time
 import os
 import sys
 import csv
+import queue
 import threading
 import numpy as np
 import scipy
@@ -447,7 +448,7 @@ class KinematicCoupledDoMPCNode(Node):
                                                        acc_max=self.MAX_ACCEL,
                                                        max_iterations=self.max_iter,
                                                        tolerance=self.termination_condition,
-                                                       suppress_ipopt_output=True, model_type='continuous')
+                                                       suppress_ipopt_output=True, model_type='continuous')  # discrete
         # warmstart
         self.Controller.mpc.x0 = self.zk
         self.Controller.mpc.set_initial_guess()
@@ -486,12 +487,12 @@ class KinematicCoupledDoMPCNode(Node):
         self.omega = twist.angular.z
 
         try:
-            self.direction = self.vx / abs(self.vx)
+            self.direction = self.vx / abs(self.vx)  # todo: remove noise as this leads to noisy data at high frequencies
         except ZeroDivisionError:
             self.direction = 1.0
 
-        self.speed = self.direction * np.linalg.norm([self.vx, self.vy, self.vz])
-        # self.speed = self.vx
+        # self.speed = self.direction * np.linalg.norm([self.vx, self.vy, self.vz])  # todo: refactor as direction can be noisy so migh
+        self.speed = self.vx
 
         # todo: use flag to convert from the center of mass <--> rear axle
         # great tutorial: https://dingyan89.medium.com/simple-understanding-of-kinematic-bicycle-model-81cac6420357
@@ -501,10 +502,10 @@ class KinematicCoupledDoMPCNode(Node):
         # self.location = [self.rear_x, self.rear_x_y]  # [self.x, self.y]
         # todo: to convert from rear axle to cog see new eagles misc report
 
-        self.zk[0, 0] = self.x
-        self.zk[1, 0] = self.y
-        self.zk[2, 0] = self.speed
-        self.zk[3, 0] = self.yaw
+        #self.zk[0, 0] = self.x
+        #self.zk[1, 0] = self.y
+        #self.zk[2, 0] = self.speed
+        #self.zk[3, 0] = self.yaw
 
         if not self.initial_pose_received:
             # if self.mpc_initialized: todo: remove from here
@@ -605,6 +606,7 @@ class KinematicCoupledDoMPCNode(Node):
             self.xref[:, :] = np.array(
                     [reference_traj['x_ref'], reference_traj['y_ref'],
                      reference_traj['vel_ref'], reference_traj['yaw_ref']]).T
+            # self.xref[:, :] = self.xref[0, :]  # to only use the target point
 
             # self.trajectory.current_index = self.current_idx
 
@@ -668,6 +670,7 @@ class KinematicCoupledDoMPCNode(Node):
                 2: Current_velocity + integrate(acceleration), i.e current_speed + self.acc_cmd * self.sample_time
                 '''
                 self.velocity_cmd = predicted_vel_state[1, 0]
+                # self.velocity_cmd = vel + self.acc_cmd * self.sample_time
 
                 if self.saturate_input:
                     self.input_saturation()
@@ -687,14 +690,15 @@ class KinematicCoupledDoMPCNode(Node):
                         -1, 1)
                 psi_state_ref = self.Controller.mpc.data.prediction(('_tvp', 'psi_ref', 0), t_ind=time_index).reshape(
                         -1, 1)
-                self.xref[:, :] = np.hstack([x_state_ref, y_state_ref, vel_state_ref, psi_state_ref])  # todo: refactor
                 self.target_point = self.xref[0, :].tolist()  # todo: refactor
+                self.xref[:, :] = np.hstack([x_state_ref, y_state_ref, vel_state_ref, psi_state_ref])  # todo: refactor
 
                 # todo: initialize solution_dict above and modify values
                 self.solution_time = self.Controller.mpc.solver_stats['t_wall_total']
 
                 self.solver_iteration_count = self.Controller.mpc.solver_stats['iter_count']
                 self.solution_status = self.Controller.mpc.solver_stats['success']
+                # todo: publish solver stats
 
                 self.run_count += 1
                 # return
@@ -706,8 +710,9 @@ class KinematicCoupledDoMPCNode(Node):
             # relative_dts = np.array([self.sample_time] * self.path.shape[0])
             # relative_times = np.cumsum(relative_dts)
 
+            # todo: get from csv or topics
             relative_times, relative_dts = trajectory_utils.calc_path_relative_time(self.path, self.speeds,
-                                                                                    min_dt=self.sample_time)
+                                                                                    min_dt=1.0)  # min_dt=self.sample_time
 
             interp = interpolate.interp1d(range(len(self.path)), relative_times, kind="slinear",
                                           fill_value='extrapolate')
