@@ -281,7 +281,9 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.initial_accel_received = False
         self.path_received = False
         self.desired_speed_received = False
+        self.mpc_built = False
         self.mpc_initialized = False
+        self.trajectory_initialized = False
         self.x = 0.0  # todo: remove
         self.y = 0.0  # todo: remove
         self.yaw = 0.0  # todo: remove
@@ -406,6 +408,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.debug_timer = self.create_timer(0.25, self.publish_debug_topics,
                                              callback_group=self.debug_group)  # todo: setup separate publishing dt
 
+        self.setup_mpc_model()
         self.get_logger().info('kinematic_coupled_acados_mpc_controller node started. ')
 
     def update_queue(self, data_queue, data, overwrite_if_full=True):
@@ -504,13 +507,25 @@ class KinematicCoupledAcadosMPCNode(Node):
         # self.trajectory.trajectory_key_to_column['omega']] = csv_df.omega.values  # todo
         self.desired_speed_received = True
 
-    def initialize_mpc(self):
+    def setup_mpc_model(self):
         # todo: initialize during init phase as this causes the model to not be generated until path, speed and odom messages arrive
         # todo: add weights to acados settings arguments
         # todo: refactor acados settings
         # todo: add wheelbase
         config_path = os.path.join(self.model_directory, "kinematic_bicycle_acados_ocp.json")
         build_path = os.path.join(self.model_directory, "c_generated_code")
+
+        # create the directory if it does not exist
+        if not os.path.exists(build_path):
+            os.makedirs(build_path, exist_ok=True)
+
+        # get the current working directory
+        cwd = os.getcwd()
+
+        # change the current working directory to the build path
+        os.chdir(build_path)
+
+        # generate the MPC model and optionally build
         self.constraint, self.model, self.controller, self.ocp = acados_settings(Tf=self.prediction_time,
                                                                                  N=self.horizon,
                                                                                  x0=self.zk, scale_cost=self.scale_cost,
@@ -551,6 +566,12 @@ class KinematicCoupledAcadosMPCNode(Node):
             if self.Qf is not None:
                 self.controller.cost_set(self.horizon, 'W', self.Qf / unscale)
 
+        self.mpc_built = True
+        self.get_logger().info("Finished setting up the MPC.")
+
+        os.chdir(cwd)
+
+    def initialize_mpc_solver(self):
         # initialize solver
         for i in range(self.horizon + 1):
             self.controller.set(i, "x", self.zk.flatten())
@@ -567,10 +588,10 @@ class KinematicCoupledAcadosMPCNode(Node):
         # self.controller.constraints_set(i, 'lbu', blah)
 
         # solve/get initial guess
-        status = self.controller.solve()
+        self.solution_status = self.controller.solve()
+
         self.mpc_initialized = True
-        self.get_logger().info("Finished compiling MPC.")
-        self.get_logger().info("########################MPC initialized##################################")
+        self.get_logger().info("######################## MPC initialized ##################################")
 
     def odom_callback(self, data):
         """
@@ -632,7 +653,6 @@ class KinematicCoupledAcadosMPCNode(Node):
             #    # warmstart
             #    self.Controller.mpc.x0 = self.zk
             #    self.Controller.mpc.set_initial_guess()
-
             self.initial_pose_received = True
 
     def acceleration_callback(self, data):
@@ -652,13 +672,20 @@ class KinematicCoupledAcadosMPCNode(Node):
 
     def mpc_callback(self):
         # todo: refactor this method
-        if self.mpc_initialized:
+        if self.mpc_built and not self.mpc_initialized and self.initial_pose_received:
+            # initialize the MPC solver with the current state if it is already built
+            num_tries = 5  # 1, 5, 10
+            for _ in range(num_tries):
+                # a kind of hacky way to fix not finding a solution the first time the solver is called
+                self.initialize_mpc_solver()
+
+        if self.mpc_initialized and self.trajectory_initialized:
             # break out of loop (optional)
             self.stop_flag = self.trajectory.check_goal(self.x, self.y, self.speed, self.final_goal,
                                                         self.current_idx, self.path.shape[0])
 
             if self.stop_flag:
-                self.get_logger().info("Goal reached")
+                self.get_logger().info("Final goal reached")
                 self.delta_cmd = 0.0
                 self.acc_cmd = 0.0
                 self.velocity_cmd = 0.0
@@ -717,6 +744,7 @@ class KinematicCoupledAcadosMPCNode(Node):
             )
 
             if reference_traj is None:
+                self.get_logger().info("No more waypoints. Final goal reached.")
                 self.delta_cmd = 0.0
                 self.acc_cmd = 0.0
                 self.velocity_cmd = 0.0
@@ -932,7 +960,8 @@ class KinematicCoupledAcadosMPCNode(Node):
 
             self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['dt']] = relative_dts
             self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['total_time_elapsed']] = relative_times
-            self.initialize_mpc()  # todo: initialize during init phase as this causes the model to not be generated early when replaying rosbags
+
+            self.trajectory_initialized = True
 
     def input_saturation(self):
         # saturate inputs
@@ -1085,12 +1114,6 @@ def main(args=None):
         executor.add_node(mpc_node)
 
         try:
-            executor.spin()
-        except ImportError:
-            ''' Occasionally, the code fails due to cython compilation issues 
-            caused my multithreading conflicts between Pythons threads and compiled acados OpenMP threads. 
-            A quick fix is to just restart this node or set num_threads above to 1 which is not ideal.'''
-            time.sleep(2)
             executor.spin()
         finally:
             executor.shutdown()

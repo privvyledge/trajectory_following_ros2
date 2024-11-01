@@ -258,7 +258,9 @@ class KinematicCoupledDoMPCNode(Node):
         self.initial_accel_received = False
         self.path_received = False
         self.desired_speed_received = False
+        self.mpc_built = False
         self.mpc_initialized = False
+        self.trajectory_initialized = False
         self.x = 0.0  # todo: remove
         self.y = 0.0  # todo: remove
         self.yaw = 0.0  # todo: remove
@@ -382,6 +384,7 @@ class KinematicCoupledDoMPCNode(Node):
         self.debug_timer = self.create_timer(0.25, self.publish_debug_topics,
                                              callback_group=self.debug_group)  # todo: setup separate publishing dt
 
+        self.setup_mpc_model()
         self.get_logger().info('kinematic_coupled_do_mpc_controller node started. ')
 
     def update_queue(self, data_queue, data, overwrite_if_full=True):
@@ -474,7 +477,7 @@ class KinematicCoupledDoMPCNode(Node):
         # self.trajectory.trajectory_key_to_column['omega']] = csv_df.omega.values  # todo
         self.desired_speed_received = True
 
-    def initialize_mpc(self):
+    def setup_mpc_model(self):
         # todo: initialize during init phase as this causes the model to not be generated until path, speed and odom messages arrive
         _, self.Controller, _ = initialize_mpc_problem(reference_path=self.reference_path,
                                                        horizon=self.horizon,
@@ -491,10 +494,17 @@ class KinematicCoupledDoMPCNode(Node):
                                                        max_iterations=self.max_iter,
                                                        tolerance=self.termination_condition,
                                                        suppress_ipopt_output=True, model_type='continuous')  # discrete
+        self.mpc_built = True
+        self.get_logger().info("Finished setting up the MPC.")
+
+    def initialize_mpc_solver(self):
         # warmstart
         self.Controller.mpc.x0 = self.zk
         self.Controller.mpc.set_initial_guess()
+        # self.Controller.get_control(self.zk)  # todo: test
+
         self.mpc_initialized = True
+        self.get_logger().info("######################## MPC initialized ##################################")
 
     def odom_callback(self, data):
         """
@@ -575,13 +585,20 @@ class KinematicCoupledDoMPCNode(Node):
 
     def mpc_callback(self):
         # todo: refactor this method
-        if self.mpc_initialized:
+        if self.mpc_built and not self.mpc_initialized and self.initial_pose_received:
+            # initialize the MPC solver with the current state if it is already built
+            num_tries = 5  # 1, 5, 10
+            for _ in range(num_tries):
+                # a kind of hacky way to fix not finding a solution the first time the solver is called
+                self.initialize_mpc_solver()
+
+        if self.mpc_initialized and self.trajectory_initialized:
             # break out of loop (optional)
             self.stop_flag = self.trajectory.check_goal(self.x, self.y, self.speed, self.final_goal,
                                                         self.current_idx, self.path.shape[0])
 
             if self.stop_flag:
-                self.get_logger().info("Goal reached")
+                self.get_logger().info("Final goal reached.")
                 self.delta_cmd = 0.0
                 self.acc_cmd = 0.0
                 self.velocity_cmd = 0.0
@@ -640,6 +657,7 @@ class KinematicCoupledDoMPCNode(Node):
             )
 
             if reference_traj is None:
+                self.get_logger().info("No more waypoints. Final goal reached.")
                 self.delta_cmd = 0.0
                 self.acc_cmd = 0.0
                 self.velocity_cmd = 0.0
@@ -692,7 +710,8 @@ class KinematicCoupledDoMPCNode(Node):
                 dt = time.process_time() - start_time
 
                 # unpack mpc predicted states
-                time_index = self.run_count  # self.run_count or -1. Optionally used to index MPC solution history
+                time_index = -1  # -1 or self.run_count. Optionally used to index MPC solution history.
+                # time_index = self.run_count  # this fails when running with multiple threads
                 state_indices = range(1)  # todo: replace with self.NX when vectorized
                 input_indices = range(1)  # todo: replace with self.NU when vectorized
                 predicted_x_state = self.Controller.mpc.data.prediction(('_x', 'pos_x'), t_ind=time_index)[0]
@@ -772,9 +791,8 @@ class KinematicCoupledDoMPCNode(Node):
             relative_dts = interp(range(len(self.path)))
 
             self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['dt']] = relative_dts
-            self.trajectory.trajectory[:,
-            self.trajectory.trajectory_key_to_column['total_time_elapsed']] = relative_times
-            self.initialize_mpc()  # todo: initialize during init phase as this causes the model to not be generated early when replaying rosbags
+            self.trajectory.trajectory[:, self.trajectory.trajectory_key_to_column['total_time_elapsed']] = relative_times
+            self.trajectory_initialized = True
 
     def input_saturation(self):
         # saturate inputs
