@@ -76,6 +76,7 @@ def generate_launch_description():
     generate_mpc_model = LaunchConfiguration('generate_mpc_model')
     build_with_cython = LaunchConfiguration('build_with_cython')
     model_directory = LaunchConfiguration('model_directory')
+    debug_frequency = LaunchConfiguration('debug_frequency')
 
     # # Trajectory/goal parameters
     distance_tolerance = LaunchConfiguration('distance_tolerance')
@@ -163,7 +164,7 @@ def generate_launch_description():
     )
     ode_type_la = DeclareLaunchArgument(
             'ode_type',
-            default_value='continuous_kinematic_coupled',
+            default_value='discrete_kinematic_coupled',
             description='The type of ode. '
                         'Examples: '
                         '   continuous_kinematic_coupled, continuous_kinematic_coupled_augmented'
@@ -310,7 +311,7 @@ def generate_launch_description():
     build_with_cython_la = DeclareLaunchArgument(
             'build_with_cython',
             default_value='True',
-            description='Whether to build the model with cython (faster) or ctypes..'
+            description='Whether to build the model with cython (faster) or ctypes.'
     )
     model_directory_la = DeclareLaunchArgument(
             'model_directory',
@@ -361,6 +362,12 @@ def generate_launch_description():
             default_value=speed_topic
     )
 
+    debug_frequency_la = DeclareLaunchArgument(
+            'debug_frequency',
+            default_value='4.0',
+            description='The rate at which to publish debugging/visualization topics. If <= 0, no topics are published.'
+    )
+
     # Create Launch Description
     ld = LaunchDescription(
             [declare_use_sim_time_cmd, params_file_la,
@@ -377,7 +384,7 @@ def generate_launch_description():
              distance_tolerance_la, speed_tolerance_la,
              declare_log_level_cmd,
              odom_topic_la, ackermann_cmd_topic_la, twist_topic_la, acceleration_topic_la, path_topic_la,
-             speed_topic_la]
+             speed_topic_la, debug_frequency_la]
     )
 
     # Load Nodes
@@ -452,6 +459,7 @@ def generate_launch_description():
                     'path_topic': path_topic,
                     'speed_topic': speed_topic,
                 },
+                {'debug_frequency': debug_frequency},
             ],
             arguments=['--ros-args', '--log-level', log_level],
             # remappings=[
@@ -512,6 +520,7 @@ def generate_launch_description():
                     'path_topic': path_topic,
                     'speed_topic': speed_topic,
                 },
+                {'debug_frequency': debug_frequency},
             ],
             arguments=['--ros-args', '--log-level', log_level],
             # remappings=[

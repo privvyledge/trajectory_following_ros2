@@ -146,8 +146,8 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('ode_type', "continuous_kinematic_coupled")  # todo: also augmented, etc
         self.declare_parameter('stage_cost_type', "LINEAR_LS")  # Acados specific (LINEAR_LS, NONLINEAR_LS, EXTERNAL)
         self.declare_parameter('terminal_cost_type', "LINEAR_LS")  # Acados specific (LINEAR_LS, NONLINEAR_LS, EXTERNAL)
-        self.declare_parameter('model_type', "continuous_kinematic_coupled")
         self.declare_parameter('control_rate', 50.0)
+        self.declare_parameter('debug_frequency', 4.0)
         self.declare_parameter('distance_tolerance', 0.2)  # todo: move to goal checker node
         self.declare_parameter('speed_tolerance', 0.5)  # todo: move to goal checker node
         self.declare_parameter('wheelbase', 0.256)
@@ -201,6 +201,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.robot_frame = self.get_parameter('robot_frame').value
         self.global_frame = self.get_parameter('global_frame').value
         self.control_rate = self.get_parameter('control_rate').value
+        self.debug_frequency = self.get_parameter('debug_frequency').value
         self.distance_tolerance = self.get_parameter('distance_tolerance').value
         self.speed_tolerance = self.get_parameter('speed_tolerance').value
 
@@ -258,6 +259,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.build_with_cython = self.get_parameter('build_with_cython').value
         self.model_directory = self.get_parameter('model_directory').value
 
+        self.model_type = 'continuous' if 'continuous' in self.ode_type else 'discrete'
         self.dt = self.sample_time = 1 / self.control_rate  # [s] sample time. # todo: get from ros Duration
         if (self.prediction_time is None) or (self.prediction_time == 0.0):
             self.prediction_time = self.sample_time * self.horizon
@@ -405,8 +407,9 @@ class KinematicCoupledAcadosMPCNode(Node):
         # setup mpc timer. todo: either publish debug topics in a separate node or use Reentrant MultiThreadedExecutor
         self.mpc_timer = self.create_timer(self.sample_time, self.mpc_callback,
                                                    callback_group=self.mpc_group)
-        self.debug_timer = self.create_timer(0.25, self.publish_debug_topics,
-                                             callback_group=self.debug_group)  # todo: setup separate publishing dt
+        if self.debug_frequency > 0:
+            self.debug_timer = self.create_timer(1 / self.debug_frequency, self.publish_debug_topics,
+                                                 callback_group=self.debug_group)  # todo: setup separate publishing dt
 
         self.setup_mpc_model()
         self.get_logger().info('kinematic_coupled_acados_mpc_controller node started. ')

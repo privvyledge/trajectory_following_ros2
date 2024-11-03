@@ -130,6 +130,7 @@ class KinematicCoupledDoMPCNode(Node):
                                                                'otherwise use "odom".'))  # global frame: odom, map
         self.declare_parameter('ode_type', "continuous_kinematic_coupled")  # todo: also augmented, etc
         self.declare_parameter('control_rate', 20.0)
+        self.declare_parameter('debug_frequency', 4.0)
         self.declare_parameter('distance_tolerance', 0.2)  # todo: move to goal checker node
         self.declare_parameter('speed_tolerance', 0.5)  # todo: move to goal checker node
         self.declare_parameter('wheelbase', 0.256)
@@ -185,6 +186,7 @@ class KinematicCoupledDoMPCNode(Node):
         self.robot_frame = self.get_parameter('robot_frame').value
         self.global_frame = self.get_parameter('global_frame').value
         self.control_rate = self.get_parameter('control_rate').value
+        self.debug_frequency = self.get_parameter('debug_frequency').value
         self.distance_tolerance = self.get_parameter('distance_tolerance').value
         self.speed_tolerance = self.get_parameter('speed_tolerance').value
 
@@ -235,6 +237,8 @@ class KinematicCoupledDoMPCNode(Node):
         self.smooth_yaw = self.get_parameter('smooth_yaw').value
         self.debug = self.get_parameter('debug').value
 
+        self.model_type = 'continuous' if 'continuous' in self.ode_type else 'discrete'
+        
         self.dt = self.sample_time = 1 / self.control_rate  # [s] sample time. # todo: get from ros Duration
         if (self.prediction_time is None) or (self.prediction_time == 0.0):
             self.prediction_time = self.sample_time * self.horizon
@@ -381,8 +385,9 @@ class KinematicCoupledDoMPCNode(Node):
         # setup mpc timer.
         self.mpc_timer = self.create_timer(self.sample_time, self.mpc_callback,
                                            callback_group=self.mpc_group)
-        self.debug_timer = self.create_timer(0.25, self.publish_debug_topics,
-                                             callback_group=self.debug_group)  # todo: setup separate publishing dt
+        if self.debug_frequency > 0:
+            self.debug_timer = self.create_timer(1 / self.debug_frequency, self.publish_debug_topics,
+                                                 callback_group=self.debug_group)
 
         self.setup_mpc_model()
         self.get_logger().info('kinematic_coupled_do_mpc_controller node started. ')
@@ -493,7 +498,7 @@ class KinematicCoupledDoMPCNode(Node):
                                                        acc_max=self.MAX_ACCEL,
                                                        max_iterations=self.max_iter,
                                                        tolerance=self.termination_condition,
-                                                       suppress_ipopt_output=True, model_type='continuous')  # discrete
+                                                       suppress_ipopt_output=True, model_type=self.model_type)
         self.mpc_built = True
         self.get_logger().info("Finished setting up the MPC.")
 
