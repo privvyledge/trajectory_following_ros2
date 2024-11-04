@@ -775,11 +775,13 @@ class KinematicCoupledDoMPCNode(Node):
                 self.update_queue(self.mpc_reference_states_queue, self.xref)
                 self.update_queue(self.mpc_predicted_states_queue, self.mpc_predicted_states)
 
+                self.get_logger().info(f"Status: {self.solution_status}\n")
+
                 # return
 
         # todo: replace with an else block and just  print that the model isn't initialized
         # todo: setup using desired_speed float instead of receiving speed array
-        if self.path_received and self.desired_speed_received and not self.mpc_initialized:
+        if self.path_received and self.desired_speed_received and not self.trajectory_initialized:
             self.reference_path = np.array([self.path[:, 0], self.path[:, 1], self.speeds, self.des_yaw_list]).T
             # relative_dts = np.array([self.sample_time] * self.path.shape[0])
             # relative_times = np.cumsum(relative_dts)

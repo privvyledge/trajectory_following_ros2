@@ -16,8 +16,8 @@ Todo:
         1. get the difference and normalize
         2. pass the normalized difference to the cost function as the current yaw/psi states
         3. pass 0.0 as the desired yaw/psi state
-    * initialize MPC during init phase
-    * use desired speed parameter
+    * initialize MPC during init phase [done]
+    * use desired speed parameter [done]
     * change current desired speed topic to desired speed array
     * add desired speed topic to a Float64 message and optionally generate a velocity profile
     * add a check for if speeds or desired speed is zero and modify the mpc weights to make the car move
@@ -940,12 +940,11 @@ class KinematicCoupledAcadosMPCNode(Node):
                 self.update_queue(self.mpc_reference_states_queue, self.xref)
                 self.update_queue(self.mpc_predicted_states_queue, self.mpc_predicted_states)
 
-                #self.publish_debug_topics()  # optionally publish debug topics for viewing
-                # return
+                self.get_logger().info(f"Status: {self.solution_status}\n")
 
         # todo: replace with an else block and just  print that the model isn't initialized
         # todo: setup using desired_speed float instead of receiving speed array
-        if self.path_received and self.desired_speed_received and not self.mpc_initialized:
+        if self.path_received and self.desired_speed_received and not self.trajectory_initialized:
             self.reference_path = np.array([self.path[:, 0], self.path[:, 1], self.speeds, self.des_yaw_list]).T
             # relative_dts = np.array([self.sample_time] * self.path.shape[0])
             # relative_times = np.cumsum(relative_dts)

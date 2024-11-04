@@ -11,6 +11,7 @@ Notes:
         * save control commands (speed, delta)
         * add option to save at a specific frequency or only when messages are received
         * add the option to either save Odometry or subscribe to a path topic and save
+        * add option to save only if the distance (odometry) changes by a threshold
 
 Msgs:
     Path: http://docs.ros.org/en/noetic/api/nav_msgs/html/msg/Path.html
