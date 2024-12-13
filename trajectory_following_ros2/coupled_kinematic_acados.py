@@ -12,7 +12,7 @@ Tips:
     6. For an interesting cost function, see (https://discourse.acados.org/t/how-to-set-weights-of-costs-according-to-the-time-interval-in-mpc-prediction-horizon/1001)
 Todo:
     * normalize angle difference between current and desired yaw to [-pi, pi) or [0, 2pi).
-        Since acados does not give an interface to manipulate the cost function:
+        Since acados does not give an interface to manipulate the cost function. Actually, see (https://github.com/bzarr/TUM-CONTROL/blob/main/Model_Predictive_Controller/Nominal_NMPC/NMPC_STM_acados_settings.py#L41):
         1. get the difference and normalize
         2. pass the normalized difference to the cost function as the current yaw/psi states
         3. pass 0.0 as the desired yaw/psi state
@@ -404,12 +404,12 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.mpc_odom_pub = self.create_publisher(Odometry, '/mpc/current_state', 1)
         self.mpc_pose_pub = self.create_publisher(PoseStamped, '/mpc/current_pose', 1)
 
-        # setup mpc timer. todo: either publish debug topics in a separate node or use Reentrant MultiThreadedExecutor
+        # setup mpc timer.
         self.mpc_timer = self.create_timer(self.sample_time, self.mpc_callback,
                                                    callback_group=self.mpc_group)
         if self.debug_frequency > 0:
             self.debug_timer = self.create_timer(1 / self.debug_frequency, self.publish_debug_topics,
-                                                 callback_group=self.debug_group)  # todo: setup separate publishing dt
+                                                 callback_group=self.debug_group)
 
         self.setup_mpc_model()
         self.get_logger().info('kinematic_coupled_acados_mpc_controller node started. ')
@@ -511,7 +511,6 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.desired_speed_received = True
 
     def setup_mpc_model(self):
-        # todo: initialize during init phase as this causes the model to not be generated until path, speed and odom messages arrive
         # todo: add weights to acados settings arguments
         # todo: refactor acados settings
         # todo: add wheelbase
@@ -767,7 +766,7 @@ class KinematicCoupledAcadosMPCNode(Node):
                 self.zk[1, 0] = y
                 self.zk[2, 0] = vel
                 self.zk[3, 0] = psi
-                # # normalize the angle from -pi to pi or [0, 2PI). todo
+                # # normalize the angle from -pi to pi or [0, 2PI). todo. See: https://github.com/bzarr/TUM-CONTROL/blob/main/Model_Predictive_Controller/Nominal_NMPC/NMPC_STM_acados_settings.py#L41
                 # psi = (psi + math.pi) % (2 * math.pi) - math.pi
 
                 normalized_yaw_diff = trajectory_utils.normalize_angle(psi - self.xref[0, 3],

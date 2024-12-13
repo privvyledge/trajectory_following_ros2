@@ -529,6 +529,47 @@ def generate_launch_description():
             # ]
     )
 
+    custom_purepursuit_node = Node(
+            package='trajectory_following_ros2',
+            executable='purepursuit',
+            name=f'purepursuit_node',
+            output='screen',
+            parameters=[
+                {
+                    'use_sim_time': use_sim_time,
+                    'robot_frame': 'base_link',
+                    'global_frame': 'map',
+                    # 'file_path': waypoints_csv_path,  # todo
+                    # 'path_source': 'file',
+                    'control_rate': 20.0,
+                    'goal_tolerance': 5.0,
+                    'lookahead_distance': 9.0,  # 10.0
+                    'min_lookahead': 4.35,
+                    'max_lookahead': 15.0,
+                    'adaptive_lookahead_gain': 4.0,
+                    'use_adaptive_lookahead': False,
+                    'wheelbase': 2.87528,
+                    'max_steer': 69.99999284118222,
+                    'min_steer': -69.99999284118222,
+                    'max_steer_rate': 352.9411764706,
+                    'max_speed': 9.0,
+                    # 'min_speed': '-10.5',
+                    'speed_Kp': 2.0,
+                    'speed_Ki': 0.2,
+                    'speed_Kd': 0.0,
+                    'desired_speed': 8.9,  # 8.9
+                    'odom_topic': odom_topic,
+                    'ackermann_cmd_topic': ackermann_cmd_topic,
+                    # f'/ackermann_cmd_{role_name_string}' or f'/carla/{role_name_string}/ackermann_cmd'
+                    'twist_topic': twist_topic,  # f'/carla/{role_name_string}/twist'
+                    'acceleration_topic': acceleration_topic,  # f'/carla/{role_name_string}/twist'
+                    'path_topic': path_topic,
+                    'speed_topic': speed_topic,
+                    'speedup_first_lookup': True,
+                }
+            ]
+    )
+
     casadi_mpc_node = None
 
     load_nodes = GroupAction(
@@ -538,6 +579,7 @@ def generate_launch_description():
                 waypoint_loader_node,
                 acados_mpc_node,
                 do_mpc_node,
+                #custom_purepursuit_node,
                 # casadi_mpc_node,
             ])
 

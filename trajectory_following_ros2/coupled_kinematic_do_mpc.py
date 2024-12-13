@@ -483,7 +483,6 @@ class KinematicCoupledDoMPCNode(Node):
         self.desired_speed_received = True
 
     def setup_mpc_model(self):
-        # todo: initialize during init phase as this causes the model to not be generated until path, speed and odom messages arrive
         _, self.Controller, _ = initialize_mpc_problem(reference_path=self.reference_path,
                                                        horizon=self.horizon,
                                                        sample_time=self.sample_time,
@@ -695,6 +694,7 @@ class KinematicCoupledDoMPCNode(Node):
                 self.zk[2, 0] = vel
                 self.zk[3, 0] = psi
 
+                # see (https://github.com/bzarr/TUM-CONTROL/blob/main/Model_Predictive_Controller/Nominal_NMPC/NMPC_STM_acados_settings.py#L41)
                 normalized_yaw_diff = trajectory_utils.normalize_angle(psi - self.xref[0, 3],
                                                                        minus_pi_to_pi=True, pi_is_negative=True,
                                                                        degrees=False)

@@ -277,10 +277,10 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         ocp.constraints.x0 = x0
 
     # set QP solver and integration
-    ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
+    ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
     # PARTIAL_CONDENSING_HPIPM, FULL_CONDENSING_QPOASES, FULL_CONDENSING_HPIPM,
     # PARTIAL_CONDENSING_QPDUNES, PARTIAL_CONDENSING_OSQP, FULL_CONDENSING_DAQP
-    ocp.solver_options.nlp_solver_type = "SQP_RTI"  # SQP_RTI, SQP. SQP_RTI does only one iteration while SQP solves to a certain tolerance
+    ocp.solver_options.nlp_solver_type = "SQP"  # SQP_RTI, SQP. SQP_RTI does only one iteration while SQP solves to a certain tolerance
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"  # 'GAUSS_NEWTON', 'EXACT'
     ocp.solver_options.integrator_type = "ERK"  # 'IRK' (implicit), 'ERK' (explicit), 'GNSF', 'DISCRETE', 'LIFTED_IRK'
     # ocp.solver_options.collocation_type = 'EXPLICIT_RUNGE_KUTTA'  # 'GAUSS_RADAU_IIA', 'GAUSS_LEGENDRE', 'EXPLICIT_RUNGE_KUTTA'

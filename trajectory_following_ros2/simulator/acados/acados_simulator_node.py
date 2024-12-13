@@ -6,6 +6,15 @@ Todo:
     * add global and robot frames
     * add clock publisher using python time, e.g see Carla ros-bridge bridge.py
     * improve the accuracy of the simulator
+    * don't hardcode model into do-mpc, instead use vectors
+    * setup do-mpc to return the mpc object only.
+    * setup do-mpc update
+    * setup do-mpc warmstart
+    * setup parameter type
+    * setup point stabilization, i.e go to goal from RVIz pose
+    * change model input to velocity instead of acceleration or use a model
+    * speed up do-mpc
+    * load compiled model
 """
 import math
 import time

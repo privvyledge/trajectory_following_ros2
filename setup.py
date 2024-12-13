@@ -7,12 +7,24 @@ package_name = 'trajectory_following_ros2'
 data_files = [
     ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
     ('share/' + package_name, ['package.xml']),
-    (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
+    # (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
     (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
     (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz'))
 ]
 
+# to recursively add all launch files and keep the subdirectory structure
+for root, dirs, files in os.walk('launch'):
+    # Get the relative path for each subdirectory
+    install_dir = os.path.join('share', package_name, root)
+    # Get the list of all launch files in the current subdirectory
+    launch_files = [os.path.join(root, f) for f in files if f.endswith(
+            ('.launch.py', '.launch.xml', '.launch.yml', '.launch.yaml'))]
+    if launch_files:
+        # Add each subdirectory and its files to data_files
+        data_files.append((install_dir, launch_files))
 
+
+# to include all directories and subdirectories in a folder
 def package_files(data_files, directory_list):
     paths_dict = {}
 
@@ -51,7 +63,7 @@ setup(
         tests_require=['pytest'],
         entry_points={
             'console_scripts': [
-                # 'coupled_kinematic_casadi = trajectory_following_ros2.coupled_kinematic_casadi:main',
+                'coupled_kinematic_casadi = trajectory_following_ros2.coupled_kinematic_casadi:main',
                 'coupled_kinematic_do_mpc = trajectory_following_ros2.coupled_kinematic_do_mpc:main',
                 'coupled_kinematic_acados = trajectory_following_ros2.coupled_kinematic_acados:main',
                 # 'coupled_kinematic_cvxpy = trajectory_following_ros2.ackermann_mpc_cvxpy:main',
