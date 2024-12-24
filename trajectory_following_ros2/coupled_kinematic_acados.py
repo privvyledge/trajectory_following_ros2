@@ -144,10 +144,10 @@ class KinematicCoupledAcadosMPCNode(Node):
                                                                'set to "map", '
                                                                'otherwise use "odom".'))  # global frame: odom, map
         self.declare_parameter('ode_type', "continuous_kinematic_coupled")  # todo: also augmented, etc
-        self.declare_parameter('stage_cost_type', "LINEAR_LS")  # Acados specific (LINEAR_LS, NONLINEAR_LS, EXTERNAL)
-        self.declare_parameter('terminal_cost_type', "LINEAR_LS")  # Acados specific (LINEAR_LS, NONLINEAR_LS, EXTERNAL)
-        self.declare_parameter('control_rate', 50.0)
-        self.declare_parameter('debug_frequency', 4.0)
+        self.declare_parameter('stage_cost_type', "NONLINEAR_LS")  # Acados specific (LINEAR_LS, NONLINEAR_LS, EXTERNAL)
+        self.declare_parameter('terminal_cost_type', "NONLINEAR_LS")  # Acados specific (LINEAR_LS, NONLINEAR_LS, EXTERNAL)
+        self.declare_parameter('control_rate', 20.0)
+        self.declare_parameter('debug_frequency', 1.0)
         self.declare_parameter('distance_tolerance', 0.2)  # todo: move to goal checker node
         self.declare_parameter('speed_tolerance', 0.5)  # todo: move to goal checker node
         self.declare_parameter('wheelbase', 0.256)
@@ -156,6 +156,7 @@ class KinematicCoupledAcadosMPCNode(Node):
                                        description='The minimum lateral command (steering) to apply.'))  # in degrees
         self.declare_parameter('max_steer', 27.0)  # in degrees
 
+        np.set_printoptions(suppress=True)
         # MPC Parameters
         self.declare_parameter('max_steer_rate', 60 / 0.17)  # in degrees
         self.declare_parameter('max_speed', 1.5)  # in m/s
@@ -173,10 +174,10 @@ class KinematicCoupledAcadosMPCNode(Node):
                                1e-6)  # iteration finish param. todo: pass to mpc initializer solver options
 
         # tips for tuning weights (https://www.mathworks.com/help/mpc/ug/tuning-weights.html)
-        self.declare_parameter('R', [0.01, 0.01])
-        self.declare_parameter('Rd', [10., 100.])
-        self.declare_parameter('Q', [1.0, 1.0, 1.0, 0.01])
-        self.declare_parameter('Qf', [0.04, 0.04, 0.1, 0.01])
+        self.declare_parameter('R', [10., 100.]),  # [0.01, 0.01], [10., 100.]
+        self.declare_parameter('Rd', [10., 100.]),  #
+        self.declare_parameter('Q', [1.0, 1.0, 1.0, 100.0])
+        self.declare_parameter('Qf', [0.04, 0.04, 0.1, 10.0])
         self.declare_parameter('scale_cost', False)
 
         self.declare_parameter('path_topic', '/trajectory/path')  # todo: replace with custom message or action
@@ -842,7 +843,7 @@ class KinematicCoupledAcadosMPCNode(Node):
                 if status != 0:
                     # acados_solver.print_statistics()
                     # 0-success, 1-failure, 2-maximum number of iterations reached,
-                    # 3-minimum step sizze in QP solver reached, 4-qp solver failed
+                    # 3-minimum step size in QP solver reached, 4-qp solver failed
                     # todo: set a flag (verbosity) to enable/disable this
                     self.get_logger().info("acados returned status {} in"
                                            " closed loop iteration {}.".format(status, self.run_count))
@@ -876,14 +877,15 @@ class KinematicCoupledAcadosMPCNode(Node):
                 # self.get_logger().info(f'Cost: {cost}')
                 num_iter = self.controller.get_stats('sqp_iter')
                 stats = self.controller.get_stats('statistics')
-                solve_time_ = self.controller.get_stats('time_tot')
-                time_qp_solution_ = self.controller.get_stats('time_qp')
-                time_linearization_ = self.controller.get_stats('time_lin')
-                time_integrator_ = self.controller.get_stats('time_sim')
-                # acados_solver.print_statistics()
-                # self.get_logger().info(f"Elapsed time: {solver_dt}, total_time = {solve_time_}, num_iter = {num_iter},"
-                #       f"linearization_time = {time_linearization_}, integration_time = {time_integrator_}, "
-                #       f"qp time = {time_qp_solution_}  \n")
+                solve_time_ = self.controller.get_stats('time_tot') or -1
+                time_qp_solution_ = self.controller.get_stats('time_qp') or -1
+                time_linearization_ = self.controller.get_stats('time_lin') or -1
+                time_integrator_ = self.controller.get_stats('time_sim') or -1
+                # self.controller.print_statistics()
+
+                # self.get_logger().info(f"Elapsed time: {1 / solver_dt}, total_time = {1 / solve_time_}, num_iter = {num_iter},"
+                #       f"linearization_time = {1 / time_linearization_}, integration_time = {1 / time_integrator_}, "
+                #       f"qp time = {1 / time_qp_solution_}  \n")
 
                 warmstart_variables = {'z_ws': solution_dict['z_mpc'], 'u_ws': solution_dict['u_mpc'],
                                        'sl_ws': solution_dict['sl_mpc']}
@@ -900,11 +902,12 @@ class KinematicCoupledAcadosMPCNode(Node):
                 self.acc_cmd = u[0]
                 self.delta_cmd = u[1]
                 '''To get the velocity command: use either of the following:
-                1: Predicted velocity[k+1], i.e predicted_vel_state[1, 0]
+                1: Predicted velocity[k+1], i.e predicted_vel_state[1, 0]. [k + 1]
                 2: Current_velocity + integrate(acceleration), i.e current_speed + self.acc_cmd * self.sample_time
                 '''
                 self.velocity_cmd = predicted_vel_state[1, 0]  # float(predicted_vel_state[1])
                 # self.velocity_cmd = vel + self.acc_cmd * self.sample_time
+                self.get_logger().info(f"acc cmd: {self.acc_cmd}, delta cmd: {self.delta_cmd}, vel_cmd: {self.velocity_cmd}")
 
                 if self.saturate_input:
                     self.input_saturation()

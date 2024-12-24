@@ -1,3 +1,9 @@
+"""
+Todo:
+    * cleanup and make a simple extensible class/interface
+    * move helper functions to a different file
+    * add frenet model (https://github.com/bohlinz/genesis_path_follower/blob/master/scripts/controllers/kinematic_frenet_mpc.py | https://github.com/acados/acados/blob/master/examples/acados_python/race_cars/bicycle_model.py#L97)
+"""
 import types
 
 import numpy as np
@@ -11,12 +17,14 @@ class KinematicBicycleModel(object):
                  vel_bound=(-5.0, 5.0), delta_bound=(-23.0, 23.0), acc_bound=(-3.0, 3.0),
                  jerk_bound=(-1.5, 1.5), delta_rate_bound=(-352.9411764706, 352.9411764706),
                  vehicle_parameters=None, sample_time=0.001, symbol_type='MX',
-                 model_type='kinematic', model_name='vehicle_kinematic_model', discretization_method='cvodes'):
+                 model_type='kinematic', model_name='vehicle_kinematic_model', discretization_method='cvodes',
+                 discrete=False):
         """Constructor for KinematicBicycleModel"""
         # model info
         self.model_name = model_name
         self.model_type = model_type
         self.symbol_type = symbol_type
+        self.discrete = discrete
 
         # vehicle parameters
         if vehicle_parameters is None:
@@ -33,23 +41,27 @@ class KinematicBicycleModel(object):
         self.discretization_method = discretization_method
 
         # constraints
-        self.vel_bound = (-5.0, 5.0)
-        self.delta_bound = (-23.0, 23.0)
-        self.acc_bound = (-3.0, 3.0)
-        self.jerk_bound = (-1.5, 1.5)
-        self.delta_rate_bound = (-352.9411764706, 352.9411764706)
+        self.vel_bound = vel_bound
+        self.delta_bound = delta_bound
+        self.acc_bound = acc_bound
+        self.jerk_bound = jerk_bound
+        self.delta_rate_bound = acc_bound
 
-        self.model, self.constraints = self.setup_model(symbol_type=self.symbol_type)
-        [self.linear_model, self.ode_linear_function,
-         self.system_matrices, self.system_matrices_function_handles] = self.setup_linearizer(self.model.f_expl_expr,
-                                                                                              y_meas=None,
-                                                                                              x=self.model.x,
-                                                                                              u=self.model.u,
-                                                                                              xss=self.model.xss,
-                                                                                              uss=self.model.u0,
-                                                                                              wheelbase=self.model.params.wheelbase,
-                                                                                              method='jac')
-        self.linear_model, x_next = self.linearize(self.linear_model, wheelbase=self.model.params.wheelbase)
+        if self.discrete:
+            self.model, self.constraints = self.setup_discrete_ltv_model(symbol_type=self.symbol_type)
+            self.linear_model = self.model
+        else:
+            self.model, self.constraints = self.setup_model(symbol_type=self.symbol_type)
+            [self.linear_model, self.ode_linear_function,
+             self.system_matrices, self.system_matrices_function_handles] = self.setup_linearizer(self.model.f_expl_expr,
+                                                                                                  y_meas=None,
+                                                                                                  x=self.model.x,
+                                                                                                  u=self.model.u,
+                                                                                                  xss=self.model.xss,
+                                                                                                  uss=self.model.u0,
+                                                                                                  wheelbase=self.model.params.wheelbase,
+                                                                                                  method='jac')
+            self.linear_model, x_next = self.linearize(self.linear_model, wheelbase=self.model.params.wheelbase)
 
     def setup_model(self, symbol_type='MX',
                     z0=None, u0=(0., 0.),
@@ -221,6 +233,175 @@ class KinematicBicycleModel(object):
         # model.f_disk = self.setup_discretizer(z, u, parameters)
         model.x = z
         model.xss = zss
+        model.xdot = z_dot
+        model.u = u
+        model.u0 = u_prev
+        model.z = z_algebraic
+        model.p = parameters
+        model.name = self.model_name
+        model.params = params
+
+        return model, constraint
+
+    def setup_discrete_ltv_model(self, symbol_type='MX',
+                    z0=None, u0=(0., 0.),
+                    vel_bound=None, delta_bound=None, acc_bound=None, jerk_bound=None, delta_rate_bound=None):
+        # todo: remove constraints from model since that isn't from the kinematics
+        # todo: create new models class
+        # initialize structs
+        constraint = types.SimpleNamespace()  # todo: switch to a class instead
+        model = types.SimpleNamespace()  # todo: switch to a class instead
+
+        if symbol_type.lower() == 'MX'.lower():
+            symbol_type = casadi.MX
+
+        elif symbol_type.lower() == 'SX'.lower():
+            symbol_type = casadi.SX
+
+        else:
+            raise Exception('Invalid Symbol Type')
+
+        # state
+        x = symbol_type.sym("x")
+        y = symbol_type.sym("y")
+        vel = symbol_type.sym("vel")
+        psi = symbol_type.sym("psi")
+        z = casadi.vertcat(x, y, vel, psi)
+        num_states = z.shape[0]
+
+        # input
+        acc = symbol_type.sym("acc")
+        delta = symbol_type.sym("delta")
+        u = casadi.vertcat(acc, delta)
+        num_inputs = u.shape[0]
+
+        # initial input
+        acc_prev = symbol_type.sym("acc_prev")
+        delta_prev = symbol_type.sym("delta_prev")
+        u_prev = casadi.vertcat(acc_prev, delta_prev)
+        if u0 is None:
+            u0 = u_prev
+
+        # input rate symbols.
+        jerk = symbol_type.sym("jerk")
+        jerk = acc - acc_prev
+
+        delta_rate = symbol_type.sym("delta_rate")
+        delta_rate = delta - delta_prev
+
+        u_dot1 = casadi.vertcat(jerk, delta_rate)
+        u_dot2 = u - u0  #
+        u_dot = u - u_prev
+
+        # state derivatives
+        x_dot = symbol_type.sym("xdot")  # vel * casadi.cos(psi)
+        y_dot = symbol_type.sym("ydot")  # vel * casadi.sin(psi)
+        vel_dot = symbol_type.sym("vel_dot")  # acc
+        psi_dot = symbol_type.sym("psi_dot")  # (vel / wheelbase) * casadi.tan(delta)
+        z_dot = casadi.vertcat(x_dot, y_dot, vel_dot, psi_dot)  # ode-nonlinear
+
+        # algebraic variables
+        z_algebraic = casadi.vertcat([])
+
+        # parameters
+        '''Race car parameters'''
+        wheelbase = symbol_type.sym('wheelbase')  # m
+        dt = symbol_type.sym('dt')
+        z_ref = symbol_type.sym('z_ref', z.shape)
+        z_k = symbol_type.sym('z_k', z.shape)
+        u_ref = symbol_type.sym('u_ref', u.shape)
+        u_prev = symbol_type.sym('u_prev', u.shape)
+        parameters = casadi.vertcat(
+            wheelbase,
+            z_ref,
+            u_ref,
+            z_k,
+            u_prev,
+            dt
+    )
+
+        A = casadi.blockcat([
+            [1, 0, casadi.cos(psi) * dt, -vel * casadi.sin(psi) * dt],
+            [0, 1, casadi.sin(psi) * dt, vel * casadi.cos(psi) * dt],
+            [0, 0, 1, 0],
+            [0, 0, dt * casadi.tan(delta) / self.wheelbase, 1],
+        ])
+        B = casadi.blockcat([
+            [0, 0],
+            [0, 0],
+            [dt, 0],  #
+            [0, dt * vel / (self.wheelbase * casadi.cos(delta) ** 2)],
+        ])
+        G = casadi.vertcat(vel * casadi.sin(psi) * psi * dt,
+                           -vel * casadi.cos(psi) * psi * dt,
+                           0,
+                           -(vel * delta) * dt / (self.wheelbase * casadi.cos(delta) ** 2))
+
+        # dynamics (discrete linear model)
+        f_expl = A @ z + B @ u + G  # discrete linear model
+
+        '''Constraints/bounds'''
+        if delta_bound is None:
+            delta_bound = self.delta_bound
+
+        if vel_bound is None:
+            vel_bound = self.vel_bound
+
+        if acc_bound is None:
+            acc_bound = self.acc_bound
+
+        if jerk_bound is None:
+            jerk_bound = self.jerk_bound
+
+        if delta_rate_bound is None:
+            delta_rate_bound = self.delta_rate_bound
+
+        # state bounds
+        # model.x_min = -np.inf
+        # model.x_max = np.inf
+        #
+        # model.y_min = -np.inf
+        # model.y_max = np.inf
+
+        model.v_min = vel_bound[0]
+        model.v_max = vel_bound[1]
+
+        # model.psi_min = -2 * np.pi
+        # model.psi_max = -2 * np.pi
+
+        # input bounds
+        model.delta_min = np.radians(delta_bound[0])  # minimum steering angle [rad]
+        model.delta_max = np.radians(delta_bound[1])  # maximum steering angle [rad]
+
+        model.acc_min = acc_bound[0]
+        model.acc_max = acc_bound[1]
+
+        # input rate bounds. Todo: setup as non-linear constraints
+        model.delta_rate_min = np.radians(delta_rate_bound[0])
+        model.delta_rate_max = np.radians(delta_rate_bound[1])
+
+        model.jerk_min = jerk_bound[0]
+        model.jerk_max = jerk_bound[1]
+
+        # (optional) Define initial conditions
+        if z0 is None:
+            if self.z0 is not None:
+                model.x0 = self.z0
+            else:
+                model.x0 = np.zeros(z.shape[0])
+        else:
+            model.x0 = z0
+
+
+        # Define model struct
+        params = types.SimpleNamespace()
+        params.wheelbase = wheelbase
+        # params.mass = 0.2
+        params.dt = dt
+
+        model.f_impl_expr = z_dot - f_expl
+        model.f_expl_expr = f_expl
+        model.x = z
         model.xdot = z_dot
         model.u = u
         model.u0 = u_prev

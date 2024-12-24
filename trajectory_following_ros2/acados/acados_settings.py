@@ -70,7 +70,8 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     ns = nsh + nsbx  # total number of slacks at stages (1, N-1)
 
     # discretization
-    ocp.dims.N = N  # prediction horizon
+    # ocp.dims.N = N  # prediction horizon (depracated)
+    ocp.solver_options.N_horizon = N  # prediction horizon
 
     # set cost
     '''
@@ -240,7 +241,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     ocp.constraints.ubu = np.array([model.acc_max, model.delta_max])  # input upper bound
     ocp.constraints.idxbu = np.array([0, 1])
 
-    # # Soft/slack state bounds: to map lower and upper slack vectors onto x(T).
+    # # Soft/slack state bounds: to map lower and upper slack vectors onto x(T). todo: enable
     # ocp.constraints.lsbx = np.array([-2 * np.pi])  # np.zeros([nsbx])
     # ocp.constraints.usbx = np.array([2 * np.pi])  # np.zeros([nsbx])
     # ocp.constraints.idxsbx = np.array(range(nsbx))
@@ -277,27 +278,29 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         ocp.constraints.x0 = x0
 
     # set QP solver and integration
-    ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM"
+    ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
     # PARTIAL_CONDENSING_HPIPM, FULL_CONDENSING_QPOASES, FULL_CONDENSING_HPIPM,
     # PARTIAL_CONDENSING_QPDUNES, PARTIAL_CONDENSING_OSQP, FULL_CONDENSING_DAQP
-    ocp.solver_options.nlp_solver_type = "SQP"  # SQP_RTI, SQP. SQP_RTI does only one iteration while SQP solves to a certain tolerance
-    ocp.solver_options.hessian_approx = "GAUSS_NEWTON"  # 'GAUSS_NEWTON', 'EXACT'
+    ocp.solver_options.nlp_solver_type = "SQP_RTI"  # SQP_RTI, SQP. SQP_RTI does only one iteration while SQP solves to a certain tolerance
+    # ocp.solver_options.globalization = 'MERIT_BACKTRACKING'  # turns on globalization. 'FUNNEL_L1PEN_LINESEARCH' if not self.use_RTI else 'MERIT_BACKTRACKING'
+    ocp.solver_options.hessian_approx = "EXACT"  # 'GAUSS_NEWTON', 'EXACT'.
     ocp.solver_options.integrator_type = "ERK"  # 'IRK' (implicit), 'ERK' (explicit), 'GNSF', 'DISCRETE', 'LIFTED_IRK'
     # ocp.solver_options.collocation_type = 'EXPLICIT_RUNGE_KUTTA'  # 'GAUSS_RADAU_IIA', 'GAUSS_LEGENDRE', 'EXPLICIT_RUNGE_KUTTA'
-    # ocp.solver_options.hpipm_mode = 'SPEED'  # 'BALANCE', 'SPEED_ABS', 'SPEED', 'ROBUST'
+    ocp.solver_options.hpipm_mode = 'ROBUST'  # 'BALANCE', 'SPEED_ABS', 'SPEED', 'ROBUST'
     # NO_REGULARIZE, MIRROR, PROJECT, CONVEXIFY, PROJECT_REDUC_HESS
-    # ocp.solver_options.regularize_method = "NO_REGULARIZE"
+    ocp.solver_options.regularize_method = "PROJECT"
+    ocp.solver_options.reg_epsilon = 1e-4
     ocp.solver_options.print_level = 0
     ocp.solver_options.sim_method_num_stages = 4  # (1) RK1, (2) RK2, (4) RK4
     ocp.solver_options.sim_method_num_steps = 3
     # ocp.solver_options.nlp_solver_step_length = 0.05
     ocp.solver_options.nlp_solver_max_iter = num_iterations
-    ocp.solver_options.tol = tolerance  # 1e-4
+    # ocp.solver_options.tol = tolerance  # 1e-4
     # ocp.solver_options.nlp_solver_tol_comp = 1e-1
-    ocp.solver_options.qp_solver_cond_N = 1  # int(N / 2)  # or N if scale_cost=False
-    ocp.solver_options.qp_solver_warm_start = 2
+    # ocp.solver_options.qp_solver_cond_N = 1  # int(N / 2)  # or N if scale_cost=False
+    # ocp.solver_options.qp_solver_warm_start = 2
     ocp.solver_options.qp_solver_iter_max = num_iterations
-    ocp.solver_options.qp_tol = tolerance  # 1e-3
+    # ocp.solver_options.qp_tol = tolerance  # 1e-3
 
     # set prediction horizon
     ocp.solver_options.tf = Tf

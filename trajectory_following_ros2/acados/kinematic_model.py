@@ -15,7 +15,7 @@ import numpy as np
 from casadi import *
 
 
-def kinematic_model(symbol_type='MX'):
+def kinematic_model(symbol_type='SX'):
     # define structs
     constraint = types.SimpleNamespace()
     model = types.SimpleNamespace()
@@ -77,8 +77,8 @@ def kinematic_model(symbol_type='MX'):
     '''Race car parameters'''
     wheelbase = symbol.sym('wheelbase')  # m
     z_ref = symbol.sym('z_ref', z.shape)
-    z_k = symbol.sym('z_k', z.shape)
     u_ref = symbol.sym('u_ref', u.shape)
+    z_k = symbol.sym('z_k', z.shape)
     u_prev = symbol.sym('u_prev', u.shape)
     parameters = vertcat(
             wheelbase,

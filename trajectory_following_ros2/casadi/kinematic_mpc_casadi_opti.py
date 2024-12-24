@@ -25,6 +25,7 @@ Todo:
     * rename variables
     * replace for loops with map
     * replace model with kinematic_bicycle_model
+    * Setup warmstarting and codegen (https://github.com/casadi/casadi/discussions/3434#discussioncomment-7404877)
 """
 import time
 import numpy as np
@@ -42,7 +43,12 @@ class KinematicMPCCasadiOpti(object):
                  Qf=(0.0, 0.0, 0.0, 0.0), Rd=(0.0, 0.0),
                  vel_bound=(-5.0, 5.0), delta_bound=(-23.0, 23.0), acc_bound=(-3.0, 3.0),
                  jerk_bound=(-1.5, 1.5), delta_rate_bound=(-352.9411764706, 352.9411764706),
-                 warmstart=True, solver_options=None, solver='ipopt', suppress_ipopt_output=True):
+                 warmstart=True, solver_options=None, solver_type='nlp', solver='ipopt', suppress_ipopt_output=True,
+                 normalize_yaw_error=True,
+                 slack_weights_u_rate=(0.0, 0.0),  # (1e-6, 1e-6)
+                 slack_scale_u_rate=(1.0, 1.0),
+                 slack_upper_bound_u_rate=None, #(1., np.radians(30.0)), (np.inf, np.inf)
+                 slack_objective_is_quadratic=False):
         """ Constructor for KinematicMPCCasadiOpti """
         # self.vehicle = vehicle
         # self.model = vehicle.model
@@ -54,8 +60,28 @@ class KinematicMPCCasadiOpti(object):
         self.R = casadi.diag(R)
         self.Qf = casadi.diag(Qf)
         self.Rd = casadi.diag(Rd)
+        self.P_u_rate = casadi.diag(slack_weights_u_rate) if slack_weights_u_rate is not None else casadi.DM.zeros(self.nu, self.nu)  # >= 0,should be small, for soft constraints and large for hard constraints. 0 to disable slack
+        self.V_scale_u_rate = casadi.diag(slack_scale_u_rate) if slack_scale_u_rate is not None else casadi.DM.eye(self.nu)  # should be identity in most cases
+        # set the positive slack upper bound
+        if slack_upper_bound_u_rate is not None and isinstance(slack_upper_bound_u_rate, (list, tuple, np.ndarray)):
+            if isinstance(slack_upper_bound_u_rate, np.ndarray):
+                slack_upper_bound_u_rate = slack_upper_bound_u_rate.flatten().tolist()
+            elif isinstance(slack_upper_bound_u_rate, tuple):
+                slack_upper_bound_u_rate = list(slack_upper_bound_u_rate)
+            for i in range(len(slack_upper_bound_u_rate)):
+                if slack_upper_bound_u_rate[i] < 0:
+                    slack_upper_bound_u_rate[i] = np.inf
+        self.slack_upper_bound_u_rate = casadi.DM(slack_upper_bound_u_rate) if slack_upper_bound_u_rate is not None else [np.inf, np.inf]  # to put limits (upper bound) on the slack variables. Must be > 0. 0 implies None
+        self.slack_objective_is_quadratic = slack_objective_is_quadratic  # if True, use quadratic slack objective else linear
         self.warmstart = warmstart
         self.solver_options = solver_options
+        self.solver_type = solver_type
+        self.solver_ = solver
+
+        if self.solver_ in ["osqp", "qpoases"] or self.solver_type in ['quad', 'conic', 'qp']:
+            self.solver_type = 'conic'  # casadi opti uses conic (or sqpmethod in newer versions of casadi) for SQPs, etc
+
+        self.normalize_yaw_error = normalize_yaw_error  # normalizes the angle in the range [-pi, pi)
 
         self.Ts = sample_time
         self.T_predict = self.Ts * self.horizon  # prediction horizon, i.e T_predict / horizon = dt
@@ -84,8 +110,12 @@ class KinematicMPCCasadiOpti(object):
         self.delta_dv = None
         self.u_dv = np.array([self.acc_dv, self.delta_dv])  # actual/predicted/openloop inputs
 
-        self.sl_acc_dv = None
-        self.sl_delta_dv = None
+        self.jerk_dv = None
+        self.delta_rate_dv = None
+        self.u_rate_dv = np.array([self.jerk_dv, self.delta_rate_dv])  # actual/predicted/openloop input rates
+
+        self.sl_acc_dv = np.zeros(self.horizon)  # to handle cases where slack is disabled
+        self.sl_delta_dv = np.zeros(self.horizon)  # to handle cases where slack is disabled
         self.sl_dv = np.array([self.sl_acc_dv, self.sl_delta_dv])  # slack variables for input rates
 
         self.mpc = self.initialize_mpc(horizon=self.horizon,
@@ -105,16 +135,23 @@ class KinematicMPCCasadiOpti(object):
                                   self.horizon * [float(x0[2])],
                                   self.horizon * [float(x0[3])])
 
-        if u0 is not None:
+        if u0 is None:
             self.update_previous_input(0., 0.)
+        else:
+            if isinstance(u0, np.ndarray):
+                u0 = u0.flatten().tolist()
+            self.update_previous_input(u0[0], u0[1])
 
-        self.solver = self.setup_solver(self.cost, solver_options=self.solver_options, solver=solver,
+        self.solver = self.setup_solver(self.cost, solver_options=self.solver_options, solver=self.solver_,
                                         suppress_output=suppress_ipopt_output)  # returns None when using Opti
 
         self.solution = self.solve()
 
     def initialize_mpc(self, horizon, nx, nu):
-        mpc = casadi.Opti()
+        if self.solver_type == 'nlp':
+            mpc = casadi.Opti()
+        else:
+            mpc = casadi.Opti(self.solver_type)
 
         # Parameters
         self.previous_input = mpc.parameter(nu)
@@ -154,13 +191,24 @@ class KinematicMPCCasadiOpti(object):
         self.delta_dv = self.u_dv[:, 1]
 
         '''
+        Control input rates used to achieve self.z_dv according to dynamics.
+        The first index is the timestep k, i.e. self.u_dv[0,:] is u_0.
+        The second index is the input element as detailed below.
+        '''
+        self.u_rate_dv = mpc.variable(horizon, nu)
+
+        self.jerk_dv = self.u_rate_dv[:, 0]
+        self.delta_rate_dv = self.u_rate_dv[:, 1]
+
+        '''
         Slack variables used to relax input rate constraints.
         Matches self.u_dv in structure but timesteps range from -1, ..., N-1.
         '''
-        self.sl_dv = mpc.variable(horizon, nu)
+        if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
+            self.sl_dv = mpc.variable(horizon, nu)
 
-        self.sl_acc_dv = self.sl_dv[:, 0]
-        self.sl_delta_dv = self.sl_dv[:, 1]
+            self.sl_acc_dv = self.sl_dv[:, 0]
+            self.sl_delta_dv = self.sl_dv[:, 1]
         return mpc
 
     def constraints_setup(
@@ -214,6 +262,28 @@ class KinematicMPCCasadiOpti(object):
 
         # state model constraints.
         for i in range(self.horizon):
+            # # todo: add different integrators
+            # k1 = self.f(st, con)
+            # if self.INTEGRATION_MODE == "Euler":
+            #     st_next_euler = st + (self.dT * k1)
+            # elif self.INTEGRATION_MODE == "RK3":
+            #     k2 = self.f(st + self.dT / 2 * k1, con)
+            #     k3 = self.f(st + self.dT * (2 * k2 - k1), con)
+            #     st_next_euler = st + self.dT / 6 * (k1 + 4 * k2 + k3)
+            # elif self.INTEGRATION_MODE == "RK4":
+            #     k2 = self.f(st + self.dT / 2 * k1, con)
+            #     k3 = self.f(st + self.dT / 2 * k2, con)
+            #     k4 = self.f(st + self.dT * k3, con)
+            #     st_next_euler = st + self.dT / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+            # dt = T / N  # length of a control interval
+            # for k in range(N):  # loop over control intervals
+            #     # Runge-Kutta 4 integration
+            #     k1 = f(X[:, k], U[:, k])
+            #     k2 = f(X[:, k] + dt / 2 * k1, U[:, k])
+            #     k3 = f(X[:, k] + dt / 2 * k2, U[:, k])
+            #     k4 = f(X[:, k] + dt * k3, U[:, k])
+            #     x_next = X[:, k] + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
+
             # # beta = casadi.atan(self.lr / (self.lf + self.lr) * casadi.tan(self.delta_dv[i]))
             beta = 0.0
             # x_[k+1]
@@ -240,31 +310,55 @@ class KinematicMPCCasadiOpti(object):
 
         # state constraints
         self.mpc.subject_to(self.mpc.bounded(vel_bound[0], self.v_dv, vel_bound[1]))
+        self.mpc.subject_to(self.mpc.bounded(-2 * casadi.pi, self.psi_dv, 2 * casadi.pi))
 
         # Input Bound Constraints
         self.mpc.subject_to(self.mpc.bounded(acc_bound[0], self.acc_dv, acc_bound[1]))
-        self.mpc.subject_to(self.mpc.bounded(np.radians(delta_bound[0]), self.delta_dv, np.radians(delta_bound[1])))
+        self.mpc.subject_to(
+            self.mpc.bounded(np.radians(delta_bound[0]),
+                             self.delta_dv,
+                             np.radians(delta_bound[1])))
 
-        # Input Rate Bound Constraints
-        self.mpc.subject_to(self.mpc.bounded(jerk_bound[0] * self.Ts - self.sl_acc_dv[0],
-                                             self.acc_dv[0] - self.previous_input[0],
-                                             jerk_bound[1] * self.Ts + self.sl_acc_dv[0]))
+        # Input Rate Bound Constraints. todo: refactor without for loop and test, i.e use a for-loop or map to assign the rates and set the bound
+        slack_flag = int(not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))))
+        self.jerk_dv[0] = self.acc_dv[0] - self.previous_input[0]
+        self.delta_rate_dv[0] = self.delta_dv[0] - self.previous_input[1]
+        self.mpc.subject_to(self.mpc.bounded(
+                (jerk_bound[0] * self.Ts) - (slack_flag * self.V_scale_u_rate[0, 0] * self.sl_acc_dv[0]),
+                self.jerk_dv[0],
+                (jerk_bound[1] * self.Ts) + (slack_flag * self.V_scale_u_rate[0, 0] * self.sl_acc_dv[0])))
 
-        self.mpc.subject_to(self.mpc.bounded(np.radians(delta_rate_bound[0]) * self.Ts - self.sl_delta_dv[0],
-                                             self.delta_dv[0] - self.previous_input[1],
-                                             np.radians(delta_rate_bound[1]) * self.Ts + self.sl_delta_dv[0]))
+        self.mpc.subject_to(self.mpc.bounded(
+                (np.radians(delta_rate_bound[0]) * self.Ts) - (slack_flag * self.V_scale_u_rate[1, 1] * self.sl_delta_dv[0]),
+                self.delta_rate_dv[0],
+                (np.radians(delta_rate_bound[1]) * self.Ts) + (slack_flag * self.V_scale_u_rate[1, 1] * self.sl_delta_dv[0])))
 
         for i in range(self.horizon - 1):
-            self.mpc.subject_to(self.mpc.bounded(jerk_bound[0] * self.Ts - self.sl_acc_dv[i + 1],
-                                                 self.acc_dv[i + 1] - self.acc_dv[i],
-                                                 jerk_bound[1] * self.Ts + self.sl_acc_dv[i + 1]))
-            self.mpc.subject_to(self.mpc.bounded(np.radians(delta_rate_bound[0]) * self.Ts - self.sl_delta_dv[i + 1],
-                                                 self.delta_dv[i + 1] - self.delta_dv[i],
-                                                 np.radians(delta_rate_bound[1]) * self.Ts + self.sl_delta_dv[i + 1]))
+            self.jerk_dv[i + 1] = self.acc_dv[i + 1] - self.acc_dv[i]
+            self.delta_rate_dv[i + 1] = self.delta_dv[i + 1] - self.delta_dv[i]
+            self.mpc.subject_to(self.mpc.bounded(
+                    (jerk_bound[0] * self.Ts) - (slack_flag * self.V_scale_u_rate[0, 0] * self.sl_acc_dv[i + 1]),
+                    self.jerk_dv[i + 1],
+                    (jerk_bound[1] * self.Ts) + (slack_flag * self.V_scale_u_rate[0, 0] * self.sl_acc_dv[i + 1])))
+            self.mpc.subject_to(self.mpc.bounded(
+                    (np.radians(delta_rate_bound[0]) * self.Ts) - (slack_flag * self.V_scale_u_rate[1, 1] * self.sl_delta_dv[i + 1]),
+                    self.delta_rate_dv[i + 1],
+                    (np.radians(delta_rate_bound[1]) * self.Ts) + (slack_flag * self.V_scale_u_rate[1, 1] * self.sl_delta_dv[i + 1])
+            ))
+        # Slack Bound Constraints.
+        if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
+            if self.slack_upper_bound_u_rate is None:
+                self.mpc.subject_to(
+                    0 <= self.sl_acc_dv)  # test removing the conditional by using (0 <= self.sl_delta_dv) <= casadi.inf and declaring slack bound u rate as inf or 1E15
+                self.mpc.subject_to(0 <= self.sl_delta_dv)  # test removing the conditional by using (0 <= self.sl_delta_dv) <= casadi.inf and declaring slack bound u rate as inf or 1E15
+            else:
+                # self.mpc.subject_to((0 <= self.sl_acc_dv) <= self.slack_upper_bound_u_rate[0])
+                # self.mpc.subject_to((0 <= self.sl_delta_dv) <= self.slack_upper_bound_u_rate[1])
+                self.mpc.subject_to(self.mpc.bounded(0, self.sl_acc_dv, self.slack_upper_bound_u_rate[0]))
+                self.mpc.subject_to(self.mpc.bounded(0, self.sl_delta_dv, self.slack_upper_bound_u_rate[1]))
+
         # Other Constraints
-        self.mpc.subject_to(0 <= self.sl_delta_dv)
-        self.mpc.subject_to(0 <= self.sl_acc_dv)
-        # e.g. things like collision avoidance or lateral acceleration bounds could go here.
+        # e.g. things like collision avoidance or lateral acceleration bounds could go here. for static obstacles, the position will be repeated horizon times, for dynamic obstacles, the k-th position should be added in the loop
 
     def _quad_form(self, z, Q):
         return casadi.mtimes(z, casadi.mtimes(Q, z.T))  # z.T @ Q @ z
@@ -276,27 +370,38 @@ class KinematicMPCCasadiOpti(object):
         cost = 0
         # tracking cost
         for i in range(self.horizon):
-            cost += self._quad_form(self.z_dv[i + 1, :] - self.z_ref[i, :], self.Q)
-            # cost += self._quad_form(self.z_dv[i + 1, 0:3] - self.z_ref[i, 0:3], self.Q[0:3, 0:3])
-            # cost += self._quad_form(casadi.fmod(self.z_dv[i + 1, 3] - self.z_ref[i, 3] + np.pi, 2 * np.pi) - np.pi,
-            #                         self.Q[3, 3])
+            if self.normalize_yaw_error:
+                cost += self._quad_form(self.z_dv[i + 1, 0:3] - self.z_ref[i, 0:3], self.Q[0:3, 0:3])
+                cost += self._quad_form(casadi.fmod(self.z_dv[i + 1, 3] - self.z_ref[i, 3] + np.pi, 2 * np.pi) - np.pi,
+                                        self.Q[3, 3])  # normalizes the angle in the range [-pi, pi)
+            else:
+                cost += self._quad_form(self.z_dv[i + 1, :] - self.z_ref[i, :], self.Q)
 
         # input cost.
         for i in range(self.horizon - 1):
             cost += self._quad_form(self.u_dv[i, :], self.R)
 
-        # input derivative cost
+        # input derivative cost.
+        self.u_rate_dv[0, :] = (self.u_dv[0, :] - self.previous_input.T)  # / self.Ts
         for i in range(self.horizon - 1):
-            cost += self._quad_form(self.u_dv[i + 1, :] - self.u_dv[i, :], self.Rd)
+            self.u_rate_dv[i + 1, :] = (self.u_dv[i + 1, :] - self.u_dv[i, :])  # / self.Ts
+            cost += self._quad_form(self.u_rate_dv[i + 1, :], self.Rd)
 
-        cost += (casadi.sum1(self.sl_delta_dv) + casadi.sum1(self.sl_acc_dv))  # slack cost
+        if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
+            if self.slack_objective_is_quadratic:
+                cost += self.P_u_rate[0, 0] * casadi.sum1(self.sl_acc_dv ** 2) + self.P_u_rate[1, 1] * casadi.sum1(self.sl_delta_dv ** 2)  # slack cost
+            else:
+                slack_weights = casadi.diag(self.P_u_rate)  # to convert to a column vector
+                cost += slack_weights[0] * casadi.sum1(self.sl_acc_dv) + slack_weights[1] * casadi.sum1(self.sl_delta_dv)  # slack cost
 
         cost += self._quad_form(self.z_dv[self.horizon, :] - self.z_ref[self.horizon - 1, :], self.Qf)  # terminal state
 
-        # cost *= 0.5
+        cost *= 0.5
         return cost
 
     def setup_solver(self, cost, solver_options=None, solver='ipopt', suppress_output=False):
+        # to setup warmstarting and codegen (https://github.com/casadi/casadi/discussions/3434#discussioncomment-7404877)
+
         self.mpc.minimize(cost)
         # Ipopt with custom options: https://web.casadi.org/docs/ -> see sec 9.1 on Opti stack.
         if solver_options is None:
@@ -313,12 +418,25 @@ class KinematicMPCCasadiOpti(object):
                     'ipopt.acceptable_obj_change_tol': 1e-6,
                 }
                 solver_options.update(ipopt_options)
+
+            # todo: test
+            elif solver == 'osqp':
+                osqp_options = {
+                    'verbose': not suppress_output,
+                    'max_iter': 2000,
+                    'eps_pr': 1e-8,
+                    'eps_r': 1e-8,
+                    'warm_start_dual': True,
+                    'warm_start_primal': True
+                }
+                solver_options.update(osqp_options)
         solver_options.update(
                 {
                     'print_time': not suppress_output,
                     'verbose': not suppress_output,
                     'expand': True,
                     # 'max_cpu_time': 0.1,
+                    # 'max_iter': 1000,
                     'record_time': True
                 }
         )
@@ -337,6 +455,10 @@ class KinematicMPCCasadiOpti(object):
     def update_previous_input(self, acc_prev, delta_prev):
         self.mpc.set_value(self.previous_input, [acc_prev, delta_prev])
 
+    def update_u_rate(self, u_prev_value, u_dv_value):
+        # not required since the Opti stack keeps track of the variable.
+        return
+
     def update(self, state=None, ref_traj=None, previous_input=None, warmstart_variables=None):
         self.update_initial_condition(*state)
         self.update_reference(*ref_traj)
@@ -344,10 +466,13 @@ class KinematicMPCCasadiOpti(object):
 
         if self.warmstart and len(warmstart_variables) > 0:
             # Warm Start used if provided.  Else I believe the problem is solved from scratch with initial values of 0.
-            # self.mpc.set_initial(self.solution.value_variables())
+            # Format: self.mpc.set_initial(self.solution.value_variables())
             self.mpc.set_initial(self.z_dv, warmstart_variables['z_ws'])
             self.mpc.set_initial(self.u_dv, warmstart_variables['u_ws'])
-            self.mpc.set_initial(self.sl_dv, warmstart_variables['sl_ws'])
+            if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
+                self.mpc.set_initial(self.sl_dv, warmstart_variables['sl_ws'])
+
+            self.mpc.set_initial(self.mpc.lam_g, warmstart_variables['lam_g'])
 
     def solve(self, debug=True):
         """
@@ -356,14 +481,37 @@ class KinematicMPCCasadiOpti(object):
         """
         st = time.process_time()
 
+        sl_mpc = np.zeros((self.horizon, self.nu)) # or return None
         try:
-            sol = self.solver()
+            sol = self.solver()  # todo: make this an attribute
+
+            # warmstarting
+            self.mpc.set_value(sol.value_parameters())
+
             # Optimal solution.
             u_mpc = sol.value(self.u_dv)
             z_mpc = sol.value(self.z_dv)
-            sl_mpc = sol.value(self.sl_dv)
+            if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
+                sl_mpc = sol.value(self.sl_dv)
             z_ref = sol.value(self.z_ref)
+            u_prev = sol.value(self.previous_input)
             iteration_count = sol.stats()["iter_count"]
+
+            cost = sol.value(self.mpc.f)
+            g = sol.value(self.mpc.g)
+            lam_g = sol.value(self.mpc.lam_g)
+            lam_x = None  # sol.value(self.mpc.lam_x)
+            lam_p = None  # sol.value(self.mpc.lam_p)
+
+            self.lbg = sol.value(self.mpc.lbg)
+            self.ubg = sol.value(self.mpc.ubg)
+            u_rate = sol.value(self.u_rate_dv)
+            # jerk = sol.value(self.jerk_dv)
+            # delta_rate = sol.value(self.delta_rate_dv)
+            # u_rate_alt = np.array([jerk, delta_rate]).T  # same as u_rate above
+
+            # for index in range(g.size):
+            #     print(f"{self.lbg[index]} <= {g[index]} <= {self.ubg[index]}")
 
             return_state = sol.stats()["return_status"]
             success = sol.stats()["success"]
@@ -387,27 +535,44 @@ class KinematicMPCCasadiOpti(object):
             t_wall_total = sol.stats()["t_wall_total"]
             # print(sol.stats())  # todo:
             is_opt = True
+
+            # # get functions used by the solver.
+            # # Could be useful when replacing default functions.
+            # # See (https://github.com/casadi/casadi/wiki/FAQ:-How-to-specify-a-custom-Hessian-approximation%3F | https://groups.google.com/g/casadi-users/c/XnDBUWrPTlQ)
+            # hess_l = self.mpc.debug.casadi_solver.get_function('nlp_hess_l')
         except Exception as e:
             # Suboptimal solution (e.g. timed out).
             u_mpc = self.mpc.debug.value(self.u_dv)
             z_mpc = self.mpc.debug.value(self.z_dv)
-            sl_mpc = self.mpc.debug.value(self.sl_dv)
+            if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
+                sl_mpc = self.mpc.debug.value(self.sl_dv)
             z_ref = self.mpc.debug.value(self.z_ref)
+            u_rate = self.mpc.debug.value(self.u_rate_dv)
+            u_prev = self.mpc.debug.value(self.previous_input)
             iteration_count = None
             is_opt = False
             success = False
+            lam_g = self.mpc.debug.value(self.mpc.lam_g)
+            lam_x = None  # sol.value(self.mpc.lam_x)
+            lam_p = None  # sol.value(self.mpc.lam_p)
 
         solve_time = time.process_time() - st
 
         sol_dict = {'u_control': u_mpc[0, :],
                     'u_mpc': u_mpc,
                     'z_mpc': z_mpc,
+                    'u_rate': u_rate,
+                    'u_prev': u_prev,
                     'sl_mpc': sl_mpc,
                     'z_ref': z_ref,
                     'optimal': is_opt,
                     'solve_time': solve_time,
                     'iter_count': iteration_count,
-                    'solver_status': success
+                    'solver_status': success,
+                    'lam_x': lam_x,
+                    'lam_g': lam_g,
+                    'lam_p': lam_p,
+                    'solver_stats': sol.stats(),
                     }
         return sol_dict
 
@@ -423,6 +588,7 @@ class KinematicMPCCasadiOpti(object):
         if z0 is None:
             self.z_dv_value = np.zeros((self.nx, self.horizon + 1))
         self.u_dv_value = np.zeros((self.nu, self.horizon))
+        self.u_rate_dv_value = np.zeros((self.nu, self.horizon))
         self.solve()
 
     def run(self, z0, u0, zref, zk, u_prev):

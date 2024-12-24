@@ -230,6 +230,9 @@ def normalize_angle_from_minus_pi_to_pi(angle, pi_is_negative=True):
     """
     if pi_is_negative:
         # normalize from [-pi, pi), 180 -> -180
+        # todo: investigate using the below formulation since using fmod can introduce discontinuities
+        # normalized_angle = np.arctan2(np.sin(angle), np.cos(angle))
+
         # method 1
         normalized_angle = (angle + np.pi) % (2 * np.pi) - np.pi  # normalizes to [-pi, pi)
 

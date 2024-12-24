@@ -1,10 +1,7 @@
 """
 Todo:
-    * setup casadi [done]
-    * setup casadi-opti [done]
     * fix goal point not updating (and lagging behind) xref
-    * verify casadi unpacking when not using opti
-    * setup qp solver with osqp/qpoases
+    * add subscribing to Ackermann message for current input
 """
 import math
 import time
@@ -36,7 +33,7 @@ import tf_transformations
 import tf2_geometry_msgs
 
 # messages
-from rcl_interfaces.msg import ParameterDescriptor
+from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult, ParameterType
 from visualization_msgs.msg import Marker, MarkerArray
 from std_msgs.msg import Float32, Float64, Float32MultiArray, MultiArrayDimension
 from geometry_msgs.msg import Point, Pose, PoseStamped, PoseArray, Quaternion, PolygonStamped, Polygon, Point32, \
@@ -51,6 +48,7 @@ import trajectory_following_ros2.utils.trajectory_utils as trajectory_utils
 
 from trajectory_following_ros2.casadi.kinematic_mpc_casadi_opti import KinematicMPCCasadiOpti
 from trajectory_following_ros2.casadi.kinematic_mpc_casadi import KinematicMPCCasadi
+from trajectory_following_ros2.casadi.discrete_kinematic_mpc_casadi import DiscreteKinematicMPCCasadi
 
 
 class KinematicCoupledCasadi(Node):
@@ -94,7 +92,7 @@ class KinematicCoupledCasadi(Node):
                                                                'Since Carla does not use the odom frame, '
                                                                'set to "map", '
                                                                'otherwise use "odom".'))  # global frame: odom, map
-        self.declare_parameter('ode_type', "continuous_kinematic_coupled")  # todo: also augmented, etc
+        self.declare_parameter('ode_type', "discrete_kinematic_coupled")  # or continuous_kinematic_coupled todo: also augmented, etc
         self.declare_parameter('use_opti', False)
         self.declare_parameter('control_rate', 20.0)
         self.declare_parameter('debug_frequency', 4.0)
@@ -106,7 +104,10 @@ class KinematicCoupledCasadi(Node):
                                        description='The minimum lateral command (steering) to apply.'))  # in degrees
         self.declare_parameter('max_steer', 27.0)  # in degrees
 
+        np.set_printoptions(suppress=True)
         # MPC Parameters
+        self.declare_parameter('min_jerk', -1.5)  # in m/s^3
+        self.declare_parameter('max_jerk', 1.5)  # in m/s^3
         self.declare_parameter('max_steer_rate', 60 / 0.17)  # in degrees
         self.declare_parameter('max_speed', 1.5)  # in m/s
         self.declare_parameter('min_speed', -1.5)  # in m/s
@@ -120,16 +121,44 @@ class KinematicCoupledCasadi(Node):
         self.declare_parameter('n_inputs', 2)  # todo: remove and get from import model
         self.declare_parameter('horizon', 25)
         self.declare_parameter('prediction_time', 0.0)
-        self.declare_parameter('max_iter', 15)  # it usually doesnt take more than 15 iterations
+        self.declare_parameter('max_iter', 15)
         self.declare_parameter('termination_condition',
                                1e-6)  # iteration finish param. todo: pass to mpc initializer solver options
+        self.declare_parameter('normalize_yaw_error', True)  # normalizes the angle in the range [-pi, pi)
+        self.declare_parameter('solver_type', 'quad')  # nlp, quad
+        self.declare_parameter('solver', 'qrqp')  # nlp: [fatrop, ipopt, ma57], quad: [qrqp, osqp, qpoases, ipopt, hpipm for casadi >= 3.6.7]
 
         # tips for tuning weights (https://www.mathworks.com/help/mpc/ug/tuning-weights.html)
-        self.declare_parameter('R', [0.01, 0.01])
-        self.declare_parameter('Rd', [10., 100.])
-        self.declare_parameter('Q', [1.0, 1.0, 1.0, 0.01])
-        self.declare_parameter('Qf', [0.04, 0.04, 0.1, 0.01])
-        self.declare_parameter('scale_cost', False)
+        self.declare_parameter('R', [0.1, 0.1], descriptor=ParameterDescriptor(
+                description='',
+                type=ParameterType.PARAMETER_DOUBLE_ARRAY))  # [0.1, 0.1], 0.01, 0.01
+        self.declare_parameter('Rd', [10.0, 100.0], descriptor=ParameterDescriptor(
+                description='',
+                type=ParameterType.PARAMETER_DOUBLE_ARRAY))  # [10.0, 100.0]
+        self.declare_parameter('Q', [1.0, 1.0, 10.0, 10.0], descriptor=ParameterDescriptor(
+                description='',
+                type=ParameterType.PARAMETER_DOUBLE_ARRAY))  # 1.0, 1.0, 1.0, 0.01, [1.0, 1.0, 100.0, 0.0001]
+        self.declare_parameter('Qf', [0.04, 0.04, 0.1, 1.0], descriptor=ParameterDescriptor(
+                description='',
+                type=ParameterType.PARAMETER_DOUBLE_ARRAY))  # 0.04, 0.04, 0.1, 0.01, [1.0, 1.0, 100.0, 0.0001],
+        self.declare_parameter('slack_weights_input_rate', [0.0, 0.0], descriptor=ParameterDescriptor(
+                description='The weights for the input rate slack terms in the cost function. '
+                            'Setting to zero will disable the slack terms. '
+                            'Recommendations: (i) set to low values for soft constraints, e.g 1e-6. (ii) Set to high values for hard constraints, e.g 100.'
+                            'Default: [0.0] * self.nx.',
+                type=ParameterType.PARAMETER_DOUBLE_ARRAY))
+        self.declare_parameter('slack_scale_input_rate', [1.0, 1.0], descriptor=ParameterDescriptor(
+                description='The scaling factor for the input rate slack terms in the constraints when '
+                            'subtracting/adding to the slack to the input rate. Default: [1.0] * self.nu.',
+                type=ParameterType.PARAMETER_DOUBLE_ARRAY))
+        self.declare_parameter('slack_upper_bound_input_rate', [np.inf, np.inf], descriptor=ParameterDescriptor(
+                description='The positive slack upper bound for the input rate slack terms in the constraints. '
+                            'Set to negative values for infinity. Default: [np.inf] * self.nu.',
+                type=ParameterType.PARAMETER_DOUBLE_ARRAY))
+        self.declare_parameter('slack_objective_is_quadratic', False, descriptor=ParameterDescriptor(
+                description='Whether to use quadratic objective (True) or linear objective (False) '
+                            'for the input rate slack terms in the cost function. Default: False.',
+                type=ParameterType.PARAMETER_BOOL))
 
         self.declare_parameter('path_topic', '/trajectory/path')  # todo: replace with custom message or action
         self.declare_parameter('speed_topic', '/trajectory/speed')  # todo: replace with custom message or action
@@ -162,6 +191,8 @@ class KinematicCoupledCasadi(Node):
         self.WHEELBASE = self.get_parameter('wheelbase').value  # [m] wheelbase of the vehicle
         self.MAX_STEER_ANGLE = math.radians(self.get_parameter('max_steer').value)
         self.MIN_STEER_ANGLE = math.radians(self.get_parameter('min_steer').value)
+        self.MIN_JERK = self.get_parameter('min_jerk').value
+        self.MAX_JERK = self.get_parameter('max_jerk').value
         self.MAX_STEER_RATE = math.radians(self.get_parameter('max_steer_rate').value)
         self.MAX_SPEED = self.get_parameter('max_speed').value
         self.MIN_SPEED = self.get_parameter('min_speed').value
@@ -175,20 +206,26 @@ class KinematicCoupledCasadi(Node):
 
         self.NX = self.get_parameter('n_states').value
         self.NU = self.get_parameter('n_inputs').value
-        self.R = np.diag(self.get_parameter('R').value)
-        self.Rd = np.diag(self.get_parameter('Rd').value)
-        self.Q = np.diag(self.get_parameter('Q').value)
-        self.Qf = self.get_parameter('Qf').value
+        self.R = np.diag(self.get_parameter('R').get_parameter_value().double_array_value)
+        self.Rd = np.diag(self.get_parameter('Rd').get_parameter_value().double_array_value)
+        self.Q = np.diag(self.get_parameter('Q').get_parameter_value().double_array_value)
+        self.Qf = self.get_parameter('Qf').get_parameter_value().double_array_value
         if self.Qf is not None:
-            self.Qf = np.diag(self.get_parameter('Qf').value)
+            self.Qf = np.diag(self.get_parameter('Qf').get_parameter_value().double_array_value)
         else:
             self.Qf = self.Q
-        self.scale_cost = self.get_parameter('scale_cost').value
+        self.slack_weights_input_rate = self.get_parameter('slack_weights_input_rate').get_parameter_value().double_array_value
+        self.slack_scale_input_rate = self.get_parameter('slack_scale_input_rate').get_parameter_value().double_array_value
+        self.slack_upper_bound_input_rate = self.get_parameter('slack_upper_bound_input_rate').get_parameter_value().double_array_value
+        self.slack_objective_is_quadratic = self.get_parameter('slack_objective_is_quadratic').value
         self.horizon = int(self.get_parameter('horizon').value)
         self.prediction_time = self.get_parameter('prediction_time').value
 
         self.max_iter = int(self.get_parameter('max_iter').value)
         self.termination_condition = self.get_parameter('termination_condition').value
+        self.normalize_yaw_error = self.get_parameter('normalize_yaw_error').value
+        self.solver_type = self.get_parameter('solver_type').value
+        self.solver = self.get_parameter('solver').value
 
         # initialize variables
         self.ode_type = self.get_parameter('ode_type').value
@@ -206,6 +243,11 @@ class KinematicCoupledCasadi(Node):
         self.smooth_yaw = self.get_parameter('smooth_yaw').value
         self.debug = self.get_parameter('debug').value
 
+        # Setup dynamic parameter reconfiguring.
+        # Register a callback function that will be called whenever there is an attempt to
+        # change one or more parameters of the node.
+        self.add_on_set_parameters_callback(self.parameter_change_callback)
+
         self.model_type = 'continuous' if 'continuous' in self.ode_type else 'discrete'
 
         self.dt = self.sample_time = 1 / self.control_rate  # [s] sample time. # todo: get from ros Duration
@@ -219,6 +261,7 @@ class KinematicCoupledCasadi(Node):
                                      )
 
         self.acc_cmd, self.delta_cmd, self.velocity_cmd = 0.0, 0.0, 0.0
+        self.jerk_cmd, self.delta_rate_cmd = None, None
         self.zk = np.zeros((self.NX, 1))  # x, y, psi, velocity, psi
         self.uk = np.array([[self.acc_cmd, self.delta_cmd]]).T
         self.u_prev = np.zeros((self.NU, 1))
@@ -284,6 +327,7 @@ class KinematicCoupledCasadi(Node):
         self.model = None
         self.controller = None
         self.ocp = None
+        self.previous_time = None
 
         # Setup queues for multi-thread access
         self.mutex = threading.Lock()  # or threading.RLock()
@@ -469,34 +513,77 @@ class KinematicCoupledCasadi(Node):
                                                                   np.degrees(self.MAX_STEER_ANGLE)),
                                                      acc_bound=(self.MAX_DECEL,
                                                                 self.MAX_ACCEL),
-                                                     jerk_bound=(-1.5, 1.5),
+                                                     jerk_bound=(self.MIN_JERK, self.MAX_JERK),
                                                      delta_rate_bound=(
                                                          -np.degrees(self.MAX_STEER_RATE),
                                                          np.degrees(self.MAX_STEER_RATE)),
-                                                     suppress_ipopt_output=True)
+                                                     solver_type=self.solver_type, solver=self.solver,
+                                                     suppress_ipopt_output=True,
+                                                     normalize_yaw_error=self.normalize_yaw_error,
+                                                     slack_weights_u_rate=self.slack_weights_input_rate,
+                                                     slack_scale_u_rate=self.slack_scale_input_rate,
+                                                     slack_upper_bound_u_rate=self.slack_upper_bound_input_rate,
+                                                     slack_objective_is_quadratic=self.slack_objective_is_quadratic)
         else:
-            self.controller = KinematicMPCCasadi(horizon=self.horizon,
-                                                 sample_time=self.sample_time,
-                                                 wheelbase=self.WHEELBASE,
-                                                 nx=self.NX, nu=self.NU,
-                                                 x0=self.zk, u0=self.uk,
-                                                 Q=self.Q.diagonal(),
-                                                 R=self.R.diagonal(),
-                                                 Qf=self.Qf.diagonal(),
-                                                 Rd=self.Rd.diagonal(),
-                                                 vel_bound=(self.MIN_SPEED,
-                                                            self.MAX_SPEED),
-                                                 delta_bound=(np.degrees(self.MIN_STEER_ANGLE),
-                                                              np.degrees(self.MAX_STEER_ANGLE)),
-                                                 acc_bound=(self.MAX_DECEL,
-                                                            self.MAX_ACCEL),
-                                                 jerk_bound=(-1.5, 1.5),
-                                                 delta_rate_bound=(
-                                                     -np.degrees(self.MAX_STEER_RATE),
-                                                     np.degrees(self.MAX_STEER_RATE)),
-                                                 symbol_type='SX', warmstart=True,
-                                                 solver_type='nlp', solver='ipopt', # todo: add as parameters
-                                                 suppress_ipopt_output=True)
+            if self.model_type == 'continuous':
+                self.controller = KinematicMPCCasadi(horizon=self.horizon,
+                                                     sample_time=self.sample_time,
+                                                     wheelbase=self.WHEELBASE,
+                                                     nx=self.NX, nu=self.NU,
+                                                     x0=self.zk, u0=self.uk,
+                                                     Q=self.Q.diagonal(),
+                                                     R=self.R.diagonal(),
+                                                     Qf=self.Qf.diagonal(),
+                                                     Rd=self.Rd.diagonal(),
+                                                     vel_bound=(self.MIN_SPEED,
+                                                                self.MAX_SPEED),
+                                                     delta_bound=(np.degrees(self.MIN_STEER_ANGLE),
+                                                                  np.degrees(self.MAX_STEER_ANGLE)),
+                                                     acc_bound=(self.MAX_DECEL,
+                                                                self.MAX_ACCEL),
+                                                     jerk_bound=(self.MIN_JERK, self.MAX_JERK),
+                                                     delta_rate_bound=(
+                                                         -np.degrees(self.MAX_STEER_RATE),
+                                                         np.degrees(self.MAX_STEER_RATE)),
+                                                     symbol_type='MX', warmstart=True,
+                                                     solver_type=self.solver_type, solver=self.solver,
+                                                     suppress_ipopt_output=True,
+                                                     normalize_yaw_error=self.normalize_yaw_error,
+                                                     slack_weights_u_rate=self.slack_weights_input_rate,
+                                                     slack_scale_u_rate=self.slack_scale_input_rate,
+                                                     slack_upper_bound_u_rate=self.slack_upper_bound_input_rate,
+                                                     slack_objective_is_quadratic=self.slack_objective_is_quadratic)
+            elif self.model_type == 'discrete':
+                self.controller = DiscreteKinematicMPCCasadi(horizon=self.horizon,
+                                                     sample_time=self.sample_time,
+                                                     wheelbase=self.WHEELBASE,
+                                                     nx=self.NX, nu=self.NU,
+                                                     x0=self.zk, u0=self.uk,
+                                                     Q=self.Q.diagonal(),
+                                                     R=self.R.diagonal(),
+                                                     Qf=self.Qf.diagonal(),
+                                                     Rd=self.Rd.diagonal(),
+                                                     vel_bound=(self.MIN_SPEED,
+                                                                self.MAX_SPEED),
+                                                     delta_bound=(np.degrees(self.MIN_STEER_ANGLE),
+                                                                  np.degrees(self.MAX_STEER_ANGLE)),
+                                                     acc_bound=(self.MAX_DECEL,
+                                                                self.MAX_ACCEL),
+                                                     jerk_bound=(self.MIN_JERK, self.MAX_JERK),
+                                                     delta_rate_bound=(
+                                                         -np.degrees(self.MAX_STEER_RATE),
+                                                         np.degrees(self.MAX_STEER_RATE)),
+                                                     symbol_type='MX', warmstart=True,
+                                                     solver_type=self.solver_type, solver=self.solver,
+                                                     suppress_ipopt_output=True,
+                                                     normalize_yaw_error=self.normalize_yaw_error,
+                                                     slack_weights_u_rate=self.slack_weights_input_rate,
+                                                     slack_scale_u_rate=self.slack_scale_input_rate,
+                                                     slack_upper_bound_u_rate=self.slack_upper_bound_input_rate,
+                                                     slack_objective_is_quadratic=self.slack_objective_is_quadratic)
+            else:
+                raise ValueError(f"Unknown model type: {self.model_type}")
+
         self.mpc_built = True
         self.get_logger().info("Finished setting up the MPC.")
 
@@ -699,12 +786,20 @@ class KinematicCoupledCasadi(Node):
                                                  warmstart_variables=self.warmstart_variables)
 
                 start_time = time.process_time()
+                start_time_ = self.get_clock().now()
                 solution_dict = self.controller.solve()
                 dt = time.process_time() - start_time
+                dt_ = -1
+                if self.previous_time is not None:
+                    dt_ = abs((start_time_ - self.previous_time).nanoseconds / 1e9)
+
+                self.previous_time = start_time_
 
                 # unpack mpc predicted states
                 self.warmstart_variables['z_ws'] = solution_dict['z_mpc']
                 self.warmstart_variables['u_ws'] = solution_dict['u_mpc']
+
+                slack = None
 
                 if self.use_opti:
                     predicted_x_state = solution_dict['z_mpc'][:, 0].reshape(-1, 1)
@@ -714,6 +809,15 @@ class KinematicCoupledCasadi(Node):
                     predicted_acc = solution_dict['u_mpc'][:, 0].reshape(-1, 1)
                     predicted_delta = solution_dict['u_mpc'][:, 1].reshape(-1, 1)
 
+                    predicted_jerk = solution_dict['u_rate'][:, 0]
+                    if predicted_jerk is not None:
+                        predicted_jerk = predicted_jerk.reshape(-1, 1)
+                    predicted_delta_rate = solution_dict['u_rate'][:, 1]
+                    if predicted_delta_rate is not None:
+                        predicted_delta_rate = predicted_delta_rate.reshape(-1, 1)
+
+                    predicted_input_rates = np.hstack([predicted_jerk, predicted_delta_rate])
+
                     self.mpc_predicted_states[:, :] = np.hstack([predicted_x_state, predicted_y_state,
                                                                  predicted_vel_state, predicted_psi_state])
                     self.mpc_predicted_inputs[:, :] = np.hstack([predicted_acc, predicted_delta])
@@ -722,6 +826,8 @@ class KinematicCoupledCasadi(Node):
                     y_state_ref = solution_dict['z_ref'][:, 1].reshape(-1, 1)
                     vel_state_ref = solution_dict['z_ref'][:, 2].reshape(-1, 1)
                     psi_state_ref = solution_dict['z_ref'][:, 3].reshape(-1, 1)
+
+                    previous_input = solution_dict['u_prev']  # should be equal to self.u_prev
 
                     # Input rate slack values
                     self.warmstart_variables['sl_ws'] = solution_dict['sl_mpc']
@@ -737,6 +843,14 @@ class KinematicCoupledCasadi(Node):
                     predicted_acc = solution_dict['u_mpc'][0, :].reshape(-1, 1)
                     predicted_delta = solution_dict['u_mpc'][1, :].reshape(-1, 1)
 
+                    predicted_jerk = solution_dict['u_rate'][0, :]
+                    if predicted_jerk is not None:
+                        predicted_jerk = predicted_jerk.reshape(-1, 1)
+                    predicted_delta_rate = solution_dict['u_rate'][1, :]
+                    if predicted_delta_rate is not None:
+                        predicted_delta_rate = predicted_delta_rate.reshape(-1, 1)
+
+                    predicted_input_rates = np.hstack([predicted_jerk, predicted_delta_rate])
                     self.mpc_predicted_states[:, :] = np.hstack([predicted_x_state, predicted_y_state,
                                                                  predicted_vel_state, predicted_psi_state])
                     self.mpc_predicted_inputs[:, :] = np.hstack([predicted_acc, predicted_delta])
@@ -746,15 +860,37 @@ class KinematicCoupledCasadi(Node):
                     vel_state_ref = solution_dict['z_ref'][:, 2].reshape(-1, 1)
                     psi_state_ref = solution_dict['z_ref'][:, 3].reshape(-1, 1)
 
-                    # # Input rate slack values (not implemented)
-                    # self.warmstart_variables['sl_ws'] = solution_dict['sl_mpc']
-                    # acc_slack = solution_dict['sl_mpc'][0, :].reshape(-1, 1)
-                    # delta_slack = solution_dict['sl_mpc'][1, :].reshape(-1, 1)
+                    previous_input = solution_dict['u_prev'].tolist()  # should be equal to self.u_prev
+                    previous_input[1] = np.degrees(previous_input[1])
+
+                    # Input rate slack values
+                    self.warmstart_variables['sl_ws'] = solution_dict['sl_mpc']
+                    acc_slack = solution_dict['sl_mpc'][0, :].reshape(-1, 1)
+                    delta_slack = solution_dict['sl_mpc'][1, :].reshape(-1, 1)
+
+                # Dual variables
+                self.warmstart_variables['lam_x'] = solution_dict['lam_x']
+                self.warmstart_variables['lam_g'] = solution_dict['lam_g']
+                self.warmstart_variables['lam_p'] = solution_dict['lam_p']
+
+                # solver stats
+                solver_stats = solution_dict['solver_stats']
 
                 self.acc_cmd = solution_dict['u_control'][0]
                 self.delta_cmd = solution_dict['u_control'][1]
-                # self.velocity_cmd = predicted_vel_state[1, 0]  # float(predicted_vel_state[1])
-                self.velocity_cmd = vel + self.acc_cmd * self.sample_time
+                self.velocity_cmd = predicted_vel_state[1, 0]  # float(predicted_vel_state[1])
+                # self.velocity_cmd = vel + self.acc_cmd * self.sample_time
+                self.uk[0, 0] = self.acc_cmd
+                self.uk[1, 0] = self.delta_cmd
+
+                self.jerk_cmd = solution_dict.get('u_rate', None)[0, 0]
+                self.delta_rate_cmd = solution_dict.get('u_rate', None)[1, 0]
+
+                slack = [acc_slack[0], np.degrees(delta_slack[0])]
+
+                if self.saturate_input:
+                    self.input_saturation()
+
                 solve_time = solution_dict['solve_time']
 
                 self.publish_command()
@@ -778,6 +914,12 @@ class KinematicCoupledCasadi(Node):
                 self.solver_iteration_count = solution_dict['iter_count']
                 self.solution_status = solution_dict['solver_status']
                 # todo: publish solver stats
+
+                # print every second
+                if self.run_count % self.control_rate == 0:
+                    self.get_logger().info(f"Accel command: {self.acc_cmd}, Jerk command: {self.jerk_cmd}, delta_rate_cmd: {np.degrees(self.delta_rate_cmd)}, delta_cmd: {np.degrees(self.delta_cmd)}, prev_input: {previous_input}, run_count: {self.run_count}, slack: {slack} Status: {self.solution_status}\n")
+                if dt > 0 and solve_time > 0 and dt_ > 0:
+                    self.get_logger().info(f"Python time: {1 / dt}, casadi solve time: {1 / solve_time}, ros time: {1 / dt_}, solve status: {self.solution_status}")
 
                 self.run_count += 1
 
@@ -818,9 +960,27 @@ class KinematicCoupledCasadi(Node):
     def input_saturation(self):
         # saturate inputs
         if self.saturate_input:
+            if not(self.MAX_DECEL <= self.acc_cmd <= self.MAX_ACCEL):
+                self.get_logger().info(f"Accel command of {self.acc_cmd} is out of bounds. Saturating..")
             self.acc_cmd = np.clip(self.acc_cmd, self.MAX_DECEL, self.MAX_ACCEL)
+
+            if not(self.MIN_STEER_ANGLE <= self.delta_cmd <= self.MAX_STEER_ANGLE):
+                self.get_logger().info(f"Steer command of {self.delta_cmd} is out of bounds. Saturating..")
             self.delta_cmd = np.clip(self.delta_cmd, self.MIN_STEER_ANGLE, self.MAX_STEER_ANGLE)
+
+            if not(self.MIN_SPEED <= self.velocity_cmd <= self.MAX_SPEED):
+                self.get_logger().info(f"Velocity command of {self.velocity_cmd} is out of bounds. Saturating..")
             self.velocity_cmd = np.clip(self.velocity_cmd, self.MIN_SPEED, self.MAX_SPEED)
+
+            if self.jerk_cmd:
+                if not(self.MIN_JERK <= self.jerk_cmd <= self.MAX_JERK):
+                    self.get_logger().info(f"Jerk command of {self.jerk_cmd} is out of bounds. Saturating..")
+                self.jerk_cmd = np.clip(self.jerk_cmd, self.MIN_JERK, self.MAX_JERK)
+
+            if self.delta_rate_cmd:
+                if not(-self.MAX_STEER_RATE <= self.delta_rate_cmd <= self.MAX_STEER_RATE):
+                    self.get_logger().info(f"Steer rate command of {self.delta_rate_cmd} is out of bounds. Saturating..")
+                self.delta_rate_cmd = np.clip(self.delta_rate_cmd, -self.MAX_STEER_RATE, self.MAX_STEER_RATE)
 
     def publish_command(self):
         # filter inputs using a low-pass (or butterworth) filter. Todo
@@ -830,10 +990,12 @@ class KinematicCoupledCasadi(Node):
         ackermann_cmd.header.stamp = self.get_clock().now().to_msg()
         ackermann_cmd.header.frame_id = self.robot_frame  # self.frame_id
         ackermann_cmd.drive.steering_angle = self.delta_cmd
-        # ackermann_cmd.drive.steering_angle_velocity = 0.0
+        if self.delta_rate_cmd:
+            ackermann_cmd.drive.steering_angle_velocity = self.delta_rate_cmd
         ackermann_cmd.drive.speed = self.velocity_cmd
         ackermann_cmd.drive.acceleration = self.acc_cmd
-        # ackermann_cmd.drive.jerk = 0.0
+        if self.jerk_cmd:
+            ackermann_cmd.drive.jerk = self.jerk_cmd
         self.ackermann_cmd_pub.publish(ackermann_cmd)
 
         steer_msg = Float32()
@@ -956,6 +1118,99 @@ class KinematicCoupledCasadi(Node):
                 path_msg.poses.append(predicted_pose)
             self.mpc_path_pub.publish(path_msg)
 
+    def parameter_change_callback(self, params):
+        """
+        Triggered whenever there is a change request for one or more parameters.
+
+        Args:
+            params (List[Parameter]): A list of Parameter objects representing the parameters that are
+                being attempted to change.
+
+        Returns:
+            SetParametersResult: Object indicating whether the change was successful.
+        """
+        result = SetParametersResult()
+        result.successful = True
+
+        # Iterate over each parameter in this node
+        for param in params:
+            # Check the parameter's name and type
+            '''
+            robot_frame: str, global_frame: str, ode_type: str, distance_tolerance: float, speed_tolerance: float, wheelbase: float, min_steer: float, max_steer: float, max_steer_rate: float, max_speed, min_speed, max_accel, max_decel, horizon: int, R: list, Rd, Q, Qf, desired_speed: float
+            Todo: 
+                1. update the MPC parameters without rebuilding
+            '''
+            if param.name == "robot_frame" and param.type_ == Parameter.Type.STRING:
+                self.robot_frame = param.value
+            elif param.name == "global_frame" and param.type_ == Parameter.Type.STRING:
+                self.global_frame = param.value
+            elif param.name == "ode_type" and param.type_ == Parameter.Type.STRING:
+                self.ode_type = param.value
+                self.model_type = 'continuous' if 'continuous' in self.ode_type else 'discrete'
+            elif param.name == "distance_tolerance" and param.type_ == Parameter.Type.DOUBLE:
+                self.distance_tolerance = param.value
+            elif param.name == "speed_tolerance" and param.type_ == Parameter.Type.DOUBLE:
+                self.speed_tolerance = param.value
+            elif param.name == "wheelbase" and param.type_ == Parameter.Type.DOUBLE:
+                self.WHEELBASE = param.value
+            elif param.name == "min_steer" and param.type_ == Parameter.Type.DOUBLE:
+                self.MIN_STEER_ANGLE = param.value
+            elif param.name == "max_steer" and param.type_ == Parameter.Type.DOUBLE:
+                self.MAX_STEER_ANGLE = param.value
+            elif param.name == "min_jerk" and param.type_ == Parameter.Type.DOUBLE:
+                self.MIN_JERK = param.value
+            elif param.name == "max_jerk" and param.type_ == Parameter.Type.DOUBLE:
+                self.MAX_JERK = param.value
+            elif param.name == "max_steer_rate" and param.type_ == Parameter.Type.DOUBLE:
+                self.MAX_STEER_RATE = param.value
+            elif param.name == "max_speed" and param.type_ == Parameter.Type.DOUBLE:
+                self.MAX_SPEED = param.value
+            elif param.name == "min_speed" and param.type_ == Parameter.Type.DOUBLE:
+                self.MIN_SPEED = param.value
+            elif param.name == "max_accel" and param.type_ == Parameter.Type.DOUBLE:
+                self.MAX_ACCEL = param.value
+            elif param.name == "max_decel" and param.type_ == Parameter.Type.DOUBLE:
+                self.MAX_DECEL = param.value
+            elif param.name == "horizon" and param.type_ == Parameter.Type.INTEGER:
+                self.horizon = param.value
+            elif param.name == "R" and param.type_ == Parameter.Type.DOUBLE_ARRAY:
+                self.R = np.diag(param.value)
+                self.setup_mpc_model()
+                self.initialize_mpc_solver()
+            elif param.name == "Rd" and param.type_ == Parameter.Type.DOUBLE_ARRAY:
+                self.Rd = np.diag(param.value)
+                self.setup_mpc_model()
+                self.initialize_mpc_solver()
+            elif param.name == "Q":
+                self.Q = np.diag(param.value)
+                self.setup_mpc_model()
+                self.initialize_mpc_solver()
+            elif param.name == "Qf":
+                self.Qf = np.diag(param.value)
+                self.setup_mpc_model()
+                self.initialize_mpc_solver()
+            elif param.name == "desired_speed" and param.type_ == Parameter.Type.DOUBLE:
+                self.desired_speed = param.value
+            elif param.name == "slack_weights_input_rate" and param.type_ == Parameter.Type.DOUBLE_ARRAY:
+                self.slack_weights_input_rate = param.value
+                self.setup_mpc_model()
+                self.initialize_mpc_solver()
+            elif param.name == "slack_scale_input_rate" and param.type_ == Parameter.Type.DOUBLE_ARRAY:
+                self.slack_scale_input_rate = param.value
+                self.setup_mpc_model()
+                self.initialize_mpc_solver()
+            elif param.name == "slack_upper_bound_input_rate" and param.type_ == Parameter.Type.DOUBLE_ARRAY:
+                self.slack_upper_bound_input_rate = param.value
+                self.setup_mpc_model()
+                self.initialize_mpc_solver()
+            elif param.name == "slack_objective_is_quadratic" and param.type_ == Parameter.Type.BOOL:
+                self.slack_objective_is_quadratic = param.value
+                self.setup_mpc_model()
+                self.initialize_mpc_solver()
+            else:
+                result.successful = False
+            self.get_logger().info(f"Success = {result.successful} for param {param.name} to value {param.value}")
+        return result
 
 
 def main(args=None):

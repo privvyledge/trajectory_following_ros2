@@ -4,6 +4,9 @@ See:
         * https://web.casadi.org/docs/#for-loop-equivalents
         * https://github.com/nirajbasnet/Nonlinear_MPCC_for_autonomous_racing/blob/master/nonlinear_mpc_casadi/scripts/Nonlinear_MPC.py#L157
 
+Notes:
+    * QP solvers work when slack is added to rate inputs. Fails without slack or RD
+
 Todo:
     * set solver [done]
     * simulate [done]
@@ -33,7 +36,7 @@ import casadi
 from trajectory_following_ros2.casadi.kinematic_bicycle_model import KinematicBicycleModel
 
 
-class KinematicMPCCasadi(object):
+class DiscreteKinematicMPCCasadi(object):
     """docstring for ClassName"""
 
     def __init__(self, vehicle=None, horizon=15, sample_time=0.02, wheelbase=0.256,
@@ -92,7 +95,6 @@ class KinematicMPCCasadi(object):
         else:
             self.symbol_type = casadi.MX
 
-        discrete_model = False
         if vehicle is not None:
             self.vehicle = vehicle
             self.model = self.vehicle.model
@@ -104,28 +106,16 @@ class KinematicMPCCasadi(object):
                                                  vehicle_parameters={"wheelbase": self.wheelbase}, sample_time=self.Ts,
                                                  model_type='kinematic', model_name='vehicle_kinematic_model',
                                                  symbol_type=symbol_type,
-                                                 discretization_method='cvodes', discrete=discrete_model)
+                                                 discretization_method='cvodes', discrete=True)
             self.model = self.vehicle.model
 
         self.ode = self.model.f_expl_expr
-        self.ode = casadi.substitute(self.ode, self.model.params.wheelbase, self.wheelbase)
-        self.ode_linear = self.vehicle.linear_model  # todo: remove ss variables
-        if not discrete_model:
-            self.ode_linear = casadi.substitute(self.ode_linear, casadi.vertcat(self.model.xss, self.model.u0),
-                                                casadi.vertcat(self.model.x, self.model.u))
-        else:
-            self.ode = casadi.substitute(self.ode,
-                                         self.model.params.dt,
-                                         self.Ts)
-            self.ode_linear = casadi.substitute(self.ode,
-                                         self.model.params.dt,
-                                         self.Ts)
+        self.ode = casadi.substitute(self.ode,
+                                     casadi.vertcat(self.model.params.wheelbase, self.model.params.dt),
+                                     casadi.vertcat(self.wheelbase, self.Ts))
         self.ode_function = self.vehicle.create_ode_function(self.ode,
                                                              self.model.x, self.model.u,
-                                                             function_name='nonlinear_ode')
-        self.ode_linear_function = self.vehicle.create_ode_function(self.ode_linear,
-                                                                    self.model.x, self.model.u,
-                                                                    function_name='linear_ode')
+                                                             function_name='discrete_ltv_ode')
         self.u_prev = None  # previous input: [u_{acc, -1}, u_{df, -1}]
         self.z_k = x0  # current state:  [x_0, y_0, psi_0, v_0]
         self.u_prev_value = u0  # previous input: [u_{acc, -1}, u_{df, -1}]
@@ -176,8 +166,10 @@ class KinematicMPCCasadi(object):
                                                                                           delta_rate_bound=delta_rate_bound,
                                                                                           reset=False)
         self.u_rate_func = casadi.Function("u_rate",
-                                           [self.u_prev, self.u_dv], [self.u_rate_dv],  # replace self.u_rate_dv with self.u_rate_dv_value to avoid allow_free
-                                           ['u_prev_k', 'u_k'], ['u_rate_k'])  # , {'allow_free': True} allow_free argument required for MX functions
+                                           [self.u_prev, self.u_dv], [self.u_rate_dv],
+                                           # replace self.u_rate_dv with self.u_rate_dv_value to avoid allow_free
+                                           ['u_prev_k', 'u_k'], [
+                                               'u_rate_k'])  # , {'allow_free': True} allow_free argument required for MX functions
 
         self.objective = self.objective_function_setup()
 
@@ -208,8 +200,8 @@ class KinematicMPCCasadi(object):
             self.opt_params, self.opt_constraints = self.setup_solver(cost=self.objective, constraints=self.constraints,
                                                                       suppress_output=suppress_ipopt_output,
                                                                       solver_options=self.solver_options,
-                                                                      solver=solver,
-                                                                      solver_type=solver_type)
+                                                                      solver_=self.solver_,
+                                                                      solver_type=self.solver_type)
 
         num_tries = 5  # 1, 5, 10. todo: expose as a parameter and separate function
         for _ in range(num_tries):
@@ -246,7 +238,7 @@ class KinematicMPCCasadi(object):
 
     def constraints_setup(
             self, vel_bound=None, delta_bound=None, acc_bound=None,
-            jerk_bound=None, delta_rate_bound=None, reset=False
+            jerk_bound=None, delta_rate_bound=None, degrees=True, reset=False
     ):
         """
         G constraints (lbg, ubg): dynamic constraints in the form of an equation/function that change over time
@@ -281,19 +273,23 @@ class KinematicMPCCasadi(object):
         if delta_rate_bound is None:
             delta_rate_bound = [-352.9411764706, 352.9411764706]
 
+        if degrees:
+            delta_bound = np.radians(delta_bound).tolist()
+            delta_rate_bound = np.radians(delta_rate_bound).tolist()
+
         u_min = np.array([[acc_bound[0]], [delta_bound[0]]])
         u_max = np.array([[acc_bound[1]], [delta_bound[1]]])
 
-        u_dot_min = np.array([[jerk_bound[0]], [np.radians(delta_rate_bound[0])]])
-        u_dot_max = np.array([[jerk_bound[1]], [np.radians(delta_rate_bound[1])]])
+        u_dot_min = np.array([[jerk_bound[0]], [delta_rate_bound[0]]])
+        u_dot_max = np.array([[jerk_bound[1]], [delta_rate_bound[1]]])
 
-        constraints = []
+        constraints = []  # todo: initialize the appropriate size
         '''
         Set lower bound of inequality constraint to zero to force: 
             1. n*N state dynamics
             2. n terminal contraints and
             3. CVX hull constraint
-            
+
             [0] * (self.nx * (self.horizon + 1)) + [0] * self.nx 
         '''
         # lbg = [0] * (self.nx * (self.horizon + 1))  # + [0] * self.nx + [0]  # 0.0
@@ -330,12 +326,10 @@ class KinematicMPCCasadi(object):
         for k in range(self.horizon):
             # todo: create a new symbolic state for x_next and update it at each timestep using my integrator function
             # state model/dynamics constraints.  a=b or a-b
-            ode_symbolic = self.ode_function(self.z_dv[:, k], self.u_dv[:, k])
-            # ode_symbolic = self.ode_linear_function(self.z_dv[:, k], self.u_dv[:, k])  # doesn't work. Needs fixing
-            z_dt = ode_symbolic * self.Ts  # todo: replace with my integration function
-            # z_dt = self.vehicle.get_next_state()
+            # ode_symbolic = self.ode_function(self.z_dv[:, k], self.u_dv[:, k])
+            # z_dt = ode_symbolic * self.Ts
 
-            z_next = self.z_dv[:, k] + z_dt  # todo: set z_dt = 0 for discrete model
+            z_next = self.ode_function(self.z_dv[:, k], self.u_dv[:, k])
 
             # A = self.symbol_type.eye(self.nx) + self.Ts * self.symbol_type.jacobian(ode_symbolic, self.z_dv[:, k])
             # B = self.Ts * self.symbol_type.jacobian(ode_symbolic, self.u_dv[:, k])
@@ -378,7 +372,7 @@ class KinematicMPCCasadi(object):
                 constraints,
                 -u_dot + (slack_flag * casadi.mtimes(self.V_scale_u_rate, self.sl_dv[:, k])))  # or u_dot - ...
             lbg = casadi.vertcat(lbg, -u_dot_max * self.Ts)  # or -casadi.inf * casadi.DM.ones((self.nu, 1))
-            ubg = casadi.vertcat(ubg, casadi.inf *  casadi.DM.ones((self.nu, 1)) * self.Ts)  # or  u_dot_max * self.Ts
+            ubg = casadi.vertcat(ubg, casadi.inf * casadi.DM.ones((self.nu, 1)) * self.Ts)  # or  u_dot_max * self.Ts
 
             u_prev = self.u_dv[:, k]
             u_dot_list.append(u_dot)
@@ -389,11 +383,11 @@ class KinematicMPCCasadi(object):
         # Other Constraints.
         # # e.g. things like collision avoidance or lateral acceleration bounds could go here.
 
-        # lbx = [-casadi.inf, -casadi.inf, vel_bound[0], -casadi.inf] * (self.horizon + 1)  # state constraints
-        # ubx = [casadi.inf, casadi.inf, vel_bound[1], casadi.inf] * (self.horizon + 1)  # state constraints
+        # lbx = [-casadi.inf, -casadi.inf, vel_bound[0], -2 * casadi.pi] * (self.horizon + 1)  # state constraints
+        # ubx = [casadi.inf, casadi.inf, vel_bound[1], 2 * casadi.pi] * (self.horizon + 1)  # state constraints
         #
-        # lbx.extend([acc_bound[0], np.radians(delta_bound[0])] * self.horizon)  # input constraints
-        # ubx.extend([acc_bound[1], np.radians(delta_bound[1])] * self.horizon)  # input constraints
+        # lbx.extend([acc_bound[0], delta_bound[0]] * self.horizon)  # input constraints
+        # ubx.extend([acc_bound[1], delta_bound[1]] * self.horizon)  # input constraints
 
         lbx = casadi.DM.zeros((self.nx * (self.horizon + 1) + self.nu * self.horizon, 1))
         ubx = casadi.DM.zeros((self.nx * (self.horizon + 1) + self.nu * self.horizon, 1))
@@ -414,21 +408,56 @@ class KinematicMPCCasadi(object):
         ubx[3: self.nx * (self.horizon + 1): self.nx] = 2 * casadi.pi  # psi upper bound
 
         # controls
-        lbx[self.nx * (self.horizon + 1):(self.nx * (self.horizon + 1) + (self.nu * self.horizon)):self.nu] = acc_bound[0]  # acc lower bound
-        lbx[self.nx * (self.horizon + 1) + 1:(self.nx * (self.horizon + 1) + (self.nu * self.horizon)):self.nu] = np.radians(delta_bound[0])  # delta lower bound
+        lbx[self.nx * (self.horizon + 1):(self.nx * (self.horizon + 1) + (self.nu * self.horizon)):self.nu] = acc_bound[
+            0]  # acc lower bound
+        lbx[self.nx * (self.horizon + 1) + 1:(
+                    self.nx * (self.horizon + 1) + (self.nu * self.horizon)):self.nu] = delta_bound[0]  # delta lower bound
 
-        ubx[self.nx * (self.horizon + 1):(self.nx * (self.horizon + 1) + (self.nu * self.horizon)):self.nu] = acc_bound[1]  # acc lower bound
-        ubx[self.nx * (self.horizon + 1) + 1:(self.nx * (self.horizon + 1) + (self.nu * self.horizon)):self.nu] = np.radians(delta_bound[1])  # delta lower bound
+        ubx[self.nx * (self.horizon + 1):(self.nx * (self.horizon + 1) + (self.nu * self.horizon)):self.nu] = acc_bound[
+            1]  # acc lower bound
+        ubx[self.nx * (self.horizon + 1) + 1:(
+                    self.nx * (self.horizon + 1) + (self.nu * self.horizon)):self.nu] = delta_bound[1]  # delta lower bound
 
         # slack constraints (see https://forces.embotech.com/Documentation/examples/high_level_soft_constraints/index.html)
         if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
-            lbx[self.nx * (self.horizon + 1) + (self.nu * self.horizon):(self.nx * (self.horizon + 1) + (self.nu * self.horizon) + (self.nu * self.horizon)):self.nu] = 0.0  # todo: make configurable
-            lbx[self.nx * (self.horizon + 1) + (self.nu * self.horizon) + 1:(self.nx * (self.horizon + 1) + (self.nu * self.horizon) + (self.nu * self.horizon)):self.nu] = 0.0  # todo: make configurable
+            lbx[self.nx * (self.horizon + 1) + (self.nu * self.horizon):(
+                        self.nx * (self.horizon + 1) + (self.nu * self.horizon) + (
+                            self.nu * self.horizon)):self.nu] = 0.0  # todo: make configurable
+            lbx[self.nx * (self.horizon + 1) + (self.nu * self.horizon) + 1:(
+                        self.nx * (self.horizon + 1) + (self.nu * self.horizon) + (
+                            self.nu * self.horizon)):self.nu] = 0.0  # todo: make configurable
 
             ubx[self.nx * (self.horizon + 1) + (self.nu * self.horizon):(
-                        self.nx * (self.horizon + 1) + (self.nu * self.horizon) + (self.nu * self.horizon)):self.nu] = self.slack_upper_bound_u_rate[0]
+                    self.nx * (self.horizon + 1) + (self.nu * self.horizon) + (self.nu * self.horizon)):self.nu] = \
+            self.slack_upper_bound_u_rate[0]
             ubx[self.nx * (self.horizon + 1) + (self.nu * self.horizon) + 1:(
-                        self.nx * (self.horizon + 1) + (self.nu * self.horizon) + (self.nu * self.horizon)):self.nu] = self.slack_upper_bound_u_rate[1]
+                    self.nx * (self.horizon + 1) + (self.nu * self.horizon) + (self.nu * self.horizon)):self.nu] = \
+            self.slack_upper_bound_u_rate[1]
+
+        # # To verify for debugging purposes (should be commented out)
+        # opt_to_state_input_dict = {
+        #     'x_0': 'x', 'x_1': 'y', 'x_2': 'vel', 'x_3': 'psi',
+        #     'u_0': 'acc', 'u_1': 'delta'
+        # }
+        # for index in range(constraints.size1()):
+        #     print(f"{lbg[index]} <= {constraints[index]} <= {ubg[index]}")
+        # print("\n")
+        #
+        # # print state (z) constraints. todo: fix
+        # for index in range(0, self.nx * (self.horizon + 1), self.nx):
+        #     expression = ""
+        #     for state in range(self.nx):
+        #         key = f'x_{state}'
+        #         expression += f"{lbx[index + state]} <= {opt_to_state_input_dict[key]} <= {ubx[index + state]}\n"
+        #     print(expression)
+        #
+        # # print input (u) constraints. todo: fix
+        # for index in range(self.nx * (self.horizon + 1), lbx.size1(), self.nu):
+        #     expression = ""
+        #     for input_ in range(self.nu):
+        #         key = f'u_{input_}'
+        #         expression += f"{lbx[index + input_]} <= {opt_to_state_input_dict[key]} <= {ubx[index + input_]}\n"
+        #     print(expression)
         return constraints, lbg, ubg, lbx, ubx
 
     def _quad_form(self, z, Q):
@@ -464,7 +493,7 @@ class KinematicMPCCasadi(object):
                         cost += self._quad_form(self.sl_dv[:, k], self.P_u_rate)  # slack cost
                     else:
                         slack_weights = casadi.diag(self.P_u_rate)  # to convert to a column vector
-                        cost += casadi.mtimes(slack_weights.T, self.sl_dv[:, k]) # slack cost
+                        cost += casadi.mtimes(slack_weights.T, self.sl_dv[:, k])  # slack cost
 
         ''' Mayer/terminal cost '''
         cost += self._quad_form(self.z_dv[:, self.horizon] - self.z_ref[:, self.horizon], self.Qf)  # terminal state
@@ -473,7 +502,7 @@ class KinematicMPCCasadi(object):
         return cost
 
     def setup_solver(self, cost, constraints, solver_type='nlp',
-                     solver_options=None, solver='ipopt', suppress_output=True):
+                     solver_options=None, solver_='ipopt', suppress_output=True, use_nlp_interface_for_qp=True):
         flat_z = casadi.reshape(self.z_dv, self.nx * (self.horizon + 1), 1)  # flatten (self.nx * (self.horizon + 1), 1)
         flat_u = casadi.reshape(self.u_dv, self.nu * self.horizon, 1)  # flatten (self.nu * self.horizon, 1)
         if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
@@ -514,35 +543,73 @@ class KinematicMPCCasadi(object):
                 # 'max_iter': 1000,
             }
 
-            if solver == 'ipopt':
-                ipopt_options = {
-                    'ipopt.print_level': not suppress_output,
-                    'ipopt.sb': 'yes',
-                    'ipopt.max_iter': 2000,
-                    'ipopt.acceptable_tol': 1e-8,
-                    'ipopt.acceptable_obj_change_tol': 1e-6,
-                    'error_on_fail': 0,  # to raise an exception if the solver fails to find a solution
-                    # "ipopt.linear_solver": "ma27",  # Comment this line if you don't have MA27
-                }
-                solver_options.update(ipopt_options)
-
-                if self.warmstart:
-                    # see (https://coin-or.github.io/Ipopt/OPTIONS.html#OPT_Warm_Start and
-                    # https://www.gams.com/latest/docs/S_IPOPT.html#IPOPT_WARMSTART) for tips
-                    warmstart_options = {
-                        'ipopt.warm_start_init_point': 'yes',
-                        'ipopt.warm_start_bound_push': 1e-8,  # 1e-9
-                        'ipopt.warm_start_mult_bound_push': 1e-8,  # 1e-9
-                        'ipopt.mu_init': 1e-5,
-                        'ipopt.bound_relax_factor': 1e-9,
-                        # # todo: test with the below values
-                        # 'ipopt.warm_start_bound_frac': 1e-9,
-                        # 'ipopt.warm_start_slack_bound_frac': 1e-9,
-                        # 'ipopt.mu_strategy': 'monotone',
-                        # 'mu_init': 0.0001,
-                        # 'nlp_scaling_method': 'none',
+            if solver_ == 'ipopt':
+                if solver_type != 'quad':
+                    ipopt_options = {
+                        'ipopt.print_level': not suppress_output,
+                        'ipopt.sb': 'yes',
+                        'ipopt.max_iter': 2000,
+                        'ipopt.acceptable_tol': 1e-8,
+                        'ipopt.acceptable_obj_change_tol': 1e-6,
+                        'error_on_fail': False,  # to raise an exception if the solver fails to find a solution
+                        # "ipopt.linear_solver": "ma27",  # Comment this line if you don't have MA27
                     }
-                    solver_options.update(warmstart_options)
+                    solver_options.update(ipopt_options)
+
+                    if self.warmstart:
+                        # see (https://coin-or.github.io/Ipopt/OPTIONS.html#OPT_Warm_Start and
+                        # https://www.gams.com/latest/docs/S_IPOPT.html#IPOPT_WARMSTART) for tips
+                        warmstart_options = {
+                            'ipopt.warm_start_init_point': 'yes',
+                            'ipopt.warm_start_bound_push': 1e-8,  # 1e-9
+                            'ipopt.warm_start_mult_bound_push': 1e-8,  # 1e-9
+                            'ipopt.mu_init': 1e-5,
+                            'ipopt.bound_relax_factor': 1e-9,
+                            # # todo: test with the below values
+                            # 'ipopt.warm_start_bound_frac': 1e-9,
+                            # 'ipopt.warm_start_slack_bound_frac': 1e-9,
+                            # 'ipopt.mu_strategy': 'monotone',
+                            # 'mu_init': 0.0001,
+                            # 'nlp_scaling_method': 'none',
+                        }
+                        solver_options.update(warmstart_options)
+
+                else:
+                    use_nlp_interface_for_qp = True  # ipopt requires the nlp interface below
+                    if use_nlp_interface_for_qp:
+                        # see https://github.com/casadi/casadi/wiki/FAQ:-how-to-use-IPOPT-as-QP-solver%3F
+                        # must use alternate nlpsol formulation (or qpsol)
+                        ipopt_quad_settings = {
+                            'qpsol': 'nlpsol',
+                            'qpsol_options': {}
+                        }
+
+                        ipopt_quad_settings['qpsol_options']['nlpsol'] = 'ipopt'
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options'] = {}
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt'] = {}
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.tol'] = 1e-12  # 1e-7
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.tiny_step_tol'] = 1e-20
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.fixed_variable_treatment'] = 'make_constraint'
+                        # ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.hessian_constant'] = 'yes'
+                        # ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.jac_c_constant'] = 'yes'
+                        # ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.jac_d_constant'] = 'yes'
+                        # ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.accept_every_trial_step'] = 'yes'
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.mu_init'] = 1e-5  # 1e-3
+                        # ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.linear_solver'] = 'ma27'
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.sb'] = 'yes'
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.max_iter'] = 2000
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.acceptable_tol'] = 1e-8
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.acceptable_obj_change_tol'] = 1e-6
+
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.print_level'] = 0
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['print_time'] = False
+                        solver_options.update(ipopt_quad_settings)
+
+                    else:
+                        raise NotImplementedError(f"Solver {solver_}, with optimization type: {solver_type} "
+                                                  f"requires setting {use_nlp_interface_for_qp}. "
+                                                  f"Either set 'use_nlp_interface_for_qp' to "
+                                                  f"True or optimization type to 'nlp'.")
 
         '''
         Setup code generation flags. See the following for details:
@@ -551,7 +618,7 @@ class KinematicMPCCasadi(object):
            * https://github.com/casadi/casadi/wiki/FAQ:-how-to-make-jit-not-recompile-when-problem-is-unchanged
         '''
         # compiler and flags are common to jit and external code_generation
-        compiler = "gcc"  # Linux (gcc, clang, ccache gcc)
+        compiler = "ccache gcc"  # Linux (gcc, clang, ccache gcc)  # todo: catch exception if ccache is not installed
         # compiler = "clang"  # OSX
         # compiler = "cl.exe" # Windows
         flags = ["-O3"]  # Linux/OSX. ['O3'] enables the most optimizations
@@ -581,25 +648,89 @@ class KinematicMPCCasadi(object):
             f must be convex and g must be linear
             solvers: qpoases, osqp
             '''
-            quad_solver = solver
-            if quad_solver not in ["osqp", "qpoases"]:
+            quad_solver = solver_
+            if quad_solver not in ["osqp", "qpoases", "qrqp", "ipopt"]:
                 quad_solver = 'osqp'  # osqp, qpoases
-                print(f"Solver: {solver} not valid. Defaulting to {quad_solver}")
+                print(f"solver_: {solver_} not valid. Defaulting to {quad_solver}")
 
-            if quad_solver == "osqp":
+            if (quad_solver == "osqp") and not use_nlp_interface_for_qp:
                 quad_settings = {
                     # 'verbose': not suppress_output,
-                    # 'max_iter': 2000,
+                    # 'max_iter': 10,
                     # 'eps_pr': 1e-8,
                     # 'eps_r': 1e-8,
-                    'warm_start_dual': True,
-                    'warm_start_primal': True,
-                    # 'sparse': True,  # test with osqp and qpoases
+                    # 'warm_start_dual': True,
+                    # 'warm_start_primal': True,
+                    # 'sparse': True,  # for qpoases only
                 }
                 solver_options.update(quad_settings)
-            solver = casadi.qpsol('solver', quad_solver, optimization_prob, solver_options)
+            if not use_nlp_interface_for_qp:
+                solver = casadi.qpsol('solver', quad_solver, optimization_prob, solver_options)
+            else:
+                # see https://web.casadi.org/python-api/
+                qp_options = {
+                    "qpsol": "nlpsol" if solver_ == "ipopt" else solver_,  # else solver_
+                    "print_time": not suppress_output,
+                    # "convexify_strategy": "regularize",  # NONE|regularize|eigen- reflect|eigen-clip
+                    # "convexify_margin": 1e-4,
+                    "max_iter": 10,  # ipopt, 2000
+                    # "hessian_approximation": "exact",   # "limited-memory" (sqpmethod), "exact" (all plugins), "gauss-neuton" (scpgen). Feasiblesqpmethod only works with exact and get better performance with regularization
+                    # "tol_du": 1e-10,  # ipopt, qrqp
+                    # "tol_pr": 1e-10,   # ipopt
+                    # "min_step_size": 1e-14,  # ipopt, qrqp
+                    # "max_iter_ls": 0,  #  qrqp
+                    "print_header": not suppress_output,
+                    "print_iteration": not suppress_output,
+                    # 'init_feasible': True,  # for sqpmethod and feasiblesqpmethod plugins
+                    # "warmstart": True,  # for blocksqp plugin
+                    # "qp_init": True,  # for blocksqp plugin
+                }
+                solver_options.update(qp_options)
+
+                common_qp_sol_options = {
+                        "print_problem": not suppress_output,
+                        "print_out": not suppress_output,
+                        "print_iter": not suppress_output,  # disable for osqp
+                        "error_on_fail": False,
+                        # "sparse": True, # (for QPOases only)
+                    }  # common to ipopt and the QP solvers
+
+                if solver_options.get('qpsol_options', None) is None:
+                    solver_options['qpsol_options'] = common_qp_sol_options
+                else:
+                    solver_options['qpsol_options'].update(common_qp_sol_options)
+
+                # sqpmethod, feasiblesqpmethod, blocksqp
+                plugin = 'sqpmethod'
+                if plugin not in ["sqpmethod", "feasiblesqpmethod", "blocksqp", "scpgen"]:
+                    plugin = "sqpmethod"
+
+                if plugin in ["feasiblesqpmethod", "blocksqp", "scpgen"]:
+                    print("Only 'sqpmethod' works at the moment. \n "
+                          "Feasiblesqpmethod is not stable/robust and fails when the initial condition is not "
+                          "sufficient or without warmstarting. I have not been able to get it to work yet. \n "
+                          "Blocksqp requires HSL to be installed, specifically the ma27 solver. \n"
+                          "For scpgen there is a bug in casadi at least as of 3.6.6 that leads to an Exception when creating. \n"
+                          "Defaulting to sqpmethod plugin.")
+                    plugin = "sqpmethod"
+
+                # qrqp, osqp, qpoases
+                solver = casadi.nlpsol('solver', plugin, optimization_prob, solver_options)
+
+                if self.code_gen_mode == 'external':
+                    # Generate C code for the NLP functions. todo: rename the files
+                    solver.generate_dependencies("nlp.c")
+
+                    import subprocess
+                    # On Windows, use other flags
+                    cmd_args = [compiler, "-shared"] + flags + ["nlp.c", "-o", "nlp.so"]
+                    subprocess.run(cmd_args)
+
+                    # Create a new NLP solver instance from the compiled code
+                    solver = casadi.nlpsol("solver", solver, "./nlp.so")
+
         else:
-            nlp_solver = solver
+            nlp_solver = solver_
             # nlp_settings = {
             #
             # }
@@ -611,7 +742,7 @@ class KinematicMPCCasadi(object):
 
                 import subprocess
                 # On Windows, use other flags
-                cmd_args = [compiler, "-fPIC", "-shared"] + flags + ["nlp.c", "-o", "nlp.so"]
+                cmd_args = [compiler, "-shared"] + flags + ["nlp.c", "-o", "nlp.so"]
                 subprocess.run(cmd_args)
 
                 # Create a new NLP solver instance from the compiled code
@@ -687,7 +818,7 @@ class KinematicMPCCasadi(object):
             opt_parameters = casadi.vertcat(
                     casadi.reshape(self.z_ref_value, self.nx * (self.horizon + 1), 1),
                     casadi.reshape(self.z_k_value, self.nx, 1),
-                    casadi.reshape(self.u_prev_value, self.nu, 1),
+                    casadi.reshape(self.u_prev_value, self.nu, 1)
             )
 
             dual_variables = {}
@@ -700,7 +831,6 @@ class KinematicMPCCasadi(object):
 
             result_dict = self.solver(x0=opt_variables, p=opt_parameters,
                                       lbg=self.lbg, lbx=self.lbx, ubg=self.ubg, ubx=self.ubx, **dual_variables)
-
             sol = result_dict['x']
             cost = result_dict['f']
             g = result_dict['g']
@@ -725,6 +855,7 @@ class KinematicMPCCasadi(object):
                 sl_mpc = casadi.reshape(sol[self.nx * (self.horizon + 1) + (self.nu * self.horizon):(
                             self.nx * (self.horizon + 1) + (self.nu * self.horizon) + (self.nu * self.horizon))], self.nu,
                                         self.horizon).full()
+                # sl_mpc = casadi.reshape(g[self.nx * (self.horizon + 1) + self.nu * self.horizon:], self.nu, -1).full()  # wrong.
 
             # evaluate/calculate u_rate
             self.update_u_rate(self.u_prev_value, u_mpc)
@@ -736,7 +867,11 @@ class KinematicMPCCasadi(object):
                 opt_parameters[self.nx * (self.horizon + 1):self.nx * (self.horizon + 1) + self.nx],
                 self.nx, 1).full()
             u_prev_value = casadi.reshape(opt_parameters[self.nx * (self.horizon + 1) + self.nx:], self.nu, 1).full()
-            iteration_count = self.solver.stats()['iter_count']  # sol.stats()["iter_count"]
+            try:
+                iteration_count = self.solver.stats()['iter_count']  # sol.stats()["iter_count"]
+            except KeyError:
+                # blocksqp plugin does not return iteration count
+                iteration_count = -1
             is_opt = True  # self.solver.stats()['success']
             success = self.solver.stats()['success']
 
@@ -803,6 +938,7 @@ class KinematicMPCCasadi(object):
             # #     print(expression)
             # # print("\n")
         except Exception as e:
+            print(f"Encountered: {e}")
             # Suboptimal solution (e.g. timed out). Todo: decide what to do
             u_mpc = np.zeros((self.nu, self.horizon))  # self.mpc.debug.value(self.u_dv)
             z_mpc = np.zeros((self.nx, self.horizon + 1))  # self.mpc.debug.value(self.z_dv)
@@ -871,7 +1007,7 @@ if __name__ == '__main__':
     dt = 0.0001
     x0 = np.array([[1., 0.3, 3, 0.1]]).T
     u0 = np.array([[1., 0.3]]).T
-    kin_mpc = KinematicMPCCasadi(vehicle=None, horizon=25, sample_time=dt, wheelbase=0.256,
+    kin_mpc = DiscreteKinematicMPCCasadi(vehicle=None, horizon=25, sample_time=dt, wheelbase=0.256,
                                  nx=4, nu=2, x0=x0, u0=u0,
                                  Q=(1e-1, 1e-8, 1e-8, 1e-8), R=(1e-3, 5e-3),
                                  Qf=(0.0, 0.0, 0.0, 0.0), Rd=(0.0, 0.0),

@@ -17,7 +17,7 @@ class MPC(object):
                  Q=np.diag([1e-1, 1e-8, 1e-8, 1e-8]), R=np.diag([1e-3, 5e-3]),
                  Qf=np.diag([0.0, 0.0, 0.0, 0.0]), Rd=np.diag([0.0, 0.0]),
                  vel_bound=(-5.0, 5.0), delta_bound=(-23.0, 23.0), acc_bound=(-3.0, 3.0),
-                 max_iterations=20, tolerance=1e-6, suppress_ipopt_output=True):
+                 max_iterations=20, tolerance=1e-6, suppress_ipopt_output=True, compile_model=False):
         """Constructor for MPC"""
         self.model = vehicle.model
 
@@ -28,6 +28,7 @@ class MPC(object):
         self.Rd = Rd
 
         self.Ts = sample_time
+        self.compile_model = compile_model
         self.reference_states = np.zeros((self.horizon + 1, self.Q.shape[0]))
 
         self.mpc = self.initialize_mpc(model=self.model, horizon=self.horizon,
@@ -53,6 +54,10 @@ class MPC(object):
         self.mpc.set_tvp_fun(self.tvp_fun)
 
         self.mpc.setup()
+        if self.compile_model:
+            # self.mpc.compile_nlp(overwrite= False, cname='nlp.c', libname='nlp.so', compiler_command=None)
+            # todo: for now there is a bug in the do_mpc code. Compile using my method in casadi node and modify the solver self.mpc.S
+            pass
 
     def initialize_mpc(self, model, horizon, timestep=0.01, store_full_solution=False):
         """
@@ -198,7 +203,8 @@ def initialize_mpc_problem(reference_path, horizon=15, sample_time=0.02,
                            Q=None, R=None, Qf=None, Rd=None, wheelbase=0.256,
                            delta_min=-23.0, delta_max=23.0, vel_min=-10.0, vel_max=10.0,
                            ay_max=4.0, acc_min=-3.0, acc_max=3.0,
-                           max_iterations=100, tolerance=1e-6, suppress_ipopt_output=True, model_type='continuous'):
+                           max_iterations=100, tolerance=1e-6, suppress_ipopt_output=True, model_type='continuous',
+                           compile_model=False):
     """
     Get configured do-mpc modules:
     """
@@ -212,7 +218,8 @@ def initialize_mpc_problem(reference_path, horizon=15, sample_time=0.02,
 
     Controller = MPC(Vehicle, horizon=horizon, sample_time=sample_time, Q=Q, R=R, Qf=Qf, Rd=Rd, wheelbase=wheelbase,
                      vel_bound=(vel_min, vel_max), delta_bound=(delta_min, delta_max), acc_bound=(acc_min, acc_max),
-                     max_iterations=max_iterations, tolerance=tolerance, suppress_ipopt_output=suppress_ipopt_output)
+                     max_iterations=max_iterations, tolerance=tolerance, suppress_ipopt_output=suppress_ipopt_output,
+                     compile_model=compile_model)
 
     # Sim = Simulator(Vehicle, sample_time=sample_time)
     Sim = None
