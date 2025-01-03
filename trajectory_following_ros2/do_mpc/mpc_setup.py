@@ -2,8 +2,10 @@
 
 """
 
+import os
 import numpy as np
 # from casadi import *
+import casadi
 from casadi import mtimes, vertcat, vertsplit
 # from casadi.tools import *
 import do_mpc
@@ -17,7 +19,9 @@ class MPC(object):
                  Q=np.diag([1e-1, 1e-8, 1e-8, 1e-8]), R=np.diag([1e-3, 5e-3]),
                  Qf=np.diag([0.0, 0.0, 0.0, 0.0]), Rd=np.diag([0.0, 0.0]),
                  vel_bound=(-5.0, 5.0), delta_bound=(-23.0, 23.0), acc_bound=(-3.0, 3.0),
-                 max_iterations=20, tolerance=1e-6, suppress_ipopt_output=True, compile_model=False):
+                 max_iterations=20, tolerance=1e-6, suppress_ipopt_output=True,
+                 warmstart=True, quad_prog_mode=True,
+                 compile_mpc=True, jit_compilation=False):
         """Constructor for MPC"""
         self.model = vehicle.model
 
@@ -28,8 +32,10 @@ class MPC(object):
         self.Rd = Rd
 
         self.Ts = sample_time
-        self.compile_model = compile_model
+        self.compile = compile_mpc
         self.reference_states = np.zeros((self.horizon + 1, self.Q.shape[0]))
+        self.warmstart = warmstart
+        self.quad_prog_mode = quad_prog_mode
 
         self.mpc = self.initialize_mpc(model=self.model, horizon=self.horizon,
                                        timestep=self.Ts, store_full_solution=True)
@@ -43,6 +49,37 @@ class MPC(object):
         if suppress_ipopt_output:
             nlpsol_opts.update({"ipopt.print_level": 0, "ipopt.sb": "yes", "print_time": 0})
 
+        if self.warmstart:
+            # see (https://coin-or.github.io/Ipopt/OPTIONS.html#OPT_Warm_Start and
+            # https://www.gams.com/latest/docs/S_IPOPT.html#IPOPT_WARMSTART) for tips
+            warmstart_options = {
+                'ipopt.warm_start_init_point': 'yes',
+                'ipopt.warm_start_bound_push': 1e-8,  # 1e-9
+                'ipopt.warm_start_mult_bound_push': 1e-8,  # 1e-9
+                'ipopt.mu_init': 1e-5,
+                'ipopt.bound_relax_factor': 1e-9,
+                # # todo: test with the below values
+                # 'ipopt.warm_start_bound_frac': 1e-9,
+                # 'ipopt.warm_start_slack_bound_frac': 1e-9,
+                # 'ipopt.mu_strategy': 'monotone',
+                # 'mu_init': 0.0001,
+                # 'nlp_scaling_method': 'none',
+            }
+            nlpsol_opts.update(warmstart_options)
+
+        if self.quad_prog_mode:
+            # use ipopt with some QP optimization settings.
+            # Convexification and hessian approximation do not work with Do-MPC as the OCP is non convex and not a QP
+            qp_options = {
+                # WARNING: DO NOT APPLY convexification to Do MPC problem formulation
+                # WARNING. DO NOT USE limited memory or exact hessian approximation with Do MPC. Leave IPOPT default.
+                'ipopt.tol': 1e-12,
+                'ipopt.tiny_step_tol': 1e-20,
+                'ipopt.fixed_variable_treatment': 'make_constraint',
+                'ipopt.mu_init': 1e-5  # 1e-3
+            }
+            nlpsol_opts.update(qp_options)
+
         self.mpc.set_param(nlpsol_opts=nlpsol_opts)
 
         # define the objective function and constraints
@@ -53,11 +90,42 @@ class MPC(object):
         self.tvp_template = self.mpc.get_tvp_template()
         self.mpc.set_tvp_fun(self.tvp_fun)
 
+        # compilation parameters
+        compiler = "ccache gcc"  # Linux (gcc, clang, ccache gcc)  # todo: catch exception if ccache is not installed
+        # compiler = "clang"  # OSX
+        # compiler = "cl.exe" # Windows
+        flags = ["-O3"]  # Linux/OSX. ['O3'] enables the most optimizations
+        if compiler == "gcc":
+            flags = [
+                "-Ofast",
+                # enables even more optimization than -O3 but could be less precise/safe but is okay in most situations
+                "-march=native",  # optimizes for the specific hardware (CPU) but isn't transferable
+                "-fPIC",  # for shared_libraries
+            ]  # for performance boost using gcc
+
+        # JIT compilation automatically compiles helper functions as well as the solver.
+        # Yields about a 2.5x increase in performance
+        # By default, the compiler will be gcc or cl.exe
+        jit_options = {
+            "jit": True, "compiler": "shell", "jit_temp_suffix": False,
+            "jit_options": {
+                "flags": flags, "compiler": compiler, "verbose": True,
+                "compiler_flags": flags
+            },  # use ("compiler": "ccache gcc") if ccache is installed for a performance boost
+            'jit_cleanup': False  # True: delete files on shutdown
+        }
+
+        if self.compile and jit_compilation:
+            nlpsol_opts.update(jit_options)
+            self.mpc.set_param(nlpsol_opts=nlpsol_opts)
+
         self.mpc.setup()
-        if self.compile_model:
-            # self.mpc.compile_nlp(overwrite= False, cname='nlp.c', libname='nlp.so', compiler_command=None)
+
+        if self.compile and not jit_compilation:
+            # self.mpc.compile_nlp(overwrite=False, cname='nlp.c', libname='nlp.so', compiler_command=None)
             # todo: for now there is a bug in the do_mpc code. Compile using my method in casadi node and modify the solver self.mpc.S
-            pass
+            # this is faster than jit for do_mpc
+            self.compile_model(overwrite=True, cname='nlp_do_mpc.c', libname='nlp_do_mpc.so', compiler=compiler, flags=flags)
 
     def initialize_mpc(self, model, horizon, timestep=0.01, store_full_solution=False):
         """
@@ -198,13 +266,53 @@ class MPC(object):
 
         return s
 
+    def compile_model(self, overwrite=True, cname='nlp_do_mpc.c', libname='nlp_do_mpc.so', compiler='gcc', flags=None):
+        # self.mpc.compile_nlp(overwrite=False, cname='nlp.c', libname='nlp.so', compiler_command=None)
+
+        if isinstance(compiler, str):
+            compiler = compiler.split()
+
+        if flags is None:
+            flags = [
+                "-Ofast",
+                # enables even more optimization than -O3 but could be less precise/safe but is okay in most situations
+                "-march=native",  # optimizes for the specific hardware (CPU) but isn't transferable
+                "-fPIC",  # for shared_libraries
+            ]  # for performance boost using gcc
+
+        # Only compile if not already compiled:
+        if overwrite or not os.path.isfile(libname):
+            self.mpc.S.generate_dependencies(cname)
+
+            import subprocess
+            # On Windows, use other flags
+            cmd_args = compiler + ["-shared"] + flags + [cname, "-o", libname]
+
+            try:
+                result = subprocess.run(cmd_args, check=True, capture_output=True)
+                if result.returncode != 0:
+                    print("Error:", result.returncode)
+                    print("Output:", result.stdout)
+                    print("Error output:", result.stderr)
+            except subprocess.CalledProcessError as e:
+                # print("Error:", e)
+                # print("Return code:", e.returncode)
+                # print("Error output:", e.stderr)
+                if "ccache" in str(e) or "No such file or directory" in e.stderr:
+                    cmd_args.pop(0)
+                    result = subprocess.run(cmd_args, check=True, capture_output=True)
+
+            # Create a new NLP solver instance from the compiled code
+            # self.mpc.S = casadi.nlpsol("solver", self.mpc.S, libname)
+            self.mpc.S = casadi.nlpsol('solver_compiled', 'ipopt', libname, self.mpc.settings.nlpsol_opts)
+
 
 def initialize_mpc_problem(reference_path, horizon=15, sample_time=0.02,
                            Q=None, R=None, Qf=None, Rd=None, wheelbase=0.256,
                            delta_min=-23.0, delta_max=23.0, vel_min=-10.0, vel_max=10.0,
                            ay_max=4.0, acc_min=-3.0, acc_max=3.0,
                            max_iterations=100, tolerance=1e-6, suppress_ipopt_output=True, model_type='continuous',
-                           compile_model=False):
+                           warmstart=True, quad_prog_mode=True, compile_model=False, jit_compilation=True):
     """
     Get configured do-mpc modules:
     """
@@ -219,7 +327,7 @@ def initialize_mpc_problem(reference_path, horizon=15, sample_time=0.02,
     Controller = MPC(Vehicle, horizon=horizon, sample_time=sample_time, Q=Q, R=R, Qf=Qf, Rd=Rd, wheelbase=wheelbase,
                      vel_bound=(vel_min, vel_max), delta_bound=(delta_min, delta_max), acc_bound=(acc_min, acc_max),
                      max_iterations=max_iterations, tolerance=tolerance, suppress_ipopt_output=suppress_ipopt_output,
-                     compile_model=compile_model)
+                     warmstart=warmstart, quad_prog_mode=quad_prog_mode, compile_mpc=compile_model, jit_compilation=jit_compilation)
 
     # Sim = Simulator(Vehicle, sample_time=sample_time)
     Sim = None

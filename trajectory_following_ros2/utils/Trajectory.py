@@ -111,6 +111,9 @@ class Trajectory(object):
 
         if (max_search_radius is None) or (max_search_radius < 0.0):
             max_search_radius = self.MAXIMUM_SEARCH_RADIUS
+
+        if self.waypoint_kdtree is None:
+            self.waypoint_kdtree = trajectory_utils.generate_kd_tree(waypoints)
         indices, distances = trajectory_utils.find_closest_waypoints(waypoints[:, :2], state,
                                                                      current_index=current_index,
                                                                      num_neighbours=num_neighbours,

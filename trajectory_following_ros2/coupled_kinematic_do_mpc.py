@@ -176,8 +176,8 @@ class KinematicCoupledDoMPCNode(Node):
         self.declare_parameter('n_ind_search', 10)  # the number of points to check for when searching for the closest
         self.declare_parameter('smooth_yaw', False)
         self.declare_parameter('debug', False)  # displays solver output
-        self.declare_parameter('generate_mpc_model', False)  # generate and build model
-        self.declare_parameter('build_with_cython', True)  # whether to use cython (recommended) or ctypes
+        self.declare_parameter('generate_mpc_model', True)  # generate and build model
+        self.declare_parameter('build_with_cython', True)  # whether to use cython (recommended) or ctypes. not used. todo: remove
         self.declare_parameter('model_directory',
                                '/f1tenth_ws/src/trajectory_following_ros2/data/model')  # don't use absolute paths
 
@@ -497,7 +497,8 @@ class KinematicCoupledDoMPCNode(Node):
                                                        max_iterations=self.max_iter,
                                                        tolerance=self.termination_condition,
                                                        suppress_ipopt_output=True, model_type=self.model_type,
-                                                       compile_model=self.generate_mpc_model)
+                                                       warmstart=True, quad_prog_mode=True,
+                                                       compile_model=self.generate_mpc_model, jit_compilation=False)
         self.mpc_built = True
         self.get_logger().info("Finished setting up the MPC.")
 
@@ -772,6 +773,12 @@ class KinematicCoupledDoMPCNode(Node):
                 #     self.get_logger().info(f"Accel command: {self.acc_cmd}, delta_cmd: {np.degrees(self.delta_cmd)}, run_count: {self.run_count}, Status: {self.solution_status}\n")
 
                 self.run_count += 1
+
+                # print every second
+                if self.run_count % self.control_rate == 0:
+                    self.get_logger().info(f"Accel command: {self.acc_cmd}, delta_cmd: {np.degrees(self.delta_cmd)}, run_count: {self.run_count}, Status: {self.solution_status}\n")
+                if dt > 0 and self.solution_time > 0:
+                    self.get_logger().info(f"Python time: {1 / dt}, do_mpc solve time: {1 / self.solution_time}, solve status: {self.solution_status}")
 
                 # update queues for debug publishing
                 self.update_queue(self.goal_queue, self.target_point[0:2])

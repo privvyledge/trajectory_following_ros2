@@ -50,9 +50,12 @@ class DiscreteKinematicMPCCasadi(object):
                  normalize_yaw_error=True,
                  slack_weights_u_rate=(1e-6, 1e-6),  # (1e-6, 1e-6)
                  slack_scale_u_rate=(1.0, 1.0),
-                 slack_upper_bound_u_rate=None, #(1., np.radians(30.0)), (np.inf, np.inf)
+                 slack_upper_bound_u_rate=None, #(1., np.radians(30.0)), (np.inf, np.inf). Set to 0 to disable slack
                  slack_objective_is_quadratic=False,
-                 code_gen_mode='jit'):
+                 code_gen_mode='jit',
+                 num_obstacles=1, collision_avoidance_scheme='cbf',
+                 ego_radius=None,
+                 slack_weights_obstacle_avoidance=(1.0, 1.0), slack_upper_bound_obstacle_avoidance=None):
         """Constructor for KinematicMPCCasadi"""
         self.horizon = horizon
         self.nx = nx
@@ -136,6 +139,8 @@ class DiscreteKinematicMPCCasadi(object):
         self.psi_dv = None
         self.z_dv = np.zeros((self.nx, self.horizon + 1))  # actual/predicted/openloop trajectory
         self.z_dv_value = np.zeros((self.nx, self.horizon + 1))
+        self.z_pred_dv = None  # can be extracted from the constraints after solving
+        self.z_pred_value = None  # can be extracted from the constraints after solving
 
         self.acc_dv = None
         self.delta_dv = None
@@ -156,6 +161,45 @@ class DiscreteKinematicMPCCasadi(object):
         self.lam_g_value = None
         self.lam_p_value = None
 
+        self.n_obstacles = num_obstacles
+        self.ego_radius = None
+        self.ego_radius_value = ego_radius
+        self.obstacles = None
+        self.obstacles_value = np.ones((3 * self.n_obstacles, horizon + 1)) * 1000.0  # setting to inf leads to infeasibilities
+        if self.n_obstacles > 0:
+            self.obstacles_value[2, :] = 2.0  # modify the radius
+
+            if slack_weights_obstacle_avoidance is not None and collision_avoidance_scheme == 'cbf':
+                raise NotImplementedError("The slack formulation with CBF isn't correct.")
+
+            self.P_obstacle_avoidance = casadi.diag(slack_weights_obstacle_avoidance) if slack_weights_obstacle_avoidance is not None else casadi.DM.zeros(
+                self.n_obstacles,
+                self.n_obstacles)  # >= 0,should be small, for soft constraints and large for hard constraints. 0 to disable
+            # set the positive slack upper bound
+            if slack_upper_bound_obstacle_avoidance is not None and isinstance(slack_upper_bound_obstacle_avoidance, (list, tuple, np.ndarray)):
+                if isinstance(slack_upper_bound_obstacle_avoidance, np.ndarray):
+                    slack_upper_bound_obstacle_avoidance = slack_upper_bound_obstacle_avoidance.flatten().tolist()
+                elif isinstance(slack_upper_bound_obstacle_avoidance, tuple):
+                    slack_upper_bound_obstacle_avoidance = list(slack_upper_bound_obstacle_avoidance)
+                for i in range(len(slack_upper_bound_obstacle_avoidance)):
+                    if slack_upper_bound_obstacle_avoidance[i] < 0:
+                        slack_upper_bound_obstacle_avoidance[i] = np.inf
+
+            self.slack_upper_bound_obstacle_avoidance = casadi.DM(
+                slack_upper_bound_obstacle_avoidance) if slack_upper_bound_obstacle_avoidance is not None else casadi.DM(
+                [np.inf] * self.n_obstacles)  # to put limits (upper bound) on the slack variables. Must be > 0. 0 implies None
+            self.sl_obs_dv = np.zeros((self.n_obstacles, self.horizon + 1))  # slack variables for input rates
+            self.sl_obs_dv_value = np.zeros((self.n_obstacles, self.horizon + 1))
+
+        self.obstacle_distances = None
+        self.obstacle_distances_value = np.ones((self.n_obstacles, horizon + 1)) * np.inf
+        self.safe_distance = 0.5  # (0.5) safe distance for obstacle avoidance.
+        self.collision_avoidance_scheme = collision_avoidance_scheme  # euclidean, CBF
+        if self.collision_avoidance_scheme == 'cbf':
+            self.cbf = None
+            self.h = None
+            self.gamma = np.clip(0.7, 0.0, 1.0)
+
         self.mpc, self.objective, self.constraints = self.initialize_mpc(horizon=self.horizon, nx=self.nx, nu=self.nu)
 
         # define the objective function and constraints.
@@ -170,6 +214,22 @@ class DiscreteKinematicMPCCasadi(object):
                                            # replace self.u_rate_dv with self.u_rate_dv_value to avoid allow_free
                                            ['u_prev_k', 'u_k'], [
                                                'u_rate_k'])  # , {'allow_free': True} allow_free argument required for MX functions
+
+        if self.n_obstacles > 0:
+            if not casadi.is_equal(self.P_obstacle_avoidance, casadi.DM.zeros((self.n_obstacles, self.n_obstacles))):
+                self.obstacle_distances_func = casadi.Function("obstacle_distances",
+                                                               [self.z_k, self.z_dv, self.obstacles, self.ego_radius, self.sl_obs_dv], [self.obstacle_distances],
+                                                               ['z_k', 'z_dv', 'obstacles', 'ego_radius', 'slack_obs'], ['obstacle_distances'])
+            else:
+                self.obstacle_distances_func = casadi.Function("obstacle_distances",
+                                                               [self.z_k, self.z_dv, self.obstacles, self.ego_radius],
+                                                               [self.obstacle_distances],
+                                                               ['z_k', 'z_dv', 'obstacles', 'ego_radius'],
+                                                               ['obstacle_distances'])
+            self.ego_radius_func = casadi.Function("ego_radius",
+                                                   [self.ego_radius], [self.ego_radius],
+                                                   ['ego_radius_value'], ['ego_radius'])
+            self.update_ego_radius(ego_radius)
 
         self.objective = self.objective_function_setup()
 
@@ -230,6 +290,17 @@ class DiscreteKinematicMPCCasadi(object):
         # Slack variables
         if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
             self.sl_dv = self.symbol_type.sym('sl_dv', nu, horizon)
+
+        # other non-linear constraints, e.g obstacle avoidance
+        if self.n_obstacles > 0:
+            if self.collision_avoidance_scheme in ['euclidean', 'cbf']:
+                self.ego_radius = self.symbol_type.sym('ego_radius', 1)
+                # self.obstacle_distances = self.symbol_type.sym('obstacle_distances', self.n_obstacles, horizon + 1)  # will be updated in constraint function
+                self.obstacles = self.symbol_type.sym('obstacles', 3 * self.n_obstacles, horizon + 1)  # x, y, radius
+
+            # Slack variables for obstacle avoidance
+            if not casadi.is_equal(self.P_obstacle_avoidance, casadi.DM.zeros((self.n_obstacles, self.n_obstacles))):
+                self.sl_obs_dv = self.symbol_type.sym('sl_obs_dv', self.n_obstacles, horizon + 1)
 
         objective = 0.0
         constraints = []
@@ -323,6 +394,7 @@ class DiscreteKinematicMPCCasadi(object):
         #     k4 = f(X[:, k] + dt * k3, U[:, k])
         #     x_next = X[:, k] + dt / 6 * (k1 + 2 * k2 + 2 * k3 + k4)
 
+        z_pred_list = [self.z_k]
         for k in range(self.horizon):
             # todo: create a new symbolic state for x_next and update it at each timestep using my integrator function
             # state model/dynamics constraints.  a=b or a-b
@@ -330,6 +402,7 @@ class DiscreteKinematicMPCCasadi(object):
             # z_dt = ode_symbolic * self.Ts
 
             z_next = self.ode_function(self.z_dv[:, k], self.u_dv[:, k])
+            z_pred_list.append(z_next)
 
             # A = self.symbol_type.eye(self.nx) + self.Ts * self.symbol_type.jacobian(ode_symbolic, self.z_dv[:, k])
             # B = self.Ts * self.symbol_type.jacobian(ode_symbolic, self.u_dv[:, k])
@@ -339,6 +412,8 @@ class DiscreteKinematicMPCCasadi(object):
             constraints.append(dynamics)  # todo: use casadi map or fold
 
         constraints = casadi.vertcat(*constraints)
+        z_pred_list = casadi.horzcat(*z_pred_list)
+        self.z_pred_dv = z_pred_list
 
         # Input Rate Bound Constraints (lbx)
         u_prev = self.u_prev
@@ -381,7 +456,53 @@ class DiscreteKinematicMPCCasadi(object):
         self.u_rate_dv = u_dot_list
 
         # Other Constraints.
-        # # e.g. things like collision avoidance or lateral acceleration bounds could go here.
+        # e.g. things like collision avoidance or lateral acceleration bounds could go here.
+        # add obstacle constraints
+        if self.n_obstacles > 0:
+            distance_expression_list = []
+
+            if self.collision_avoidance_scheme == 'cbf':
+                cbf_list = []  # same
+                h_k_list = []  # same
+
+            slack_obs_flag = int(not casadi.is_equal(
+                self.P_obstacle_avoidance, casadi.DM.zeros((self.n_obstacles, self.n_obstacles))))
+
+            for k in range(self.horizon):
+                ego_pose = self.z_dv[0:3, k]  # get ego position (x, y). self.z_dv[0:3, k], z_pred_list[0:3, k]
+                ego_pose_plus_1 = self.z_dv[0:3, k + 1]  # k + 1. self.z_dv[0:3, k + 1], z_pred_list[0:3, k + 1]
+                for i in range(self.n_obstacles):
+                    obstacle_state = self.obstacles[3 * i:3 * i + 3, k]  # get obstacle state (x, y, radius)
+                    obstacle_state_plus_1 = self.obstacles[3 * i:3 * i + 3, k + 1]
+                    distance_expression = casadi.sumsqr(
+                        ego_pose[0:2] - obstacle_state[0:2]
+                    )  # avoid norm_2 or sqrt since they have undefined derivatives at 0. casadi.sqrt(casadi.sumsqr(ego_pose[0:2] - obstacle_state[0:2])) is the same as casadi.norm_2(ego_pose[0:2] - obstacle_state[0:2])
+                    distance_expression -= (self.ego_radius + obstacle_state[
+                        2] + self.safe_distance - (slack_obs_flag * self.sl_obs_dv[:, k])) ** 2  # to avoid symbolic values in the LBG constraint. Square to avoid using sqrt in distance_expression above
+
+                    if self.collision_avoidance_scheme == "euclidean":
+                        distance_expression_list.append(distance_expression)
+                        lbg = casadi.vertcat(lbg, np.zeros((self.n_obstacles, 1)))  # 0
+                        ubg = casadi.vertcat(ubg, np.ones((self.n_obstacles, 1)) * np.inf)  # np.inf
+                    elif self.collision_avoidance_scheme == "cbf":
+                        h_k = distance_expression  # h(k)
+                        h_k_plus_1 = casadi.sumsqr(ego_pose_plus_1[0:2] - obstacle_state_plus_1[0:2]) - (self.ego_radius + obstacle_state_plus_1[2] + self.safe_distance - (slack_obs_flag * self.sl_obs_dv[:, k + 1])) ** 2  # h(k+1)
+                        delta_h_xk_uk = h_k_plus_1 - h_k
+                        distance_expression_list.append(delta_h_xk_uk + (self.gamma * h_k))
+                        lbg = casadi.vertcat(
+                            lbg, np.zeros((self.n_obstacles, 1)))
+                        ubg = casadi.vertcat(
+                            ubg, np.ones((self.n_obstacles, 1)) * np.inf)
+
+                        # h_k_list.append(h_k)
+                    else:
+                        distance_expression = casadi.DM(0)
+                        # todo: add other collision avoidance schemes
+            self.obstacle_distances = casadi.vertcat(*distance_expression_list)
+            constraints = casadi.vertcat(
+                constraints,
+                self.obstacle_distances
+            )
 
         # lbx = [-casadi.inf, -casadi.inf, vel_bound[0], -2 * casadi.pi] * (self.horizon + 1)  # state constraints
         # ubx = [casadi.inf, casadi.inf, vel_bound[1], 2 * casadi.pi] * (self.horizon + 1)  # state constraints
@@ -395,6 +516,10 @@ class DiscreteKinematicMPCCasadi(object):
         if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
             lbx = casadi.vertcat(lbx, casadi.DM.zeros((self.nu * self.horizon, 1)))
             ubx = casadi.vertcat(ubx, casadi.DM.zeros((self.nu * self.horizon, 1)))
+
+        if not casadi.is_equal(self.P_obstacle_avoidance, casadi.DM.zeros((self.n_obstacles, self.n_obstacles))):
+            lbx = casadi.vertcat(lbx, casadi.DM.zeros((self.n_obstacles * (self.horizon + 1), 1)))
+            ubx = casadi.vertcat(ubx, casadi.reshape(casadi.mtimes(casadi.DM.ones((self.horizon + 1)), self.slack_upper_bound_obstacle_avoidance.T), self.n_obstacles * (self.horizon + 1), 1))
 
         # state constraints (self.v_dv, vel_bound[1]). todo: add variable constraint for each shooting node, e.g [-casadi.inf] * (self.horizon + 1)
         lbx[0: self.nx * (self.horizon + 1): self.nx] = -casadi.inf  # X lower bound
@@ -495,6 +620,14 @@ class DiscreteKinematicMPCCasadi(object):
                         slack_weights = casadi.diag(self.P_u_rate)  # to convert to a column vector
                         cost += casadi.mtimes(slack_weights.T, self.sl_dv[:, k])  # slack cost
 
+                # slack cost for obstacle  avoidance
+                if not casadi.is_equal(self.P_obstacle_avoidance, casadi.DM.zeros((self.n_obstacles, self.n_obstacles))):
+                    if self.slack_objective_is_quadratic:
+                        cost += self._quad_form(self.sl_obs_dv[:, k], self.P_obstacle_avoidance)  # slack cost
+                    else:
+                        slack_weights = casadi.diag(self.P_obstacle_avoidance)  # to convert to a column vector
+                        cost += casadi.mtimes(slack_weights.T, self.sl_obs_dv[:, k])  # slack cost
+
         ''' Mayer/terminal cost '''
         cost += self._quad_form(self.z_dv[:, self.horizon] - self.z_ref[:, self.horizon], self.Qf)  # terminal state
 
@@ -502,11 +635,17 @@ class DiscreteKinematicMPCCasadi(object):
         return cost
 
     def setup_solver(self, cost, constraints, solver_type='nlp',
-                     solver_options=None, solver_='ipopt', suppress_output=True, use_nlp_interface_for_qp=True):
+                     solver_options=None, solver_='ipopt', suppress_output=True, use_nlp_interface_for_qp=True,
+                     overwrite_c_code=True):
+        # todo: setup overwriting c code by checking for 'nlp.so' and 'nlp.c' files. See my do_mpc mpc_setup script
         flat_z = casadi.reshape(self.z_dv, self.nx * (self.horizon + 1), 1)  # flatten (self.nx * (self.horizon + 1), 1)
         flat_u = casadi.reshape(self.u_dv, self.nu * self.horizon, 1)  # flatten (self.nu * self.horizon, 1)
         if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
             flat_sl = casadi.reshape(self.sl_dv, self.nu * self.horizon, 1)
+
+        if not casadi.is_equal(self.P_obstacle_avoidance, casadi.DM.zeros((self.n_obstacles, self.n_obstacles))) and self.n_obstacles > 0:
+            flat_sl_obs = casadi.reshape(self.sl_obs_dv, self.n_obstacles * (self.horizon + 1), 1)
+
         flat_z_ref = casadi.reshape(self.z_ref, self.nx * (self.horizon + 1),
                                     1)  # flatten (self.nx * (self.horizon + 1), 1)
         flat_z_k = casadi.reshape(self.z_k, self.nx, 1)
@@ -522,11 +661,22 @@ class DiscreteKinematicMPCCasadi(object):
         if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
             opt_variables = casadi.vertcat(opt_variables, flat_sl)
 
+        if not casadi.is_equal(self.P_obstacle_avoidance, casadi.DM.zeros((self.n_obstacles, self.n_obstacles))) and self.n_obstacles > 0:
+            opt_variables = casadi.vertcat(opt_variables, flat_sl_obs)
+
         opt_params = casadi.vertcat(
                 flat_z_ref,
                 flat_z_k,
                 flat_u_prev
         )  # casadi.vertcat(flat_z_ref, flat_u_ref)
+
+        if self.n_obstacles > 0:
+            flat_obstacles = casadi.reshape(self.obstacles, 3 * self.n_obstacles * (self.horizon + 1), 1)
+            opt_params = casadi.vertcat(
+                opt_params,
+                flat_obstacles,
+                self.ego_radius
+            )
 
         # lbg, ubg constraints (i.e dynamic constraints in the form of an equation)
         g = casadi.vertcat(constraints)
@@ -548,7 +698,7 @@ class DiscreteKinematicMPCCasadi(object):
                     ipopt_options = {
                         'ipopt.print_level': not suppress_output,
                         'ipopt.sb': 'yes',
-                        'ipopt.max_iter': 2000,
+                        'ipopt.max_iter': 100,  # 2000
                         'ipopt.acceptable_tol': 1e-8,
                         'ipopt.acceptable_obj_change_tol': 1e-6,
                         'error_on_fail': False,  # to raise an exception if the solver fails to find a solution
@@ -597,7 +747,7 @@ class DiscreteKinematicMPCCasadi(object):
                         ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.mu_init'] = 1e-5  # 1e-3
                         # ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.linear_solver'] = 'ma27'
                         ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.sb'] = 'yes'
-                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.max_iter'] = 2000
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.max_iter'] = 100  # 2000
                         ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.acceptable_tol'] = 1e-8
                         ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.acceptable_obj_change_tol'] = 1e-6
 
@@ -624,6 +774,7 @@ class DiscreteKinematicMPCCasadi(object):
         flags = ["-O3"]  # Linux/OSX. ['O3'] enables the most optimizations
         if compiler == "gcc":
             flags = [
+                # "-O3"
                 "-Ofast",  # enables even more optimization than -O3 but could be less precise/safe but is okay in most situations
                 "-march=native",  # optimizes for the specific hardware (CPU) but isn't transferable
                 "-fPIC",  # for shared_libraries
@@ -637,9 +788,9 @@ class DiscreteKinematicMPCCasadi(object):
                 "jit": True, "compiler": "shell", "jit_temp_suffix": False,
                 "jit_options": {
                     "flags": flags, "compiler": compiler, "verbose": True,
-                    "compiler_flags": flags
+                    # "compiler_flags": flags
                 }, # use ("compiler": "ccache gcc") if ccache is installed for a performance boost
-                'jit_cleanup': False  # True: delete fails on shutdown
+                'jit_cleanup': False  # True: delete files on shutdown
                        }
             solver_options.update(jit_options)
 
@@ -671,10 +822,10 @@ class DiscreteKinematicMPCCasadi(object):
                 qp_options = {
                     "qpsol": "nlpsol" if solver_ == "ipopt" else solver_,  # else solver_
                     "print_time": not suppress_output,
-                    # "convexify_strategy": "regularize",  # NONE|regularize|eigen- reflect|eigen-clip
-                    # "convexify_margin": 1e-4,
-                    "max_iter": 10,  # ipopt, 2000
-                    # "hessian_approximation": "exact",   # "limited-memory" (sqpmethod), "exact" (all plugins), "gauss-neuton" (scpgen). Feasiblesqpmethod only works with exact and get better performance with regularization
+                    "convexify_strategy": "regularize",  # NONE|regularize|eigen- reflect|eigen-clip
+                    "convexify_margin": 1e-4,
+                    "max_iter": 30,  # ipopt, 2000
+                    "hessian_approximation": "exact",   # "limited-memory" (sqpmethod), "exact" (all plugins), "gauss-neuton" (scpgen). Feasiblesqpmethod only works with exact and get better performance with regularization
                     # "tol_du": 1e-10,  # ipopt, qrqp
                     # "tol_pr": 1e-10,   # ipopt
                     # "min_step_size": 1e-14,  # ipopt, qrqp
@@ -682,16 +833,22 @@ class DiscreteKinematicMPCCasadi(object):
                     "print_header": not suppress_output,
                     "print_iteration": not suppress_output,
                     # 'init_feasible': True,  # for sqpmethod and feasiblesqpmethod plugins
-                    # "warmstart": True,  # for blocksqp plugin
+                    # "warmstart": True,  # for sqpmethod or blocksqp plugin (QRQP)
                     # "qp_init": True,  # for blocksqp plugin
+                    "expand": True
                 }
                 solver_options.update(qp_options)
 
                 common_qp_sol_options = {
                         "print_problem": not suppress_output,
                         "print_out": not suppress_output,
-                        "print_iter": not suppress_output,  # disable for osqp
+                        "print_iter": not suppress_output,  # disable for osqp/QPOases/ipopt
+                        "print_time": not suppress_output,
+                        # 'printLevel': 'none',  # For QPOases
                         "error_on_fail": False,
+                        # 'warm_start_dual': True,  # OSQP
+                        # 'warm_start_primal': True,  # OSQP
+                        'verbose': not suppress_output,
                         # "sparse": True, # (for QPOases only)
                     }  # common to ipopt and the QP solvers
 
@@ -719,15 +876,30 @@ class DiscreteKinematicMPCCasadi(object):
 
                 if self.code_gen_mode == 'external':
                     # Generate C code for the NLP functions. todo: rename the files
-                    solver.generate_dependencies("nlp.c")
+                    solver.generate_dependencies("casadi_nlp.c")
+
+                    if isinstance(compiler, str):
+                        compiler = compiler.split()
 
                     import subprocess
                     # On Windows, use other flags
-                    cmd_args = [compiler, "-shared"] + flags + ["nlp.c", "-o", "nlp.so"]
-                    subprocess.run(cmd_args)
+                    cmd_args = compiler + ["-shared"] + flags + ["casadi_nlp.c", "-o", "casadi_nlp.so"]
+                    try:
+                        result = subprocess.run(cmd_args, check=True, capture_output=True)
+                        if result.returncode != 0:
+                            print("Error:", result.returncode)
+                            print("Output:", result.stdout)
+                            print("Error output:", result.stderr)
+                    except subprocess.CalledProcessError as e:
+                        # print("Error:", e)
+                        # print("Return code:", e.returncode)
+                        # print("Error output:", e.stderr)
+                        if "ccache" in str(e) or "No such file or directory" in e.stderr:
+                            cmd_args.pop(0)
+                            result = subprocess.run(cmd_args, check=True, capture_output=True)
 
                     # Create a new NLP solver instance from the compiled code
-                    solver = casadi.nlpsol("solver", solver, "./nlp.so")
+                    solver = casadi.nlpsol("solver", solver, "./casadi_nlp.so")
 
         else:
             nlp_solver = solver_
@@ -738,15 +910,30 @@ class DiscreteKinematicMPCCasadi(object):
             solver = casadi.nlpsol('solver', nlp_solver, optimization_prob, solver_options)
             if self.code_gen_mode == 'external':
                 # Generate C code for the NLP functions. todo: rename the files
-                solver.generate_dependencies("nlp.c")
+                solver.generate_dependencies("casadi_nlp.c")
+
+                if isinstance(compiler, str):
+                    compiler = compiler.split()
 
                 import subprocess
                 # On Windows, use other flags
-                cmd_args = [compiler, "-shared"] + flags + ["nlp.c", "-o", "nlp.so"]
-                subprocess.run(cmd_args)
+                cmd_args = compiler + ["-shared"] + flags + ["casadi_nlp.c", "-o", "casadi_nlp.so"]
+                try:
+                    result = subprocess.run(cmd_args, check=True, capture_output=True)
+                    if result.returncode != 0:
+                        print("Error:", result.returncode)
+                        print("Output:", result.stdout)
+                        print("Error output:", result.stderr)
+                except subprocess.CalledProcessError as e:
+                    # print("Error:", e)
+                    # print("Return code:", e.returncode)
+                    # print("Error output:", e.stderr)
+                    if "ccache" in str(e) or "No such file or directory" in e.stderr:
+                        cmd_args.pop(0)
+                        result = subprocess.run(cmd_args, check=True, capture_output=True)
 
                 # Create a new NLP solver instance from the compiled code
-                solver = casadi.nlpsol("solver", nlp_solver, "./nlp.so")
+                solver = casadi.nlpsol("solver", nlp_solver, "./casadi_nlp.so")
         return solver, opt_variables, opt_params, g
 
     def update_initial_condition(self, x0, y0, vel0, psi0):
@@ -775,6 +962,20 @@ class DiscreteKinematicMPCCasadi(object):
     def update_u_rate(self, u_prev_value, u_dv_value):
         self.u_rate_dv_value = self.u_rate_func(u_prev_value, u_dv_value).full()
 
+    def update_obstacles_state(self, obstacles_state):
+        self.obstacles_value = obstacles_state
+
+    def update_obstacle_distances(self, z_k, z_dv, obstacles_state, ego_radius, slack_obs=None):
+        if slack_obs is None:
+            self.obstacle_distances_value = self.obstacle_distances_func(
+                z_k, z_dv, obstacles_state, ego_radius).full()
+        else:
+            self.obstacle_distances_value = self.obstacle_distances_func(
+                z_k, z_dv, obstacles_state, ego_radius, slack_obs).full()
+
+    def update_ego_radius(self, ego_radius):
+        self.ego_radius_value = self.ego_radius_func(ego_radius).full().item()
+
     def update(self, state=None, ref_traj=None, previous_input=None, warmstart_variables=None):
         self.update_initial_condition(*state)
         self.update_reference(*ref_traj)
@@ -785,7 +986,13 @@ class DiscreteKinematicMPCCasadi(object):
             self.z_dv_value = warmstart_variables['z_ws']
             self.u_dv_value = warmstart_variables['u_ws']
             if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
-                self.sl_dv_value = warmstart_variables['sl_ws']
+                if warmstart_variables.get('sl_ws', None) is not None:
+                    self.sl_dv_value = warmstart_variables['sl_ws']
+
+            if not casadi.is_equal(self.P_obstacle_avoidance,
+                                   casadi.DM.zeros((self.n_obstacles, self.n_obstacles))) and self.n_obstacles > 0:
+                if warmstart_variables.get('sl_obs_ws', None) is not None:
+                    self.sl_obs_dv_value = warmstart_variables['sl_obs_ws']
 
             # lagrange multipliers
             self.lam_x_value = warmstart_variables['lam_x']
@@ -800,6 +1007,7 @@ class DiscreteKinematicMPCCasadi(object):
         st = time.process_time()
 
         sl_mpc = np.zeros((self.horizon, self.nu))  # or return None
+        sl_obs_mpc = np.zeros((self.horizon, self.n_obstacles))
         try:
             """
             init_control, x0, opt_variables: [z_dv, u_dv], [(nx, horizon+1), (nu, horizon)]
@@ -813,13 +1021,28 @@ class DiscreteKinematicMPCCasadi(object):
                     casadi.reshape(self.u_dv_value, self.nu * self.horizon, 1)
             )
             if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
-                opt_variables = casadi.vertcat(opt_variables, casadi.reshape(self.sl_dv_value, self.nu * self.horizon, 1))
+                opt_variables = casadi.vertcat(opt_variables,
+                                               casadi.reshape(self.sl_dv_value, self.nu * self.horizon, 1))
+
+            if not casadi.is_equal(self.P_obstacle_avoidance,
+                                   casadi.DM.zeros((self.n_obstacles, self.n_obstacles))) and self.n_obstacles > 0:
+                opt_variables = casadi.vertcat(opt_variables,
+                                               casadi.reshape(self.sl_obs_dv_value, self.n_obstacles * (self.horizon + 1), 1))
 
             opt_parameters = casadi.vertcat(
                     casadi.reshape(self.z_ref_value, self.nx * (self.horizon + 1), 1),
                     casadi.reshape(self.z_k_value, self.nx, 1),
                     casadi.reshape(self.u_prev_value, self.nu, 1)
             )
+
+            if self.n_obstacles > 0:
+                # todo: update obstacles state
+                # self.update_obstacles_state(self.obstacles_value)  # todo: do this in the ROS node
+                opt_parameters = casadi.vertcat(
+                    opt_parameters,
+                    casadi.reshape(self.obstacles_value, 3 * self.n_obstacles * (self.horizon + 1), 1),
+                    self.ego_radius_value
+                )
 
             dual_variables = {}
             if self.warmstart:
@@ -857,6 +1080,13 @@ class DiscreteKinematicMPCCasadi(object):
                                         self.horizon).full()
                 # sl_mpc = casadi.reshape(g[self.nx * (self.horizon + 1) + self.nu * self.horizon:], self.nu, -1).full()  # wrong.
 
+            if not casadi.is_equal(self.P_obstacle_avoidance,
+                                   casadi.DM.zeros((self.n_obstacles, self.n_obstacles))) and self.n_obstacles > 0:
+                sl_obs_mpc = casadi.reshape(sol[(
+                        self.nx * (self.horizon + 1) + (self.nu * self.horizon) + (self.nu * self.horizon)):(
+                        self.nx * (self.horizon + 1) + (self.nu * self.horizon) + (self.nu * self.horizon)) + (self.n_obstacles * (self.horizon + 1))], self.n_obstacles,
+                                        self.horizon + 1).full()
+
             # evaluate/calculate u_rate
             self.update_u_rate(self.u_prev_value, u_mpc)
             u_rate = self.u_rate_dv_value
@@ -866,7 +1096,17 @@ class DiscreteKinematicMPCCasadi(object):
             z_k_value = casadi.reshape(
                 opt_parameters[self.nx * (self.horizon + 1):self.nx * (self.horizon + 1) + self.nx],
                 self.nx, 1).full()
-            u_prev_value = casadi.reshape(opt_parameters[self.nx * (self.horizon + 1) + self.nx:], self.nu, 1).full()
+            u_prev_value = casadi.reshape(
+                    opt_parameters[self.nx * (self.horizon + 1) + self.nx:self.nx * (self.horizon + 1) + self.nx + self.nu],
+                    self.nu, 1).full()
+            if self.n_obstacles > 0:
+                obstacles_value = casadi.reshape(
+                    opt_parameters[self.nx * (self.horizon + 1) + self.nx + self.nu:self.nx * (self.horizon + 1) + self.nx + self.nu + (3 * self.n_obstacles * (self.horizon + 1))],
+                    3 * self.n_obstacles, self.horizon + 1).full()
+                ego_radius_value = casadi.reshape(
+                        opt_parameters[self.nx * (self.horizon + 1) + self.nx + self.nu + (3 * self.n_obstacles * (self.horizon + 1))],
+                        1, 1).full().item()
+
             try:
                 iteration_count = self.solver.stats()['iter_count']  # sol.stats()["iter_count"]
             except KeyError:
@@ -874,6 +1114,11 @@ class DiscreteKinematicMPCCasadi(object):
                 iteration_count = -1
             is_opt = True  # self.solver.stats()['success']
             success = self.solver.stats()['success']
+            return_status = self.solver.stats()['return_status']
+            unified_return_status = self.solver.stats()['unified_return_status']
+            if not success:
+                print(f"Return status: {return_status}, unified return status: {unified_return_status}")
+            solve_time = self.solver.stats()['t_wall_total']
 
             # Useful fo debugging and checking solver stats
             initial_condition_constraint = casadi.reshape(g[:self.nx], self.nx, 1)
@@ -885,6 +1130,13 @@ class DiscreteKinematicMPCCasadi(object):
             u_rate_ii = casadi.reshape(g[self.nx + (self.nx * self.horizon) + self.nu * self.horizon:self.nx + (self.nx *
                     self.horizon) + (self.nu * self.horizon) + (self.nu * self.horizon)], self.nu, -1).full()
             ''' u_rate = u_rate_i - sl_mpc or -u_rate_ii + sl_mpc '''
+
+            if self.n_obstacles > 0:
+                # update obstacle distances
+                if casadi.is_equal(self.P_obstacle_avoidance, casadi.DM.zeros((self.n_obstacles, self.n_obstacles))):
+                    self.update_obstacle_distances(z_k_value, z_mpc, self.obstacles_value, self.ego_radius_value)
+                else:
+                    self.update_obstacle_distances(z_k_value, z_mpc, self.obstacles_value, self.ego_radius_value, sl_obs_mpc)
 
             # # get functions used by the solver.
             # # Could be useful when replacing default functions.
@@ -958,7 +1210,7 @@ class DiscreteKinematicMPCCasadi(object):
             lam_x = np.zeros_like(opt_parameters)  # lagrange multipliers (optimization variables)
             lam_p = np.zeros_like(opt_parameters)  # lagrange multipliers (parameters)
 
-        solve_time = time.process_time() - st  # self.solver.stats()['t_wall_nlp_f']  # t_wall_total
+            solve_time = time.process_time() - st  # self.solver.stats()['t_wall_total']
 
         sol_dict = {'u_control': u_mpc[:, 0],
                     'u_mpc': u_mpc,
@@ -966,6 +1218,7 @@ class DiscreteKinematicMPCCasadi(object):
                     'u_rate': u_rate,
                     'u_prev': u_prev_value,
                     'sl_mpc': sl_mpc,
+                    'sl_obs_mpc': sl_obs_mpc,
                     'z_ref': z_ref.T,
                     'optimal': is_opt,
                     'solve_time': solve_time,  # todo: get from solver time

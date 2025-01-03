@@ -883,7 +883,7 @@ def s_curve_velocity_profile(distance, max_vel, accel, decel, jerk):
 def generate_reference_trajectory_by_interpolation(trajectory, init_pose, closest_index, waypoint_keys_to_columns,
                                                    horizon, v_target=None, dt=0.02):
     # (3) Find the reference trajectory using distance or time interpolation.
-    #     WARNING: this function does not handle well the case where the car is far from the recorded path!
+    #     WARNING: this function does not correctly handle cases where the car is far from the recorded path!
     #     Ill-defined behavior/speed.
     #     Could use the actual minimum distance and add appropriate logic to handle this edge case.
 
