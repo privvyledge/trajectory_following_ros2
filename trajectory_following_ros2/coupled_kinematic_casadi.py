@@ -179,9 +179,8 @@ class KinematicCoupledCasadi(Node):
         self.declare_parameter('twist_topic', '/cmd_vel')
         self.declare_parameter('ego_radius', -1.0)
         self.declare_parameter('obstacle_collision_avoidance_method', "euclidean")
-        if OBSTACLES_AVAILABLE:
-            self.declare_parameter('obstacle_topic', '/fake_obstacles/object_array')  # /fake_obstacles/object_array or /carla/ego_vehicle/objects
-            self.declare_parameter('num_obstacles', 2)
+        self.declare_parameter('obstacle_topic', '/fake_obstacles/object_array')  # /fake_obstacles/object_array or /carla/ego_vehicle/objects
+        self.declare_parameter('num_obstacles', 2)
 
         self.declare_parameter('desired_speed', 0.0)  # todo: get from topic/trajectory message
         self.declare_parameter('loop', False)  # todo: remove and pass to waypoint publisher
@@ -264,9 +263,10 @@ class KinematicCoupledCasadi(Node):
             self.ego_radius = self.ego_radius_carla / 1.3  # divide by 1.3 to reduce the radius so its not too wide. todo: remove division by 2
 
         self.obstacles = []
-        if OBSTACLES_AVAILABLE:
-            self.obstacle_topic = self.get_parameter('obstacle_topic').value
-            self.num_obstacles = self.get_parameter('num_obstacles').value
+        self.obstacle_topic = self.get_parameter('obstacle_topic').value
+        self.num_obstacles = self.get_parameter('num_obstacles').value
+        self.n_obstacle_states = 3  # x, y, radius
+        self.obstacle_states = None
 
         self.desired_speed = self.get_parameter('desired_speed').value
         self.loop = self.get_parameter('loop').value
@@ -826,13 +826,33 @@ class KinematicCoupledCasadi(Node):
                                                      reference_traj['vel_ref'], reference_traj['yaw_ref']],
                                            previous_input=[self.uk[0, 0], self.uk[1, 0]],
                                            warmstart_variables=self.warmstart_variables)
-                    # update the obstacle states
-                    obstacle_states = np.zeros((3 * self.num_obstacles, self.horizon + 1))
+
+                # collision avoidance
+                if self.num_obstacles > 0:
+                    # todo: add obstacle avoidance to opti and continuous model
+                    if self.use_opti or self.model_type != 'discrete':
+                        raise NotImplementedError("For now obstacle avoidance is not supported with the Opti stack or the continuous model. Will be added soon.")
+
+                    # initialize the obstacle state matrix
+                    if self.obstacle_states is None:
+                        self.obstacle_states = np.ones(
+                                (self.n_obstacle_states * self.num_obstacles,
+                                 self.horizon + 1)) * 1000.0  # setting to inf leads to infeasibilities
+                        self.obstacle_states[2, :] = 1.0  # modify the radius to a small value
+
+                    # update the obstacle states.
                     for k in range(self.horizon):
                         for j in range(self.num_obstacles):
-                            obstacle_states[3 * j:3 * j + 3, k] = self.obstacles[j]['state']
+                            # todo: add symbolic expression for obstacle state evolution, e.g kinematic model for cars, and other models e.g pedestrians.
+                            # todo: add object tracking node to get the states
+                            if len(self.obstacles) > j:
+                                # if there are more (or equal) obstacles detected than required
+                                self.obstacle_states[3 * j:3 * j + 3, k] = self.obstacles[j]['state']
+                            else:
+                                # modify the xy to a large value and the radius to a small value
+                                self.obstacle_states[3 * j:3 * j + 3, k] = np.array([1000.0, 1000.0, 1.0])
 
-                    self.controller.update_obstacles_state(obstacle_states)
+                    self.controller.update_obstacles_state(self.obstacle_states)
 
                 start_time = time.process_time()
                 start_time_ = self.get_clock().now()
@@ -921,7 +941,7 @@ class KinematicCoupledCasadi(Node):
                 self.warmstart_variables['lam_x'] = solution_dict['lam_x']
                 self.warmstart_variables['lam_g'] = solution_dict['lam_g']
                 self.warmstart_variables['lam_p'] = solution_dict['lam_p']
-                self.warmstart_variables['sl_obs_ws'] = solution_dict.get('sl_obs_ws', None)
+                self.warmstart_variables['sl_obs_ws'] = solution_dict.get('sl_obs_ws', None)  # obstacle avoidance slack
 
                 # solver stats
                 solver_stats = solution_dict['solver_stats']
@@ -980,9 +1000,10 @@ class KinematicCoupledCasadi(Node):
                 self.get_logger().info(
                     f"Ego state: [{self.x}, {self.y}, {self.ego_radius}]")
 
-                for i in range(self.num_obstacles):
-                    self.get_logger().info(
-                        f"Obstacle state: [{self.obstacles[i]['position'][0:2]}, {self.obstacles[i]['radius']}]. Distance: {self.obstacles[i]['distance']} \n ")
+                if len(self.obstacles) > 0:
+                    for i in range(min(self.num_obstacles, len(self.obstacles))):
+                        self.get_logger().info(
+                            f"Obstacle state: [{self.obstacles[i]['position'][0:2]}, {self.obstacles[i]['radius']}]. Distance: {self.obstacles[i]['distance']} \n ")
 
                 self.run_count += 1
 
