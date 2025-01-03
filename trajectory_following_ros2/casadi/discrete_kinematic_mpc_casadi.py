@@ -55,7 +55,7 @@ class DiscreteKinematicMPCCasadi(object):
                  code_gen_mode='jit',
                  num_obstacles=1, collision_avoidance_scheme='cbf',
                  ego_radius=None,
-                 slack_weights_obstacle_avoidance=(1.0, 1.0), slack_upper_bound_obstacle_avoidance=None):
+                 slack_weights_obstacle_avoidance=None, slack_upper_bound_obstacle_avoidance=None):
         """Constructor for KinematicMPCCasadi"""
         self.horizon = horizon
         self.nx = nx
