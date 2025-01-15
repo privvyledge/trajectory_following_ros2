@@ -843,11 +843,11 @@ class KinematicCoupledCasadi(Node):
                     # update the obstacle states.
                     for k in range(self.horizon):
                         for j in range(self.num_obstacles):
-                            # todo: add symbolic expression for obstacle state evolution, e.g kinematic model for cars, and other models e.g pedestrians.
+                            # todo: add symbolic expression to casadi or linear prediction here to numpy, obs[k + 1] = obs[k] + (obs[k] - obs[k - 1]) for k > 0, for obstacle state evolution, e.g kinematic model for cars, and other models e.g pedestrians.
                             # todo: add object tracking node to get the states
                             if len(self.obstacles) > j:
                                 # if there are more (or equal) obstacles detected than required
-                                self.obstacle_states[3 * j:3 * j + 3, k] = self.obstacles[j]['state']
+                                self.obstacle_states[3 * j:3 * j + 3, k] = self.obstacles[j]['state']  # the current obstacle position
                             else:
                                 # modify the xy to a large value and the radius to a small value
                                 self.obstacle_states[3 * j:3 * j + 3, k] = np.array([1000.0, 1000.0, 1.0])
@@ -1045,25 +1045,25 @@ class KinematicCoupledCasadi(Node):
         # saturate inputs
         if self.saturate_input:
             if not(self.MAX_DECEL <= self.acc_cmd <= self.MAX_ACCEL):
-                self.get_logger().info(f"Accel command of {self.acc_cmd} is out of bounds. Saturating..")
+                self.get_logger().info(f"Accel command of {self.acc_cmd} is out of bounds. Saturating to {self.MAX_ACCEL if self.acc_cmd > 0 else self.MAX_DECEL} ...")
             self.acc_cmd = np.clip(self.acc_cmd, self.MAX_DECEL, self.MAX_ACCEL)
 
             if not(self.MIN_STEER_ANGLE <= self.delta_cmd <= self.MAX_STEER_ANGLE):
-                self.get_logger().info(f"Steer command of {self.delta_cmd} is out of bounds. Saturating..")
+                self.get_logger().info(f"Steer command of {self.delta_cmd} is out of bounds. Saturating to {self.MAX_STEER_ANGLE if self.delta_cmd > 0 else self.MIN_STEER_ANGLE} ...")
             self.delta_cmd = np.clip(self.delta_cmd, self.MIN_STEER_ANGLE, self.MAX_STEER_ANGLE)
 
             if not(self.MIN_SPEED <= self.velocity_cmd <= self.MAX_SPEED):
-                self.get_logger().info(f"Velocity command of {self.velocity_cmd} is out of bounds. Saturating..")
+                self.get_logger().info(f"Velocity command of {self.velocity_cmd} is out of bounds. Saturating to {self.MAX_SPEED if self.velocity_cmd > 0 else self.MIN_SPEED} ...")
             self.velocity_cmd = np.clip(self.velocity_cmd, self.MIN_SPEED, self.MAX_SPEED)
 
             if self.jerk_cmd:
                 if not(self.MIN_JERK <= self.jerk_cmd <= self.MAX_JERK):
-                    self.get_logger().info(f"Jerk command of {self.jerk_cmd} is out of bounds. Saturating..")
+                    self.get_logger().info(f"Jerk command of {self.jerk_cmd} is out of bounds. Saturating to {self.MAX_JERK if self.jerk_cmd > 0 else self.MIN_JERK} ...")
                 self.jerk_cmd = np.clip(self.jerk_cmd, self.MIN_JERK, self.MAX_JERK)
 
             if self.delta_rate_cmd:
                 if not(-self.MAX_STEER_RATE <= self.delta_rate_cmd <= self.MAX_STEER_RATE):
-                    self.get_logger().info(f"Steer rate command of {self.delta_rate_cmd} is out of bounds. Saturating..")
+                    self.get_logger().info(f"Steer rate command of {self.delta_rate_cmd} is out of bounds. Saturating to {self.MAX_STEER_RATE if self.delta_rate_cmd > 0 else -self.MAX_STEER_RATE} ...")
                 self.delta_rate_cmd = np.clip(self.delta_rate_cmd, -self.MAX_STEER_RATE, self.MAX_STEER_RATE)
 
     def publish_command(self):

@@ -162,6 +162,10 @@ class DiscreteKinematicMPCCasadi(object):
         self.lam_p_value = None
 
         self.n_obstacles = num_obstacles
+        self.P_obstacle_avoidance = casadi.diag(
+            slack_weights_obstacle_avoidance) if slack_weights_obstacle_avoidance is not None else casadi.DM.zeros(
+            self.n_obstacles,
+            self.n_obstacles)  # >= 0,should be small, for soft constraints and large for hard constraints. 0 to disable
         self.ego_radius = None
         self.ego_radius_value = ego_radius
         self.obstacles = None
@@ -172,9 +176,6 @@ class DiscreteKinematicMPCCasadi(object):
             if slack_weights_obstacle_avoidance is not None and collision_avoidance_scheme == 'cbf':
                 raise NotImplementedError("The slack formulation with CBF isn't correct.")
 
-            self.P_obstacle_avoidance = casadi.diag(slack_weights_obstacle_avoidance) if slack_weights_obstacle_avoidance is not None else casadi.DM.zeros(
-                self.n_obstacles,
-                self.n_obstacles)  # >= 0,should be small, for soft constraints and large for hard constraints. 0 to disable
             # set the positive slack upper bound
             if slack_upper_bound_obstacle_avoidance is not None and isinstance(slack_upper_bound_obstacle_avoidance, (list, tuple, np.ndarray)):
                 if isinstance(slack_upper_bound_obstacle_avoidance, np.ndarray):
