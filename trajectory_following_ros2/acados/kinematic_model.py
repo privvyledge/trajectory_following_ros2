@@ -7,6 +7,7 @@ See:
     * https://github.com/mlab-upenn/mpcc/blob/master/scripts/acados/acados_settings.py#L126
 
 Todo: get actuation limit values from arguments instead of hardcoding here
+Todo: add angle normalization logic
 """
 
 import types
@@ -70,6 +71,32 @@ def kinematic_model(symbol_type='SX'):
             psidot
     )
 
+    # augmented states, controls and state derivatives
+    jerk = symbol.sym("jerk")
+    delta_rate = symbol.sym("delta_rate")
+    normalized_yaw_error = symbol.sym("normalized_yaw_error")  # todo: make this a parameter/function
+    z_aug = vertcat(
+            z,
+            u,
+            # normalized_yaw_error
+    )  # augmented states
+
+    u_aug = vertcat(
+            jerk,
+            delta_rate
+    )  # augmented controls
+
+    accdot = symbol.sym("accdot")
+    deltadot = symbol.sym("deltadot")
+    normalized_yaw_errordot = symbol.sym("normalized_yaw_errordot")
+
+    zdot_aug = vertcat(
+            zdot,
+            accdot,
+            deltadot,
+            # normalized_yaw_errordot
+    )
+
     # algebraic variables
     algebraic_variables = vertcat([])
 
@@ -93,7 +120,9 @@ def kinematic_model(symbol_type='SX'):
             vel * cos(psi),
             vel * sin(psi),
             acc,
-            (vel / wheelbase) * tan(delta)
+            (vel / wheelbase) * tan(delta),
+            jerk,
+            delta_rate,
     )  # continuous non-linear model
 
     '''Constraints/bounds. 
@@ -118,8 +147,15 @@ def kinematic_model(symbol_type='SX'):
     model.delta_min = -np.radians(27.0)  # minimum steering angle [rad]
     model.delta_max = np.radians(27.0)  # maximum steering angle [rad]
 
+    # augmented bounds (inputs)
+    model.jerk_min = -1.5
+    model.jerk_max = 1.5
+
+    model.delta_rate_min = -np.radians(360.0)
+    model.delta_rate_max = np.radians(360.0)
+
     # Define initial conditions
-    model.x0 = np.array([0., 0., 0., 0.])
+    model.x0 = np.array([0., 0., 0., 0., 0., 0.])  # x, y, vel, psi, acc, delta
 
     # # Define constraints struct
     # constraint.expr = vertcat(
@@ -134,9 +170,9 @@ def kinematic_model(symbol_type='SX'):
     model.f_impl_expr = zdot - f_expl
     model.f_expl_expr = f_expl
     # model.f_disk = discretizer(x_k, u_k, p_k)  # provide function
-    model.x = z
-    model.xdot = zdot
-    model.u = u
+    model.x = z_aug
+    model.xdot = zdot_aug
+    model.u = u_aug
     model.z = algebraic_variables
     model.p = parameters
     model.name = model_name

@@ -63,6 +63,7 @@ import queue
 import threading
 import numpy as np
 import scipy
+from scipy.spatial.distance import cdist
 from scipy import interpolate
 
 import rclpy
@@ -143,7 +144,7 @@ class KinematicCoupledAcadosMPCNode(Node):
                                                                'Since Carla does not use the odom frame, '
                                                                'set to "map", '
                                                                'otherwise use "odom".'))  # global frame: odom, map
-        self.declare_parameter('ode_type', "continuous_kinematic_coupled")  # todo: also augmented, etc
+        self.declare_parameter('ode_type', "continuous_kinematic_coupled_augmented")  # todo: also augmented, etc
         self.declare_parameter('stage_cost_type', "NONLINEAR_LS")  # Acados specific (LINEAR_LS, NONLINEAR_LS, EXTERNAL)
         self.declare_parameter('terminal_cost_type', "NONLINEAR_LS")  # Acados specific (LINEAR_LS, NONLINEAR_LS, EXTERNAL)
         self.declare_parameter('control_rate', 20.0)
@@ -158,6 +159,8 @@ class KinematicCoupledAcadosMPCNode(Node):
 
         np.set_printoptions(suppress=True)
         # MPC Parameters
+        self.declare_parameter('min_jerk', -1.5)  # in m/s^3
+        self.declare_parameter('max_jerk', 1.5)  # in m/s^3
         self.declare_parameter('max_steer_rate', 60 / 0.17)  # in degrees
         self.declare_parameter('max_speed', 1.5)  # in m/s
         self.declare_parameter('min_speed', -1.5)  # in m/s
@@ -197,8 +200,13 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('build_with_cython', True)  # whether to use cython (recommended) or ctypes
         self.declare_parameter('model_directory',
                                '/f1tenth_ws/src/trajectory_following_ros2/data/model')  # don't use absolute paths
+        self.declare_paramter('augment_parameters', True)
 
         # get parameter values
+        self.ode_type = self.get_parameter('ode_type').value
+        self.model_type = 'continuous' if 'continuous' in self.ode_type else 'discrete'
+        self.model_is_augmented = 'augmented' in self.ode_type
+        self.augment_parameters = self.get_parameter('augment_parameters').value
         self.robot_frame = self.get_parameter('robot_frame').value
         self.global_frame = self.get_parameter('global_frame').value
         self.control_rate = self.get_parameter('control_rate').value
@@ -209,6 +217,8 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.WHEELBASE = self.get_parameter('wheelbase').value  # [m] wheelbase of the vehicle
         self.MAX_STEER_ANGLE = math.radians(self.get_parameter('max_steer').value)
         self.MIN_STEER_ANGLE = math.radians(self.get_parameter('min_steer').value)
+        self.MIN_JERK = self.get_parameter('min_jerk').value
+        self.MAX_JERK = self.get_parameter('max_jerk').value
         self.MAX_STEER_RATE = math.radians(self.get_parameter('max_steer_rate').value)
         self.MAX_SPEED = self.get_parameter('max_speed').value
         self.MIN_SPEED = self.get_parameter('min_speed').value
@@ -224,14 +234,21 @@ class KinematicCoupledAcadosMPCNode(Node):
 
         self.NX = self.get_parameter('n_states').value
         self.NU = self.get_parameter('n_inputs').value
-        self.R = np.diag(self.get_parameter('R').value)
-        self.Rd = np.diag(self.get_parameter('Rd').value)
-        self.Q = np.diag(self.get_parameter('Q').value)
-        self.Qf = self.get_parameter('Qf').value
+        self.R = np.diag(self.get_parameter('R').get_parameter_value().double_array_value)
+        self.Rd = np.diag(self.get_parameter('Rd').get_parameter_value().double_array_value)
+        self.Q = np.diag(self.get_parameter('Q').get_parameter_value().double_array_value)
+        self.Qf = self.get_parameter('Qf').get_parameter_value().double_array_value
         if self.Qf is not None:
-            self.Qf = np.diag(self.get_parameter('Qf').value)
+            self.Qf = np.diag(self.get_parameter('Qf').get_parameter_value().double_array_value)
         else:
             self.Qf = self.Q
+
+        if self.model_is_augmented and self.augment_parameters:
+            self.NX = self.NX + self.NU
+            self.Q = scipy.linalg.block_diag(self.Q, self.R)
+            self.Qf = scipy.linalg.block_diag(self.Qf, self.R)
+            self.R = self.Rd
+
         self.scale_cost = self.get_parameter('scale_cost').value
         self.horizon = int(self.get_parameter('horizon').value)
         self.prediction_time = self.get_parameter('prediction_time').value
@@ -240,7 +257,6 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.termination_condition = self.get_parameter('termination_condition').value
 
         # initialize variables
-        self.ode_type = self.get_parameter('ode_type').value
         self.stage_cost_type = self.get_parameter('stage_cost_type').value
         self.terminal_cost_type = self.get_parameter('terminal_cost_type').value
         self.path_topic = self.get_parameter('path_topic').value
@@ -260,7 +276,6 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.build_with_cython = self.get_parameter('build_with_cython').value
         self.model_directory = self.get_parameter('model_directory').value
 
-        self.model_type = 'continuous' if 'continuous' in self.ode_type else 'discrete'
         self.dt = self.sample_time = 1 / self.control_rate  # [s] sample time. # todo: get from ros Duration
         if (self.prediction_time is None) or (self.prediction_time == 0.0):
             self.prediction_time = self.sample_time * self.horizon
@@ -272,8 +287,9 @@ class KinematicCoupledAcadosMPCNode(Node):
                                      )
 
         self.acc_cmd, self.delta_cmd, self.velocity_cmd = 0.0, 0.0, 0.0
-        self.zk = np.zeros((self.NX, 1))  # x, y, psi, velocity, psi
-        self.uk = np.array([[self.acc_cmd, self.delta_cmd]]).T
+        self.jerk_cmd, self.delta_rate_cmd = None, None
+        self.zk = np.zeros((self.NX, 1))  # x, y, psi, velocity, psi, acceleration, delta
+        self.uk = np.zeros((self.NU, 1)) # np.array([[self.jerk_cmd, self.delta_rate_cmd]]).T
         self.u_prev = np.zeros((self.NU, 1))
 
         self.xref = np.zeros((self.horizon + 1, self.NX))
@@ -289,12 +305,15 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.trajectory_initialized = False
         self.x = 0.0  # todo: remove
         self.y = 0.0  # todo: remove
-        self.yaw = 0.0  # todo: remove
         self.speed = 0.0  # todo: just use vx
+        self.yaw = 0.0  # todo: remove
         self.omega = 0.0  # todo: remove
         self.direction = 1.0
         self.yaw_rate = 0.0  # todo: remove
         self.acceleration = 0.0  # todo: remove
+        self.delta = 0.0  # todo: remove
+        self.jerk = 0.0
+        self.delta_rate = 0.0
         self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))  # todo: remove
         self.rear_y = self.y - ((self.WHEELBASE / 2) * math.sin(self.yaw))  # todo: remove
         self.location = [self.x, self.y]  # todo: remove
@@ -331,11 +350,13 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.solver_iteration_count = 0
         self.run_count = 0
         self.solution_status = False
+        self.warmstart_variables = {}
 
         self.constraint = None
         self.model = None
         self.controller = None
         self.ocp = None
+        self.previous_time = None
 
         # Setup queues for multi-thread access
         self.mutex = threading.Lock()  # or threading.RLock()
@@ -700,6 +721,8 @@ class KinematicCoupledAcadosMPCNode(Node):
             y = self.y
             vel = self.speed
             psi = self.yaw
+            acceleration = self.acc_cmd  # self.acceleration
+            delta = self.delta_cmd
             omega = self.omega
 
             # update trajectory state and reference
@@ -751,6 +774,8 @@ class KinematicCoupledAcadosMPCNode(Node):
                 self.delta_cmd = 0.0
                 self.acc_cmd = 0.0
                 self.velocity_cmd = 0.0
+                self.jerk_cmd = 0.0
+                self.delta_rate_cmd = 0.0
                 self.publish_command()
                 return
 
@@ -767,6 +792,8 @@ class KinematicCoupledAcadosMPCNode(Node):
                 self.zk[1, 0] = y
                 self.zk[2, 0] = vel
                 self.zk[3, 0] = psi
+                self.zk[4, 0] = acceleration
+                self.zk[5, 0] = delta
                 # # normalize the angle from -pi to pi or [0, 2PI). todo. See: https://github.com/bzarr/TUM-CONTROL/blob/main/Model_Predictive_Controller/Nominal_NMPC/NMPC_STM_acados_settings.py#L41
                 # psi = (psi + math.pi) % (2 * math.pi) - math.pi
 
@@ -782,22 +809,22 @@ class KinematicCoupledAcadosMPCNode(Node):
                 # current_speed = self.speed
 
                 # initial condition. todo: set vel and other constraints
-                self.controller.constraints_set(0, "lbx", np.array([x, y, vel, psi]))  # zk.flatten()
-                self.controller.constraints_set(0, "ubx", np.array([x, y, vel, psi]))
+                self.controller.constraints_set(0, "lbx", np.array([x, y, vel, psi, acceleration, delta]))  # zk.flatten()
+                self.controller.constraints_set(0, "ubx", np.array([x, y, vel, psi, acceleration, delta]))
 
                 # update reference. todo: initialize arrays at the top
                 for j in range(self.horizon):
                     # yref_old = np.array(
                     #         [xref[0, j], xref[1, j], xref[2, j], xref[3, j], 0, 0])  # reference state and input. todo: remove
                     yref = np.array(
-                            [xref[0, j], xref[1, j], xref[2, j], xref[3, j]])  # reference state and input
+                            [xref[0, j], xref[1, j], xref[2, j], xref[3, j], 0.0, 0.0])  # reference state and input
 
                     if self.stage_cost_type in ['LINEAR_LS', 'NONLINEAR_LS']:
                         # self.controller.cost_set(j, "yref",
                         #                          yref.flatten())  # update reference, cost_set(j, "yref", yref). todo: remove
                         self.controller.cost_set(j, "yref",
-                                                 np.hstack([yref.reshape(1, -1), np.zeros((1,
-                                                                                           2))]).flatten())  # update reference, cost_set(j, "yref", yref)
+                                                 np.hstack([yref.reshape(1, -1),
+                                                            np.zeros((1, 2))]).flatten())  # update reference, cost_set(j, "yref", yref)
 
                     '''
                     set the value of parameters: wheelbase, zref, uref, z_k, u_prev
@@ -818,7 +845,9 @@ class KinematicCoupledAcadosMPCNode(Node):
                 yref_N = np.array([xref[0, self.horizon],
                                    xref[1, self.horizon],
                                    xref[2, self.horizon],
-                                   xref[3, self.horizon]])  # terminal state
+                                   xref[3, self.horizon],
+                                   0.0,
+                                   0.0])  # terminal state
                 if self.terminal_cost_type in ['LINEAR_LS', 'NONLINEAR_LS']:
                     self.controller.set(self.horizon, "yref", yref_N.flatten())
                 self.controller.set(self.horizon,
@@ -893,18 +922,23 @@ class KinematicCoupledAcadosMPCNode(Node):
                 predicted_y_state = solution_dict['z_mpc'][1, :].reshape(-1, 1)
                 predicted_vel_state = solution_dict['z_mpc'][2, :].reshape(-1, 1)
                 predicted_psi_state = solution_dict['z_mpc'][3, :].reshape(-1, 1)
-                predicted_acc = solution_dict['u_mpc'][0, :].reshape(-1, 1)
-                predicted_delta = solution_dict['u_mpc'][1, :].reshape(-1, 1)
+                predicted_acc = solution_dict['z_mpc'][4, :].reshape(-1, 1)
+                predicted_delta = solution_dict['z_mpc'][5, :].reshape(-1, 1)
+                predicted_jerk = solution_dict['u_mpc'][0, :].reshape(-1, 1)
+                predicted_delta_rate = solution_dict['u_mpc'][1, :].reshape(-1, 1)
                 self.mpc_predicted_states[:, :] = np.hstack([predicted_x_state, predicted_y_state,
-                                                             predicted_vel_state, predicted_psi_state])
-                self.mpc_predicted_inputs[:, :] = np.hstack([predicted_acc, predicted_delta])
+                                                             predicted_vel_state, predicted_psi_state,
+                                                             predicted_acc, predicted_delta])
+                self.mpc_predicted_inputs[:, :] = np.hstack([predicted_jerk, predicted_delta_rate])
 
-                self.acc_cmd = u[0]
-                self.delta_cmd = u[1]
+                self.jerk_cmd = u[0]
+                self.delta_rate_cmd = u[1]
                 '''To get the velocity command: use either of the following:
                 1: Predicted velocity[k+1], i.e predicted_vel_state[1, 0]. [k + 1]
                 2: Current_velocity + integrate(acceleration), i.e current_speed + self.acc_cmd * self.sample_time
                 '''
+                self.acc_cmd = predicted_acc[1, 0]  # acc + self.jerk_cmd * self.sample_time
+                self.delta_cmd = predicted_delta[1, 0]  # delta + self.delta_rate_cmd * self.sample_time
                 self.velocity_cmd = predicted_vel_state[1, 0]  # float(predicted_vel_state[1])
                 # self.velocity_cmd = vel + self.acc_cmd * self.sample_time
                 self.get_logger().info(f"acc cmd: {self.acc_cmd}, delta cmd: {self.delta_cmd}, vel_cmd: {self.velocity_cmd}")
@@ -912,8 +946,8 @@ class KinematicCoupledAcadosMPCNode(Node):
                 if self.saturate_input:
                     self.input_saturation()
 
-                self.uk[0, 0] = self.acc_cmd
-                self.uk[1, 0] = self.delta_cmd
+                self.uk[0, 0] = self.jerk_cmd
+                self.uk[1, 0] = self.delta_rate_cmd
 
                 self.publish_command()
                 if self.publish_twist_topic:
@@ -925,9 +959,11 @@ class KinematicCoupledAcadosMPCNode(Node):
                 y_state_ref = xref[1, :].reshape(-1, 1)  # solution_dict['z_ref'][:, 1]
                 vel_state_ref = xref[2, :].reshape(-1, 1)  # solution_dict['z_ref'][:, 2]
                 psi_state_ref = xref[3, :].reshape(-1, 1)  # solution_dict['z_ref'][:, 3]
+                acc_state_ref = xref[4, :].reshape(-1, 1)  # solution_dict['z_ref'][:, 4]
+                delta_state_ref = xref[5, :].reshape(-1, 1)  # solution_dict['z_ref'][:, 5]
                 self.target_point = self.xref[0, :].tolist()  # todo: refactor
 
-                self.xref[:, :] = np.hstack([x_state_ref, y_state_ref, vel_state_ref, psi_state_ref])  # todo: refactor
+                self.xref[:, :] = np.hstack([x_state_ref, y_state_ref, vel_state_ref, psi_state_ref, acc_state_ref, delta_state_ref])  # todo: refactor
 
                 # todo: initialize solution_dict above and modify values
                 self.solution_time = solve_time_  # or solver_dt
@@ -970,9 +1006,27 @@ class KinematicCoupledAcadosMPCNode(Node):
     def input_saturation(self):
         # saturate inputs
         if self.saturate_input:
+            if not(self.MAX_DECEL <= self.acc_cmd <= self.MAX_ACCEL):
+                self.get_logger().info(f"Accel command of {self.acc_cmd} is out of bounds. Saturating to {self.MAX_ACCEL if self.acc_cmd > 0 else self.MAX_DECEL} ...")
             self.acc_cmd = np.clip(self.acc_cmd, self.MAX_DECEL, self.MAX_ACCEL)
+
+            if not(self.MIN_STEER_ANGLE <= self.delta_cmd <= self.MAX_STEER_ANGLE):
+                self.get_logger().info(f"Steer command of {self.delta_cmd} is out of bounds. Saturating to {self.MAX_STEER_ANGLE if self.delta_cmd > 0 else self.MIN_STEER_ANGLE} ...")
             self.delta_cmd = np.clip(self.delta_cmd, self.MIN_STEER_ANGLE, self.MAX_STEER_ANGLE)
+
+            if not(self.MIN_SPEED <= self.velocity_cmd <= self.MAX_SPEED):
+                self.get_logger().info(f"Velocity command of {self.velocity_cmd} is out of bounds. Saturating to {self.MAX_SPEED if self.velocity_cmd > 0 else self.MIN_SPEED} ...")
             self.velocity_cmd = np.clip(self.velocity_cmd, self.MIN_SPEED, self.MAX_SPEED)
+
+            if self.jerk_cmd:
+                if not(self.MIN_JERK <= self.jerk_cmd <= self.MAX_JERK):
+                    self.get_logger().info(f"Jerk command of {self.jerk_cmd} is out of bounds. Saturating to {self.MAX_JERK if self.jerk_cmd > 0 else self.MIN_JERK} ...")
+                self.jerk_cmd = np.clip(self.jerk_cmd, self.MIN_JERK, self.MAX_JERK)
+
+            if self.delta_rate_cmd:
+                if not(-self.MAX_STEER_RATE <= self.delta_rate_cmd <= self.MAX_STEER_RATE):
+                    self.get_logger().info(f"Steer rate command of {self.delta_rate_cmd} is out of bounds. Saturating to {self.MAX_STEER_RATE if self.delta_rate_cmd > 0 else -self.MAX_STEER_RATE} ...")
+                self.delta_rate_cmd = np.clip(self.delta_rate_cmd, -self.MAX_STEER_RATE, self.MAX_STEER_RATE)
 
     def publish_command(self):
         # filter inputs using a low-pass (or butterworth) filter. Todo
@@ -982,10 +1036,12 @@ class KinematicCoupledAcadosMPCNode(Node):
         ackermann_cmd.header.stamp = self.get_clock().now().to_msg()
         ackermann_cmd.header.frame_id = self.robot_frame  # self.frame_id
         ackermann_cmd.drive.steering_angle = self.delta_cmd
-        # ackermann_cmd.drive.steering_angle_velocity = 0.0
+        if self.delta_rate_cmd:
+            ackermann_cmd.drive.steering_angle_velocity = self.delta_rate_cmd
         ackermann_cmd.drive.speed = self.velocity_cmd
         ackermann_cmd.drive.acceleration = self.acc_cmd
-        # ackermann_cmd.drive.jerk = 0.0
+        if self.jerk_cmd:
+            ackermann_cmd.drive.jerk = self.jerk_cmd
         self.ackermann_cmd_pub.publish(ackermann_cmd)
 
         steer_msg = Float32()

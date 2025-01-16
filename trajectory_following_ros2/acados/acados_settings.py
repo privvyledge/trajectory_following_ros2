@@ -13,6 +13,7 @@ Perfomance Tips:
     * https://discourse.acados.org/t/solver-runs-slower-in-nvidia-jetson-tx2-platform/531/2
 
 Todo: get actuation limit values from arguments instead of hardcoding in the imported model
+Todo: add angle normalization logic and add slack
 """
 import numpy as np
 import scipy.linalg
@@ -233,12 +234,12 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
 
     # setting constraints
     ocp.constraints.constr_type = 'BGH'  # b: box/decision variables, g: dynamics, h:nonlinear constraints
-    ocp.constraints.lbx = np.array([model.vel_min, model.psi_min])  # state lower bound
-    ocp.constraints.ubx = np.array([model.vel_max, model.psi_max])  # state upper bound
-    ocp.constraints.idxbx = np.array([2, 3])  # index/indices of states with constraints, else +/-casadi.infinity
+    ocp.constraints.lbx = np.array([model.vel_min, model.psi_min, model.acc_min, model.delta_min])  # state lower bound
+    ocp.constraints.ubx = np.array([model.vel_max, model.psi_max, model.acc_max, model.delta_max])  # state upper bound
+    ocp.constraints.idxbx = np.array([2, 3, 4, 5])  # index/indices of states with constraints, else +/-casadi.infinity
 
-    ocp.constraints.lbu = np.array([model.acc_min, model.delta_min])  # input lower bound
-    ocp.constraints.ubu = np.array([model.acc_max, model.delta_max])  # input upper bound
+    ocp.constraints.lbu = np.array([model.jerk_min, model.delta_rate_min])  # input lower bound
+    ocp.constraints.ubu = np.array([model.jerk_max, model.delta_rate_max])  # input upper bound
     ocp.constraints.idxbu = np.array([0, 1])
 
     # # Soft/slack state bounds: to map lower and upper slack vectors onto x(T). todo: enable
