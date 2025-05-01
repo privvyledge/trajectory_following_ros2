@@ -103,10 +103,10 @@ def kinematic_model(symbol_type='SX'):
     # parameters
     '''Race car parameters'''
     wheelbase = symbol.sym('wheelbase')  # m
-    z_ref = symbol.sym('z_ref', z.shape)
-    u_ref = symbol.sym('u_ref', u.shape)
-    z_k = symbol.sym('z_k', z.shape)
-    u_prev = symbol.sym('u_prev', u.shape)
+    z_ref = symbol.sym('z_ref', z_aug.shape)
+    u_ref = symbol.sym('u_ref', u_aug.shape)
+    z_k = symbol.sym('z_k', z_aug.shape)
+    u_prev = symbol.sym('u_prev', u_aug.shape)
     parameters = vertcat(
             wheelbase,
             z_ref,
@@ -167,7 +167,7 @@ def kinematic_model(symbol_type='SX'):
     # Define model struct
     params = types.SimpleNamespace()
     params.wheelbase = wheelbase
-    model.f_impl_expr = zdot - f_expl
+    model.f_impl_expr = zdot_aug - f_expl
     model.f_expl_expr = f_expl
     # model.f_disk = discretizer(x_k, u_k, p_k)  # provide function
     model.x = z_aug

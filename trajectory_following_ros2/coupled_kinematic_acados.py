@@ -11,6 +11,7 @@ Tips:
     5. ROS2 Nav2 Controller plugin explanation (https://navigation.ros.org/plugin_tutorials/docs/writing_new_nav2controller_plugin.html)
     6. For an interesting cost function, see (https://discourse.acados.org/t/how-to-set-weights-of-costs-according-to-the-time-interval-in-mpc-prediction-horizon/1001)
 Todo:
+    * only publish debug topics if at lease one node is subscribing to each message
     * normalize angle difference between current and desired yaw to [-pi, pi) or [0, 2pi).
         Since acados does not give an interface to manipulate the cost function. Actually, see (https://github.com/bzarr/TUM-CONTROL/blob/main/Model_Predictive_Controller/Nominal_NMPC/NMPC_STM_acados_settings.py#L41):
         1. get the difference and normalize
@@ -200,7 +201,7 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('build_with_cython', True)  # whether to use cython (recommended) or ctypes
         self.declare_parameter('model_directory',
                                '/f1tenth_ws/src/trajectory_following_ros2/data/model')  # don't use absolute paths
-        self.declare_paramter('augment_parameters', True)
+        self.declare_parameter('augment_parameters', True)
 
         # get parameter values
         self.ode_type = self.get_parameter('ode_type').value
@@ -781,7 +782,8 @@ class KinematicCoupledAcadosMPCNode(Node):
 
             xref = np.array(
                     [reference_traj['x_ref'], reference_traj['y_ref'],
-                     reference_traj['vel_ref'], reference_traj['yaw_ref']])
+                     reference_traj['vel_ref'], reference_traj['yaw_ref'],
+                     np.zeros(self.horizon + 1), np.zeros(self.horizon + 1)])
             # xref[:, :] = xref[:, 0].reshape(-1, 1)  # to only use the target point
             self.xref[:, :] = xref.T
 

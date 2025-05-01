@@ -574,7 +574,8 @@ def generate_launch_description():
 
     load_nodes = GroupAction(
             actions=[
-                # PushRosNamespace(LaunchConfiguration('chatter_ns')),
+                # PushRosNamespace(LaunchConfiguration('chatter_ns'))
+                # ,
                 # SetRemap(src='/cmd_vel', dst='/cmd_vel_nav'),
                 waypoint_loader_node,
                 acados_mpc_node,

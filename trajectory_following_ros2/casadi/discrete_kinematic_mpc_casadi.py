@@ -451,7 +451,7 @@ class DiscreteKinematicMPCCasadi(object):
             ubg = casadi.vertcat(ubg, casadi.inf * casadi.DM.ones((self.nu, 1)) * self.Ts)  # or  u_dot_max * self.Ts
 
             u_prev = self.u_dv[:, k]
-            u_dot_list.append(u_dot)
+            u_dot_list.append(u_dot)  # todo: should u_dot be divided by self.Ts?
 
         u_dot_list = casadi.horzcat(*u_dot_list)  # nu x horizon
         self.u_rate_dv = u_dot_list
