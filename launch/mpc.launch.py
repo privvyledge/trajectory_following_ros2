@@ -6,16 +6,12 @@ Set default parameters
 Choose MPC type
 Remap nav2 path topic to
 
-Todo:
-    * add purepursuit
-    * add MPC groups
-    * rename from MPC as it includes all controllers now
-    * setup node name arguments
 """
 
 import os
 import yaml
 import pathlib
+import numpy as np
 
 from launch import LaunchDescription
 from ament_index_python.packages import get_package_share_directory
@@ -24,7 +20,7 @@ from launch.actions import (DeclareLaunchArgument, GroupAction,
 from launch.conditions import IfCondition, LaunchConfigurationEquals
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PythonExpression
-from launch_ros.actions import Node, SetRemap
+from launch_ros.actions import Node, SetRemap, PushRosNamespace, SetParametersFromFile, SetParameter
 from launch.actions import DeclareLaunchArgument
 from launch_ros.actions import PushRosNamespace
 from launch_ros.descriptions import ParameterFile
@@ -36,7 +32,11 @@ def generate_launch_description():
 
     # Create the launch configuration variables
     use_sim_time = LaunchConfiguration('use_sim_time')
+    use_namespace = LaunchConfiguration('use_namespace', default=False)
+    namespace = LaunchConfiguration('namespace', default='')
     params_file = LaunchConfiguration('params_file')
+    load_params_from_file = LaunchConfiguration('load_params_from_file', default=True)
+    load_params_from_args = LaunchConfiguration('load_params_from_args', default=True)
     log_level = LaunchConfiguration('log_level')
     robot_frame = LaunchConfiguration('robot_frame')
     global_frame = LaunchConfiguration('global_frame')
@@ -83,12 +83,12 @@ def generate_launch_description():
     speed_tolerance = LaunchConfiguration('speed_tolerance')
 
     # #  Topics
-    odom_topic = LaunchConfiguration('odom_topic', default="/odometry/local")
-    ackermann_cmd_topic = LaunchConfiguration('ackermann_cmd_topic', default="/drive")
-    twist_topic = LaunchConfiguration('twist_topic', default="/cmd_vel")
-    acceleration_topic = LaunchConfiguration('acceleration_topic', default="/accel/local")
-    path_topic = LaunchConfiguration('path_topic', default="/trajectory/path")
-    speed_topic = LaunchConfiguration('speed_topic', default="/trajectory/speed")
+    odom_topic = LaunchConfiguration('odom_topic', default="odometry/local")
+    ackermann_cmd_topic = LaunchConfiguration('ackermann_cmd_topic', default="drive")
+    twist_topic = LaunchConfiguration('twist_topic', default="cmd_vel")
+    acceleration_topic = LaunchConfiguration('acceleration_topic', default="accel/local")
+    path_topic = LaunchConfiguration('path_topic', default="trajectory/path")
+    speed_topic = LaunchConfiguration('speed_topic', default="trajectory/speed")
 
     # Declare default launch arguments
     config_file_path = os.path.join(trajectory_following_ros2_pkg_prefix, 'config/mpc_parameters.yaml')
@@ -100,11 +100,25 @@ def generate_launch_description():
             'use_sim_time',
             default_value='false',
             description='Use simulation (Gazebo) clock if true')
+    use_namespace_la = DeclareLaunchArgument(
+            'use_namespace', default_value=use_namespace,
+            description='Use namespace if true. ')
+    namespace_la = DeclareLaunchArgument(
+            'namespace', default_value=namespace,
+            description='Namespace for the nodes')
     params_file_la = DeclareLaunchArgument(
             'params_file',
             default_value=config_file_path,
             description='Path to config file for localization nodes'
     )
+    load_params_from_file_la = DeclareLaunchArgument(
+            'load_params_from_file',
+            default_value=load_params_from_file,
+            description='Load params from the parameter file if True.')
+    load_params_from_args_la = DeclareLaunchArgument(
+            'load_params_from_args',
+            default_value=load_params_from_args,
+            description='Load params from command line arguments if True. CLIs override YAML.')
     robot_frame_la = DeclareLaunchArgument(
             'robot_frame',
             default_value='base_link',
@@ -370,7 +384,8 @@ def generate_launch_description():
 
     # Create Launch Description
     ld = LaunchDescription(
-            [declare_use_sim_time_cmd, params_file_la,
+            [declare_use_sim_time_cmd, use_namespace_la, namespace_la, params_file_la,
+             load_params_from_file_la, load_params_from_args_la,
              robot_frame_la, global_frame_la,
              frequency_la, publish_twist_topic_la, wheelbase_la, ode_type_la,
              load_waypoints_la, waypoints_csv_la,
@@ -387,6 +402,50 @@ def generate_launch_description():
              speed_topic_la, debug_frequency_la]
     )
 
+    common_parameters = {
+        'use_sim_time': use_sim_time,
+        'robot_frame': robot_frame,
+        'global_frame': global_frame,
+        'control_rate': frequency,
+        'publish_twist_topic': publish_twist_topic,
+        'wheelbase': wheelbase,
+        'ode_type': ode_type,
+        'max_speed': max_speed,
+        'min_speed': min_speed,
+        'max_accel': max_accel,
+        'max_decel': max_decel,
+        'max_steer': max_steer,
+        'min_steer': min_steer,
+        'max_steer_rate': max_steer_rate,
+        'desired_speed': desired_speed,
+        'saturate_inputs': saturate_inputs,
+        'allow_reversing': allow_reversing,
+        'horizon': horizon,
+        'sample_time': sample_time,
+        'prediction_time': prediction_time,
+        'R': R_diagonal,
+        'Rd': Rd_diagonal,
+        'Q': Q_diagonal,
+        'Qf': Qf_diagonal,
+        'scale_cost': scale_cost,
+        'max_iter': max_iterations,
+        'termination_condition': termination_condition,
+        'generate_mpc_model': generate_mpc_model,
+        'build_with_cython': build_with_cython,
+        'model_directory': model_directory,
+        'stage_cost_type': stage_cost_type,
+        'terminal_cost_type': terminal_cost_type,
+        'distance_tolerance': distance_tolerance,
+        'speed_tolerance': speed_tolerance,
+        'odom_topic': odom_topic,
+        'ackermann_cmd_topic': ackermann_cmd_topic,
+        'twist_topic': twist_topic,
+        'acceleration_topic': acceleration_topic,
+        'path_topic': path_topic,
+        'speed_topic': speed_topic,
+        'debug_frequency': debug_frequency
+    }  # use Set Parameter and GroupAction below
+
     # Load Nodes
     waypoint_loader_node = Node(
             condition=IfCondition(load_waypoints),
@@ -394,73 +453,28 @@ def generate_launch_description():
             executable='waypoint_loader',
             name='waypoint_loader_node',
             output='screen',
-            parameters=[
-                {'use_sim_time': use_sim_time},
-                {'file_path': waypoints_csv},
-                # {'global_frame': global_frame}  # todo
-            ],
+            # parameters=[
+            #     {'use_sim_time': use_sim_time},
+            #     {'file_path': waypoints_csv},
+            # ],
             arguments=['--ros-args', '--log-level', log_level],
-            remappings=[
-                ('/waypoint_loader/path', path_topic),
-                ('/waypoint_loader/speed', speed_topic),
-            ]
+            # remappings=[
+            #     ('waypoint_loader/path', path_topic),
+            #     ('waypoint_loader/speed', speed_topic),
+            #     ('waypoint_loader/markers', 'trajectory/markers'),
+            # ]
     )
 
-    # todo: use SetParameter and Group Action to avoid repeating MPC parameters.
     acados_mpc_node = Node(
             condition=LaunchConfigurationEquals('mpc_toolbox', 'acados'),
             package='trajectory_following_ros2',
             executable='coupled_kinematic_acados',
             name='acados_mpc_node',
             output='screen',
-            parameters=[
-                params_file,
-                {'use_sim_time': use_sim_time},
-                {
-                    'robot_frame': robot_frame,
-                    'global_frame': global_frame,
-                },
-                {'control_rate': frequency},
-                {'publish_twist_topic': publish_twist_topic},
-                {'wheelbase': wheelbase},
-                {'ode_type': ode_type},
-                {'max_speed': max_speed},
-                {'min_speed': min_speed},
-                {'max_accel': max_accel},
-                {'max_decel': max_decel},
-                {'max_steer': max_steer},
-                {'min_steer': min_steer},
-                {'max_steer_rate': max_steer_rate},
-                {'desired_speed': desired_speed},
-                {'saturate_inputs': saturate_inputs},
-                {'allow_reversing': allow_reversing},
-                {'horizon': horizon},
-                {'sample_time': sample_time},
-                {'prediction_time': prediction_time},
-                {'R': R_diagonal},
-                {'Rd': Rd_diagonal},
-                {'Q': Q_diagonal},
-                {'Qf': Qf_diagonal},
-                {'scale_cost': scale_cost},
-                {'max_iter': max_iterations},
-                {'termination_condition': termination_condition},
-                {'generate_mpc_model': generate_mpc_model},
-                {'build_with_cython': build_with_cython},
-                {'model_directory': model_directory},
-                {'stage_cost_type': stage_cost_type},
-                {'terminal_cost_type': terminal_cost_type},
-                {'distance_tolerance': distance_tolerance},
-                {'speed_tolerance': speed_tolerance},
-                {
-                    'odom_topic': odom_topic,
-                    'ackermann_cmd_topic': ackermann_cmd_topic,
-                    'twist_topic': twist_topic,
-                    'acceleration_topic': acceleration_topic,
-                    'path_topic': path_topic,
-                    'speed_topic': speed_topic,
-                },
-                {'debug_frequency': debug_frequency},
-            ],
+            # parameters=[
+            #     params_file,
+            #     common_parameters,
+            # ],
             arguments=['--ros-args', '--log-level', log_level],
             # remappings=[
             #     ('/waypoint_loader/path', '/trajectory/path'),
@@ -474,54 +488,10 @@ def generate_launch_description():
             executable='coupled_kinematic_do_mpc',
             name='do_mpc_node',
             output='screen',
-            parameters=[
-                params_file,
-                {'use_sim_time': use_sim_time},
-                {
-                    'robot_frame': robot_frame,
-                    'global_frame': global_frame,
-                },
-                {'control_rate': frequency},
-                {'publish_twist_topic': publish_twist_topic},
-                {'wheelbase': wheelbase},
-                {'ode_type': ode_type},
-                {'max_speed': max_speed},
-                {'min_speed': min_speed},
-                {'max_accel': max_accel},
-                {'max_decel': max_decel},
-                {'max_steer': max_steer},
-                {'min_steer': min_steer},
-                {'max_steer_rate': max_steer_rate},
-                {'desired_speed': desired_speed},
-                {'saturate_inputs': saturate_inputs},
-                {'allow_reversing': allow_reversing},
-                {'horizon': horizon},
-                {'sample_time': sample_time},
-                {'prediction_time': prediction_time},
-                {'R': R_diagonal},
-                {'Rd': Rd_diagonal},
-                {'Q': Q_diagonal},
-                {'Qf': Qf_diagonal},
-                {'scale_cost': scale_cost},
-                {'max_iter': max_iterations},
-                {'termination_condition': termination_condition},
-                {'generate_mpc_model': generate_mpc_model},
-                {'build_with_cython': build_with_cython},
-                {'model_directory': model_directory},
-                # {'stage_cost_type': stage_cost_type},
-                # {'terminal_cost_type': terminal_cost_type},
-                {'distance_tolerance': distance_tolerance},
-                {'speed_tolerance': speed_tolerance},
-                {
-                    'odom_topic': odom_topic,
-                    'ackermann_cmd_topic': ackermann_cmd_topic,
-                    'twist_topic': twist_topic,
-                    'acceleration_topic': acceleration_topic,
-                    'path_topic': path_topic,
-                    'speed_topic': speed_topic,
-                },
-                {'debug_frequency': debug_frequency},
-            ],
+            # parameters=[
+            #     params_file,
+            #     common_parameters,
+            # ],
             arguments=['--ros-args', '--log-level', log_level],
             # remappings=[
             #     ('/waypoint_loader/path', '/trajectory/path'),
@@ -534,53 +504,107 @@ def generate_launch_description():
             executable='purepursuit',
             name=f'purepursuit_node',
             output='screen',
-            parameters=[
-                {
-                    'use_sim_time': use_sim_time,
-                    'robot_frame': 'base_link',
-                    'global_frame': 'map',
-                    # 'file_path': waypoints_csv_path,  # todo
-                    # 'path_source': 'file',
-                    'control_rate': 20.0,
-                    'goal_tolerance': 5.0,
-                    'lookahead_distance': 9.0,  # 10.0
-                    'min_lookahead': 4.35,
-                    'max_lookahead': 15.0,
-                    'adaptive_lookahead_gain': 4.0,
-                    'use_adaptive_lookahead': False,
-                    'wheelbase': 2.87528,
-                    'max_steer': 69.99999284118222,
-                    'min_steer': -69.99999284118222,
-                    'max_steer_rate': 352.9411764706,
-                    'max_speed': 9.0,
-                    # 'min_speed': '-10.5',
-                    'speed_Kp': 2.0,
-                    'speed_Ki': 0.2,
-                    'speed_Kd': 0.0,
-                    'desired_speed': 8.9,  # 8.9
-                    'odom_topic': odom_topic,
-                    'ackermann_cmd_topic': ackermann_cmd_topic,
-                    # f'/ackermann_cmd_{role_name_string}' or f'/carla/{role_name_string}/ackermann_cmd'
-                    'twist_topic': twist_topic,  # f'/carla/{role_name_string}/twist'
-                    'acceleration_topic': acceleration_topic,  # f'/carla/{role_name_string}/twist'
-                    'path_topic': path_topic,
-                    'speed_topic': speed_topic,
-                    'speedup_first_lookup': True,
-                }
-            ]
+            # parameters=[
+            #     params_file,
+            #     common_parameters,
+            # ],
     )
 
     casadi_mpc_node = None
 
     load_nodes = GroupAction(
             actions=[
-                # PushRosNamespace(LaunchConfiguration('chatter_ns')),
-                # SetRemap(src='/cmd_vel', dst='/cmd_vel_nav'),
+                PushRosNamespace(
+                        condition=IfCondition(use_namespace),
+                        namespace=namespace
+                ),
+                # Set common parameters. todo: test passing a list of names and values instead of separate SetParameter
+                SetParametersFromFile(params_file, condition=IfCondition(load_params_from_file)),
+                SetParameter(name='use_sim_time', value=use_sim_time),
+                SetParameter(name='robot_frame', value=robot_frame, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='global_frame', value=global_frame, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='control_rate', value=frequency, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='publish_twist_topic', value=publish_twist_topic, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='wheelbase', value=wheelbase, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='ode_type', value=ode_type, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='max_speed', value=max_speed, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='min_speed', value=min_speed, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='max_accel', value=max_accel, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='max_decel', value=max_decel, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='max_steer', value=max_steer, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='min_steer', value=min_steer, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='max_steer_rate', value=max_steer_rate, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='desired_speed', value=desired_speed, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='saturate_inputs', value=saturate_inputs, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='allow_reversing', value=allow_reversing, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='horizon', value=horizon, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='sample_time', value=sample_time, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='prediction_time', value=prediction_time, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='use_opti', value=False, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='solver_type', value='quad', condition=IfCondition(load_params_from_args)),
+                SetParameter(name='solver', value='qrqp', condition=IfCondition(load_params_from_args)),
+                SetParameter(name='normalize_yaw_error', value=True, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='R', value=R_diagonal, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='Rd', value=Rd_diagonal, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='Q', value=Q_diagonal, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='Qf', value=Qf_diagonal, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='slack_weights_input_rate', value=[1.0, 1.0], condition=IfCondition(load_params_from_args)),
+                SetParameter(name='slack_scale_input_rate', value=[1.0, 1.0], condition=IfCondition(load_params_from_args)),
+                SetParameter(name='slack_upper_bound_input_rate', value=[np.inf, np.inf], condition=IfCondition(load_params_from_args)),
+                SetParameter(name='slack_objective_is_quadratic', value=False, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='scale_cost', value=scale_cost, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='max_iter', value=max_iterations, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='termination_condition', value=termination_condition, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='generate_mpc_model', value=generate_mpc_model, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='build_with_cython', value=build_with_cython, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='model_directory', value=model_directory, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='stage_cost_type', value=stage_cost_type, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='terminal_cost_type', value=terminal_cost_type, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='distance_tolerance', value=distance_tolerance, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='speed_tolerance', value=speed_tolerance, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='odom_topic', value=odom_topic, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='ackermann_cmd_topic', value=ackermann_cmd_topic, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='twist_topic', value=twist_topic, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='acceleration_topic', value=acceleration_topic, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='path_topic', value=path_topic, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='speed_topic', value=speed_topic, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='marker_topic', value='trajectory/markers', condition=IfCondition(load_params_from_args)),
+                SetParameter(name='debug_frequency', value=debug_frequency, condition=IfCondition(load_params_from_args)),
+
+                # PurePursuit parameters
+                SetParameter(name='goal_tolerance', value=distance_tolerance, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='lookahead_distance', value=9.0, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='min_lookahead', value=4.35, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='max_lookahead', value=15.0, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='use_adaptive_lookahead', value=False, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='adaptive_lookahead_gain', value=4.0, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='speed_Kp', value=2.0, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='speed_Ki', value=0.2, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='speed_Kd', value=0.0, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='speedup_first_lookup', value=True, condition=IfCondition(load_params_from_args)),
+
+                # Obstacle Avoidance parameters
+                SetParameter(name='num_obstacles', value=0, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='ego_radius', value=1.0, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='obstacle_topic', value='fake_obstacles/object_array', condition=IfCondition(load_params_from_args)),
+                SetParameter(name='obstacle_collision_avoidance_method', value="euclidean", condition=IfCondition(load_params_from_args)),
+
+                # # Remap common topics
+                # SetRemap(src='trajectory/path', dst=path_topic),
+                # SetRemap(src='trajectory/speed', dst=speed_topic),
+                # SetRemap(src='odometry/local', dst=odom_topic),
+                # SetRemap(src='accel/local', dst=acceleration_topic),
+                # SetRemap(src='drive', dst=ackermann_cmd_topic),
+                # SetRemap(src='cmd_vel', dst=twist_topic),
+                # SetRemap(src='fake_obstacles/object_array', dst='fake_obstacles/object_array'),
+                # SetRemap(src='mpc/des_steer', dst='mpc/des_steer'),
+
+                # Load nodes
                 waypoint_loader_node,
                 acados_mpc_node,
                 do_mpc_node,
-                #custom_purepursuit_node,
-                # casadi_mpc_node,
+                custom_purepursuit_node,
+                casadi_mpc_node,
             ])
 
     # Add the actions to launch all of the mpc nodes

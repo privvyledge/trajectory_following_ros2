@@ -170,16 +170,16 @@ class KinematicCoupledCasadi(Node):
                             'for the input rate slack terms in the cost function. Default: False.',
                 type=ParameterType.PARAMETER_BOOL))
 
-        self.declare_parameter('path_topic', '/trajectory/path')  # todo: replace with custom message or action
-        self.declare_parameter('speed_topic', '/trajectory/speed')  # todo: replace with custom message or action
-        self.declare_parameter('odom_topic', '/odometry/local')
-        self.declare_parameter('acceleration_topic', '/accel/local')
-        self.declare_parameter('ackermann_cmd_topic', '/drive')
+        self.declare_parameter('path_topic', 'trajectory/path')  # todo: replace with custom message or action
+        self.declare_parameter('speed_topic', 'trajectory/speed')  # todo: replace with custom message or action
+        self.declare_parameter('odom_topic', 'odometry/local')
+        self.declare_parameter('acceleration_topic', 'accel/local')
+        self.declare_parameter('ackermann_cmd_topic', 'drive')
         self.declare_parameter('publish_twist_topic', True)
-        self.declare_parameter('twist_topic', '/cmd_vel')
+        self.declare_parameter('twist_topic', 'cmd_vel')
         self.declare_parameter('ego_radius', -1.0)
         self.declare_parameter('obstacle_collision_avoidance_method', "euclidean")
-        self.declare_parameter('obstacle_topic', '/fake_obstacles/object_array')  # /fake_obstacles/object_array or /carla/ego_vehicle/objects
+        self.declare_parameter('obstacle_topic', 'fake_obstacles/object_array')  # /fake_obstacles/object_array or /carla/ego_vehicle/objects
         self.declare_parameter('num_obstacles', 2)
 
         self.declare_parameter('desired_speed', 0.0)  # todo: get from topic/trajectory message
@@ -419,20 +419,20 @@ class KinematicCoupledCasadi(Node):
 
         # Setup publishers.
         self.ackermann_cmd_pub = self.create_publisher(AckermannDriveStamped, self.ackermann_cmd_topic, 1)
-        self.steer_pub = self.create_publisher(Float32, '/mpc/des_steer', 1)
-        self.speed_pub = self.create_publisher(Float32, '/mpc/des_speed', 1)
-        self.yaw_rate_pub = self.create_publisher(Float32, '/mpc/des_yaw_rate', 1)
+        self.steer_pub = self.create_publisher(Float32, 'mpc/des_steer', 1)
+        self.speed_pub = self.create_publisher(Float32, 'mpc/des_speed', 1)
+        self.yaw_rate_pub = self.create_publisher(Float32, 'mpc/des_yaw_rate', 1)
         if self.publish_twist_topic:
             self.twist_cmd_pub = self.create_publisher(TwistStamped, self.twist_topic, 1)
 
-        self.mpc_goal_pub = self.create_publisher(PointStamped, '/mpc/goal_point', 1)
-        self.waypoint_path_pub = self.create_publisher(Path, '/mpc/path_remaining', 1)
-        self.mpc_path_pub = self.create_publisher(Path, '/mpc/predicted_path', 1)
-        self.mpc_reference_path_pub = self.create_publisher(Path, '/mpc/reference_path', 1)
+        self.mpc_goal_pub = self.create_publisher(PointStamped, 'mpc/goal_point', 1)
+        self.waypoint_path_pub = self.create_publisher(Path, 'mpc/path_remaining', 1)
+        self.mpc_path_pub = self.create_publisher(Path, 'mpc/predicted_path', 1)
+        self.mpc_reference_path_pub = self.create_publisher(Path, 'mpc/reference_path', 1)
 
         # publish the internally estimated state of the car
-        self.mpc_odom_pub = self.create_publisher(Odometry, '/mpc/current_state', 1)
-        self.mpc_pose_pub = self.create_publisher(PoseStamped, '/mpc/current_pose', 1)
+        self.mpc_odom_pub = self.create_publisher(Odometry, 'mpc/current_state', 1)
+        self.mpc_pose_pub = self.create_publisher(PoseStamped, 'mpc/current_pose', 1)
 
         # setup mpc timer.
         self.mpc_timer = self.create_timer(self.sample_time, self.mpc_callback,

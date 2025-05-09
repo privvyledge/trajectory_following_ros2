@@ -11,6 +11,7 @@ Tips:
     5. ROS2 Nav2 Controller plugin explanation (https://navigation.ros.org/plugin_tutorials/docs/writing_new_nav2controller_plugin.html)
     6. For an interesting cost function, see (https://discourse.acados.org/t/how-to-set-weights-of-costs-according-to-the-time-interval-in-mpc-prediction-horizon/1001)
 Todo:
+    * only publish debug topics if at lease one node is subscribing to each message
     * normalize angle difference between current and desired yaw to [-pi, pi) or [0, 2pi).
         Since acados does not give an interface to manipulate the cost function. Actually, see (https://github.com/bzarr/TUM-CONTROL/blob/main/Model_Predictive_Controller/Nominal_NMPC/NMPC_STM_acados_settings.py#L41):
         1. get the difference and normalize
@@ -180,13 +181,13 @@ class KinematicCoupledAcadosMPCNode(Node):
         self.declare_parameter('Qf', [0.04, 0.04, 0.1, 10.0])
         self.declare_parameter('scale_cost', False)
 
-        self.declare_parameter('path_topic', '/trajectory/path')  # todo: replace with custom message or action
-        self.declare_parameter('speed_topic', '/trajectory/speed')  # todo: replace with custom message or action
-        self.declare_parameter('odom_topic', '/odometry/local')
-        self.declare_parameter('acceleration_topic', '/accel/local')
-        self.declare_parameter('ackermann_cmd_topic', '/drive')
+        self.declare_parameter('path_topic', 'trajectory/path')  # todo: replace with custom message or action
+        self.declare_parameter('speed_topic', 'trajectory/speed')  # todo: replace with custom message or action
+        self.declare_parameter('odom_topic', 'odometry/local')
+        self.declare_parameter('acceleration_topic', 'accel/local')
+        self.declare_parameter('ackermann_cmd_topic', 'drive')
         self.declare_parameter('publish_twist_topic', True)
-        self.declare_parameter('twist_topic', '/cmd_vel')
+        self.declare_parameter('twist_topic', 'cmd_vel')
 
         self.declare_parameter('desired_speed', 0.0)  # todo: get from topic/trajectory message
         self.declare_parameter('loop', False)  # todo: remove and pass to waypoint publisher
@@ -390,20 +391,20 @@ class KinematicCoupledAcadosMPCNode(Node):
 
         # Setup publishers.
         self.ackermann_cmd_pub = self.create_publisher(AckermannDriveStamped, self.ackermann_cmd_topic, 1)
-        self.steer_pub = self.create_publisher(Float32, '/mpc/des_steer', 1)
-        self.speed_pub = self.create_publisher(Float32, '/mpc/des_speed', 1)
-        self.yaw_rate_pub = self.create_publisher(Float32, '/mpc/des_yaw_rate', 1)
+        self.steer_pub = self.create_publisher(Float32, 'mpc/des_steer', 1)
+        self.speed_pub = self.create_publisher(Float32, 'mpc/des_speed', 1)
+        self.yaw_rate_pub = self.create_publisher(Float32, 'mpc/des_yaw_rate', 1)
         if self.publish_twist_topic:
             self.twist_cmd_pub = self.create_publisher(TwistStamped, self.twist_topic, 1)
 
-        self.mpc_goal_pub = self.create_publisher(PointStamped, '/mpc/goal_point', 1)
-        self.waypoint_path_pub = self.create_publisher(Path, '/mpc/path_remaining', 1)
-        self.mpc_path_pub = self.create_publisher(Path, '/mpc/predicted_path', 1)
-        self.mpc_reference_path_pub = self.create_publisher(Path, '/mpc/reference_path', 1)
+        self.mpc_goal_pub = self.create_publisher(PointStamped, 'mpc/goal_point', 1)
+        self.waypoint_path_pub = self.create_publisher(Path, 'mpc/path_remaining', 1)
+        self.mpc_path_pub = self.create_publisher(Path, 'mpc/predicted_path', 1)
+        self.mpc_reference_path_pub = self.create_publisher(Path, 'mpc/reference_path', 1)
 
         # publish the internally estimated state of the car
-        self.mpc_odom_pub = self.create_publisher(Odometry, '/mpc/current_state', 1)
-        self.mpc_pose_pub = self.create_publisher(PoseStamped, '/mpc/current_pose', 1)
+        self.mpc_odom_pub = self.create_publisher(Odometry, 'mpc/current_state', 1)
+        self.mpc_pose_pub = self.create_publisher(PoseStamped, 'mpc/current_pose', 1)
 
         # setup mpc timer.
         self.mpc_timer = self.create_timer(self.sample_time, self.mpc_callback,

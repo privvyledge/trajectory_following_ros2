@@ -143,13 +143,13 @@ class PurePursuitNode(Node):
         self.declare_parameter('min_steer', -23.0,
                                ParameterDescriptor(description='The minimum lateral command (steering) to apply.'))  # in degrees
         self.declare_parameter('max_steer', 23.0)  # in degrees
-        self.declare_parameter('path_topic', '/trajectory/path')
-        self.declare_parameter('speed_topic', '/trajectory/speed')
-        self.declare_parameter('odom_topic', '/vehicle/odometry/filtered')
-        self.declare_parameter('acceleration_topic', '/vehicle/accel/filtered')
-        self.declare_parameter('ackermann_cmd_topic', '/drive')
+        self.declare_parameter('path_topic', 'trajectory/path')
+        self.declare_parameter('speed_topic', 'trajectory/speed')
+        self.declare_parameter('odom_topic', 'odometry/filtered')
+        self.declare_parameter('acceleration_topic', 'accel/filtered')
+        self.declare_parameter('ackermann_cmd_topic', 'drive')
         self.declare_parameter('publish_twist_topic', True)
-        self.declare_parameter('twist_topic', '/cmd_vel')
+        self.declare_parameter('twist_topic', 'cmd_vel')
 
         '''Speed stuff'''
         self.declare_parameter('max_speed', 1.0)
@@ -305,19 +305,19 @@ class PurePursuitNode(Node):
 
         # Setup publishers. Todo: publish purepursuit path
         self.ackermann_cmd_pub = self.create_publisher(AckermannDriveStamped, self.ackermann_cmd_topic, 1)
-        self.steer_pub = self.create_publisher(Float32, '/purepursuit/des_steer', 1)
-        self.speed_pub = self.create_publisher(Float32, '/purepursuit/des_speed', 1)
-        self.yaw_rate_pub = self.create_publisher(Float32, '/purepursuit/des_yaw_rate', 1)
+        self.steer_pub = self.create_publisher(Float32, 'purepursuit/des_steer', 1)
+        self.speed_pub = self.create_publisher(Float32, 'purepursuit/des_speed', 1)
+        self.yaw_rate_pub = self.create_publisher(Float32, 'purepursuit/des_yaw_rate', 1)
         if self.publish_twist_topic:
             self.twist_cmd_pub = self.create_publisher(TwistStamped, self.twist_topic, 1)
 
-        self.purepursuit_goal_pub = self.create_publisher(PointStamped, '/purepursuit/goal_point', 1)
-        self.purepursuit_lookahead_pub = self.create_publisher(PointStamped, '/purepursuit/lookahead_point', 1)
-        self.purepursuit_path_pub = self.create_publisher(Path, '/purepursuit/path', 1)
+        self.purepursuit_goal_pub = self.create_publisher(PointStamped, 'purepursuit/goal_point', 1)
+        self.purepursuit_lookahead_pub = self.create_publisher(PointStamped, 'purepursuit/lookahead_point', 1)
+        self.purepursuit_path_pub = self.create_publisher(Path, 'purepursuit/path', 1)
 
         # publish the internally estimated state of the car
-        self.purepursuit_odom_pub = self.create_publisher(Odometry, '/purepursuit/current_state', 1)
-        self.purepursuit_pose_pub = self.create_publisher(PoseStamped, '/purepursuit/current_pose', 1)
+        self.purepursuit_odom_pub = self.create_publisher(Odometry, 'purepursuit/current_state', 1)
+        self.purepursuit_pose_pub = self.create_publisher(PoseStamped, 'purepursuit/current_pose', 1)
 
         # setup purepursuit timer
         self.purepursuit_timer = self.create_timer(self.sample_time, self.purepursuit_callback,

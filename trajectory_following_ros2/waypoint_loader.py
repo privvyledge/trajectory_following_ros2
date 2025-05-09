@@ -57,9 +57,9 @@ class WaypointLoaderNode(Node):
 
         # declare parameters
         self.declare_parameter('file_path', '')
-        self.declare_parameter('path_topic', '/waypoint_loader/path')
-        self.declare_parameter('speed_topic', '/waypoint_loader/speed')
-        self.declare_parameter('marker_topic', '/waypoint_loader/markers')
+        self.declare_parameter('path_topic', 'waypoint_loader/path')
+        self.declare_parameter('speed_topic', 'waypoint_loader/speed')
+        self.declare_parameter('marker_topic', 'waypoint_loader/markers')
         self.declare_parameter('target_frame_id', '',
                                ParameterDescriptor(description='The static frame to save the waypoints in.'))  # map
         self.declare_parameter('publish_if_transform_fails', False,
