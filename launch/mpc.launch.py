@@ -61,6 +61,7 @@ def generate_launch_description():
 
     # # MPC parameters
     mpc_toolbox = LaunchConfiguration('mpc_toolbox')
+    control_type = LaunchConfiguration('control_type')
     horizon = LaunchConfiguration('horizon')
     sample_time = LaunchConfiguration('sample_time')
     prediction_time = LaunchConfiguration('prediction_time')
@@ -68,6 +69,9 @@ def generate_launch_description():
     Rd_diagonal = LaunchConfiguration('Rd_diagonal')
     Q_diagonal = LaunchConfiguration('Q_diagonal')
     Qf_diagonal = LaunchConfiguration('Qf_diagonal')
+    slack_weights_input_rate = LaunchConfiguration('slack_weights_input_rate')
+    slack_scale_input_rate = LaunchConfiguration('slack_scale_input_rate')
+    slack_upper_bound_input_rate = LaunchConfiguration('slack_upper_bound_input_rate')
     scale_cost = LaunchConfiguration('scale_cost')
     max_iterations = LaunchConfiguration('max_iterations')
     termination_condition = LaunchConfiguration('termination_condition')
@@ -92,7 +96,7 @@ def generate_launch_description():
 
     # Declare default launch arguments
     config_file_path = os.path.join(trajectory_following_ros2_pkg_prefix, 'config/mpc_parameters.yaml')
-    waypoints_csv_path = os.path.join(trajectory_following_ros2_pkg_prefix, 'data/waypoints.csv')
+    waypoints_csv_path = os.path.join(trajectory_following_ros2_pkg_prefix, 'data/carla_waypoints.csv')
     mpc_model_path = os.path.join(trajectory_following_ros2_pkg_prefix, 'data/mpc')
 
     # declare launch arguments
@@ -254,8 +258,16 @@ def generate_launch_description():
     mpc_toolbox_la = DeclareLaunchArgument(
             'mpc_toolbox',
             default_value='acados',
-            description='MPC toolbox to use. acados, do_mpc, casadi.'
+            description='MPC toolbox to use. acados, do_mpc, casadi.',
+            choices=['acados', 'casadi', 'do_mpc', 'none']
     )
+    control_type_la = DeclareLaunchArgument(
+            'control_type',
+            default_value='mpc',
+            description='Type of control to use. mpc, purepursuit',
+            choices=['mpc', 'purepursuit']
+    )
+
     horizon_la = DeclareLaunchArgument(
             'horizon',
             default_value='15',
@@ -290,6 +302,21 @@ def generate_launch_description():
             'Qf_diagonal',
             default_value='[0.04, 0.04, 0.1, 0.01]',
             description='List containing the diagonal for the Qf matrix.'
+    )
+    slack_weights_input_rate_la = DeclareLaunchArgument(
+            'slack_weights_input_rate',
+            default_value='[1.0, 1.0]',
+            description='List containing the diagonal for the slack weights input rate.'
+    )
+    slack_scale_input_rate_la = DeclareLaunchArgument(
+            'slack_scale_input_rate',
+            default_value='[1.0, 1.0]',
+            description='List containing the diagonal for the slack scale input rate.'
+    )
+    slack_upper_bound_input_rate_la = DeclareLaunchArgument(
+            'slack_upper_bound_input_rate',
+            default_value=f'[{np.inf}, {np.inf}]',
+            description='List containing the diagonal for the slack upper bound input rate.'
     )
     scale_cost_la = DeclareLaunchArgument(
             'scale_cost',
@@ -391,8 +418,10 @@ def generate_launch_description():
              load_waypoints_la, waypoints_csv_la,
              saturate_inputs_la, allow_reversing_la, max_speed_la, min_speed_la, max_accel_la, max_decel_la,
              max_steer_la, min_steer_la, max_steer_rate_la, desired_speed_la,
-             mpc_toolbox_la, horizon_la, sample_time_la, prediction_time_la,
-             R_diagonal_la, Rd_diagonal_la, Q_diagonal_la, Qf_diagonal_la, scale_cost_la,
+             mpc_toolbox_la, control_type_la, horizon_la, sample_time_la, prediction_time_la,
+             R_diagonal_la, Rd_diagonal_la, Q_diagonal_la, Qf_diagonal_la,
+             slack_weights_input_rate_la, slack_scale_input_rate_la, slack_upper_bound_input_rate_la,
+             scale_cost_la,
              max_iterations_la, termination_condition_la,
              stage_cost_type_la, terminal_cost_type_la,
              generate_mpc_model_la, build_with_cython_la, model_directory_la,
@@ -403,47 +432,50 @@ def generate_launch_description():
     )
 
     common_parameters = {
-        'use_sim_time': use_sim_time,
-        'robot_frame': robot_frame,
-        'global_frame': global_frame,
-        'control_rate': frequency,
-        'publish_twist_topic': publish_twist_topic,
-        'wheelbase': wheelbase,
-        'ode_type': ode_type,
-        'max_speed': max_speed,
-        'min_speed': min_speed,
-        'max_accel': max_accel,
-        'max_decel': max_decel,
-        'max_steer': max_steer,
-        'min_steer': min_steer,
-        'max_steer_rate': max_steer_rate,
-        'desired_speed': desired_speed,
-        'saturate_inputs': saturate_inputs,
-        'allow_reversing': allow_reversing,
-        'horizon': horizon,
-        'sample_time': sample_time,
-        'prediction_time': prediction_time,
+        # 'use_sim_time': use_sim_time,
+        # 'robot_frame': robot_frame,
+        # 'global_frame': global_frame,
+        # 'control_rate': frequency,
+        # 'publish_twist_topic': publish_twist_topic,
+        # 'wheelbase': wheelbase,
+        # 'ode_type': ode_type,
+        # 'max_speed': max_speed,
+        # 'min_speed': min_speed,
+        # 'max_accel': max_accel,
+        # 'max_decel': max_decel,
+        # 'max_steer': max_steer,
+        # 'min_steer': min_steer,
+        # 'max_steer_rate': max_steer_rate,
+        # 'desired_speed': desired_speed,
+        # 'saturate_inputs': saturate_inputs,
+        # 'allow_reversing': allow_reversing,
+        # 'horizon': horizon,
+        # 'sample_time': sample_time,
+        # 'prediction_time': prediction_time,
         'R': R_diagonal,
         'Rd': Rd_diagonal,
         'Q': Q_diagonal,
         'Qf': Qf_diagonal,
-        'scale_cost': scale_cost,
-        'max_iter': max_iterations,
-        'termination_condition': termination_condition,
-        'generate_mpc_model': generate_mpc_model,
-        'build_with_cython': build_with_cython,
-        'model_directory': model_directory,
-        'stage_cost_type': stage_cost_type,
-        'terminal_cost_type': terminal_cost_type,
-        'distance_tolerance': distance_tolerance,
-        'speed_tolerance': speed_tolerance,
-        'odom_topic': odom_topic,
-        'ackermann_cmd_topic': ackermann_cmd_topic,
-        'twist_topic': twist_topic,
-        'acceleration_topic': acceleration_topic,
-        'path_topic': path_topic,
-        'speed_topic': speed_topic,
-        'debug_frequency': debug_frequency
+        'slack_weights_input_rate': slack_weights_input_rate,
+        'slack_scale_input_rate': slack_scale_input_rate,
+        'slack_upper_bound_input_rate': slack_upper_bound_input_rate,
+        # 'scale_cost': scale_cost,
+        # 'max_iter': max_iterations,
+        # 'termination_condition': termination_condition,
+        # 'generate_mpc_model': generate_mpc_model,
+        # 'build_with_cython': build_with_cython,
+        # 'model_directory': model_directory,
+        # 'stage_cost_type': stage_cost_type,
+        # 'terminal_cost_type': terminal_cost_type,
+        # 'distance_tolerance': distance_tolerance,
+        # 'speed_tolerance': speed_tolerance,
+        # 'odom_topic': odom_topic,
+        # 'ackermann_cmd_topic': ackermann_cmd_topic,
+        # 'twist_topic': twist_topic,
+        # 'acceleration_topic': acceleration_topic,
+        # 'path_topic': path_topic,
+        # 'speed_topic': speed_topic,
+        # 'debug_frequency': debug_frequency
     }  # use Set Parameter and GroupAction below
 
     # Load Nodes
@@ -471,10 +503,27 @@ def generate_launch_description():
             executable='coupled_kinematic_acados',
             name='acados_mpc_node',
             output='screen',
-            # parameters=[
-            #     params_file,
-            #     common_parameters,
-            # ],
+            parameters=[
+                # params_file,
+                common_parameters,
+            ],
+            arguments=['--ros-args', '--log-level', log_level],
+            # remappings=[
+            #     ('/waypoint_loader/path', '/trajectory/path'),
+            #     ('/waypoint_loader/speed', '/trajectory/speed'),
+            # ]
+    )
+
+    casadi_mpc_node = Node(
+            condition=LaunchConfigurationEquals('mpc_toolbox', 'casadi'),
+            package='trajectory_following_ros2',
+            executable='coupled_kinematic_casadi',
+            name='casadi_mpc_node',
+            output='screen',
+            parameters=[
+                # params_file,
+                common_parameters,
+            ],
             arguments=['--ros-args', '--log-level', log_level],
             # remappings=[
             #     ('/waypoint_loader/path', '/trajectory/path'),
@@ -488,10 +537,10 @@ def generate_launch_description():
             executable='coupled_kinematic_do_mpc',
             name='do_mpc_node',
             output='screen',
-            # parameters=[
-            #     params_file,
-            #     common_parameters,
-            # ],
+            parameters=[
+                # params_file,
+                common_parameters,
+            ],
             arguments=['--ros-args', '--log-level', log_level],
             # remappings=[
             #     ('/waypoint_loader/path', '/trajectory/path'),
@@ -500,17 +549,17 @@ def generate_launch_description():
     )
 
     custom_purepursuit_node = Node(
+            condition=LaunchConfigurationEquals('control_type', 'purepursuit'),
             package='trajectory_following_ros2',
             executable='purepursuit',
             name=f'purepursuit_node',
             output='screen',
-            # parameters=[
-            #     params_file,
-            #     common_parameters,
-            # ],
+            parameters=[
+                # params_file,
+                common_parameters,
+            ],
     )
 
-    casadi_mpc_node = None
 
     load_nodes = GroupAction(
             actions=[
@@ -544,13 +593,13 @@ def generate_launch_description():
                 SetParameter(name='solver_type', value='quad', condition=IfCondition(load_params_from_args)),
                 SetParameter(name='solver', value='qrqp', condition=IfCondition(load_params_from_args)),
                 SetParameter(name='normalize_yaw_error', value=True, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='R', value=R_diagonal, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='Rd', value=Rd_diagonal, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='Q', value=Q_diagonal, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='Qf', value=Qf_diagonal, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='slack_weights_input_rate', value=[1.0, 1.0], condition=IfCondition(load_params_from_args)),
-                SetParameter(name='slack_scale_input_rate', value=[1.0, 1.0], condition=IfCondition(load_params_from_args)),
-                SetParameter(name='slack_upper_bound_input_rate', value=[np.inf, np.inf], condition=IfCondition(load_params_from_args)),
+                # SetParameter(name='R', value=R_diagonal, condition=IfCondition(load_params_from_args)),
+                # SetParameter(name='Rd', value=Rd_diagonal, condition=IfCondition(load_params_from_args)),
+                # SetParameter(name='Q', value=Q_diagonal, condition=IfCondition(load_params_from_args)),
+                # SetParameter(name='Qf', value=Qf_diagonal, condition=IfCondition(load_params_from_args)),
+                # SetParameter(name='slack_weights_input_rate', value=[1.0, 1.0], condition=IfCondition(load_params_from_args)),
+                # SetParameter(name='slack_scale_input_rate', value=[1.0, 1.0], condition=IfCondition(load_params_from_args)),
+                # SetParameter(name='slack_upper_bound_input_rate', value=[np.inf, np.inf], condition=IfCondition(load_params_from_args)),
                 SetParameter(name='slack_objective_is_quadratic', value=False, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='scale_cost', value=scale_cost, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='max_iter', value=max_iterations, condition=IfCondition(load_params_from_args)),
@@ -589,6 +638,10 @@ def generate_launch_description():
                 SetParameter(name='obstacle_topic', value='fake_obstacles/object_array', condition=IfCondition(load_params_from_args)),
                 SetParameter(name='obstacle_collision_avoidance_method', value="euclidean", condition=IfCondition(load_params_from_args)),
 
+                # Waypoint Parameters
+                SetParameter(name='file_path', value=waypoints_csv, condition=IfCondition(load_params_from_args)),
+
+
                 # # Remap common topics
                 # SetRemap(src='trajectory/path', dst=path_topic),
                 # SetRemap(src='trajectory/speed', dst=speed_topic),
@@ -602,9 +655,9 @@ def generate_launch_description():
                 # Load nodes
                 waypoint_loader_node,
                 acados_mpc_node,
+                casadi_mpc_node,
                 do_mpc_node,
                 custom_purepursuit_node,
-                casadi_mpc_node,
             ])
 
     # Add the actions to launch all of the mpc nodes

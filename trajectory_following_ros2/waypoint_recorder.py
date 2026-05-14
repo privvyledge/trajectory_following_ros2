@@ -51,7 +51,6 @@ class WaypointRecorderNode(Node):
         # declare parameters
         self.declare_parameter('file_path', '')
         self.declare_parameter('waypoint_source', 'odometry')
-        # self.declare_parameter('save_frequency', 20.0)  # Hz. todo: remove
         self.declare_parameter('save_interval', 1.0)  # seconds
         self.declare_parameter('target_frame_id', 'odom',
                                ParameterDescriptor(description='The static frame to save the waypoints in.'))  # map
@@ -67,7 +66,6 @@ class WaypointRecorderNode(Node):
         # get parameters
         self.file_path = str(self.get_parameter('file_path').value)
         self.waypoint_source = self.get_parameter('waypoint_source').value
-        # self.save_frequency = self.get_parameter('save_frequency').value
         self.save_interval = self.get_parameter('save_interval').value
         self.target_frame_id = self.get_parameter('target_frame_id').value  # target_frame
         self.odom_topic = self.get_parameter('odom_topic').value

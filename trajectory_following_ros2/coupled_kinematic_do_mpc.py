@@ -60,6 +60,7 @@ from rclpy.qos import HistoryPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import SingleThreadedExecutor, MultiThreadedExecutor
 from rclpy.executors import ExternalShutdownException
+from ament_index_python.packages import get_package_share_directory
 
 # TF
 from tf2_ros import TransformException, LookupException, ConnectivityException, ExtrapolationException
@@ -89,6 +90,7 @@ class KinematicCoupledDoMPCNode(Node):
 
     def __init__(self, ):
         """Constructor for KinematicCoupledDoMPCNode"""
+        this_package_dir = get_package_share_directory('trajectory_following_ros2')
         super(KinematicCoupledDoMPCNode, self).__init__('kinematic_coupled_do_mpc_controller')
         # declare parameters
         # todo: transform from/to the global and robot frames
@@ -179,7 +181,7 @@ class KinematicCoupledDoMPCNode(Node):
         self.declare_parameter('generate_mpc_model', True)  # generate and build model
         self.declare_parameter('build_with_cython', True)  # whether to use cython (recommended) or ctypes. not used. todo: remove
         self.declare_parameter('model_directory',
-                               '/f1tenth_ws/src/trajectory_following_ros2/data/model')  # don't use absolute paths
+                               os.path.join(this_package_dir, 'data', 'model'))  # todo: setup
 
         # get parameter values
         self.robot_frame = self.get_parameter('robot_frame').value

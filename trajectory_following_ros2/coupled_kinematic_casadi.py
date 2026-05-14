@@ -26,6 +26,7 @@ from rclpy.qos import HistoryPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import SingleThreadedExecutor, MultiThreadedExecutor
 from rclpy.executors import ExternalShutdownException
+from ament_index_python.packages import get_package_share_directory
 
 # TF
 from tf2_ros import TransformException, LookupException, ConnectivityException, ExtrapolationException
@@ -63,6 +64,7 @@ from trajectory_following_ros2.casadi.discrete_kinematic_mpc_casadi import Discr
 
 class KinematicCoupledCasadi(Node):
     def __init__(self):
+        this_package_dir = get_package_share_directory('trajectory_following_ros2')
         super(KinematicCoupledCasadi, self).__init__('kinematic_coupled_casadi_controller')
         # declare parameters
         # todo: transform from/to the global and robot frames
@@ -190,7 +192,7 @@ class KinematicCoupledCasadi(Node):
         self.declare_parameter('generate_mpc_model', True)  # generate and build model
         self.declare_parameter('build_with_cython', True)  # whether to use cython (recommended) or ctypes
         self.declare_parameter('model_directory',
-                               '/f1tenth_ws/src/trajectory_following_ros2/data/model')  # don't use absolute paths
+                               os.path.join(this_package_dir, 'data', 'model'))  # todo: setup
 
         # get parameter values
         self.robot_frame = self.get_parameter('robot_frame').value
@@ -231,6 +233,7 @@ class KinematicCoupledCasadi(Node):
         self.slack_weights_input_rate = self.get_parameter('slack_weights_input_rate').get_parameter_value().double_array_value
         self.slack_scale_input_rate = self.get_parameter('slack_scale_input_rate').get_parameter_value().double_array_value
         self.slack_upper_bound_input_rate = self.get_parameter('slack_upper_bound_input_rate').get_parameter_value().double_array_value
+        self.get_logger().info(f"********** slack_upper_bound_input_rate: {np.array(self.slack_upper_bound_input_rate)}")
         self.slack_objective_is_quadratic = self.get_parameter('slack_objective_is_quadratic').value
         self.horizon = int(self.get_parameter('horizon').value)
         self.prediction_time = self.get_parameter('prediction_time').value

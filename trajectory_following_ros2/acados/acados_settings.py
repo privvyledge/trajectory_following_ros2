@@ -70,7 +70,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     ns = nsh + nsbx  # total number of slacks at stages (1, N-1)
 
     # discretization
-    # ocp.dims.N = N  # prediction horizon (depracated)
+    ocp.dims.N = N  # prediction horizon (depracated)
     ocp.solver_options.N_horizon = N  # prediction horizon
 
     # set cost
