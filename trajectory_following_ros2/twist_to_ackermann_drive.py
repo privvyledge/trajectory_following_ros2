@@ -118,7 +118,7 @@ class Twist2Ackermann(Node):
             return 0.
 
         radius = longitudinal_speed / desired_yaw_rate
-        steering_angle = math.atan2(self.WHEELBASE, radius)  # math.atan(self.WHEELBASE / radius)
+        steering_angle = math.atan2(self.WHEELBASE, radius) if radius != 0 else 0.0
         return steering_angle
 
 

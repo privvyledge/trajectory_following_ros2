@@ -164,8 +164,9 @@ class KinematicAcadosMPCSimulationNode(Node):
         self.y = self.get_parameter('initial_y').value
         self.yaw = self.get_parameter('initial_yaw').value
         self.speed = self.get_parameter('initial_speed').value
+        self.speed_prev = 0.0
         self.yaw_rate = self.get_parameter('initial_yaw_rate').value
-        self.acceleration = self.get_parameter('initial_yaw_rate').value
+        self.acceleration = self.get_parameter('initial_acceleration').value
         self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))
         self.rear_y = self.y - ((self.WHEELBASE / 2) * math.sin(self.yaw))
         self.location = [self.x, self.y]  # or self.rear_x, self.rear_y
@@ -258,7 +259,7 @@ class KinematicAcadosMPCSimulationNode(Node):
         self.yaw = self.zk[3, 0]  # self.yaw += self.speed * math.tan(uk[1, 0]) / self.WHEELBASE * dt
 
         self.yaw_rate = (self.speed / self.WHEELBASE) * math.tan(uk[1, 0])
-        self.acceleration = self.speed / self.sample_time
+        self.acceleration = (self.speed - self.speed_prev) / self.sample_time
 
         self.publish_transform()
         self.publish_odometry()
@@ -266,6 +267,7 @@ class KinematicAcadosMPCSimulationNode(Node):
 
         self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))
         self.rear_y = self.y - ((self.WHEELBASE / 2) * math.sin(self.yaw))
+        self.speed_prev = self.speed
 
     def publish_odometry(self):
         """

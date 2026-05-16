@@ -122,6 +122,13 @@ class MPC(object):
         self.mpc.setup()
 
         if self.compile and not jit_compilation:
+            # if os.path.exists(self.model_directory + '/nlp.so'):
+            #     # todo: test loading model from shared libraries
+            #     # load pre-compiled model
+            #     self.Controller.mpc.S['solver_obj'] = casadi.nlpsol(
+            #             'solver', 'ipopt',
+            #             self.model_directory + '/nlp.so', opts)
+            # else:
             # self.mpc.compile_nlp(overwrite=False, cname='nlp.c', libname='nlp.so', compiler_command=None)
             # todo: for now there is a bug in the do_mpc code. Compile using my method in casadi node and modify the solver self.mpc.S
             # this is faster than jit for do_mpc

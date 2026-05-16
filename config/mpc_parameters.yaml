@@ -20,7 +20,7 @@
     max_steer_rate: 352.9411764706
 
     max_iter: 15
-    terminattion_condition: 0.1
+    termination_condition: 0.1
 
     R: [0.01, 0.01]
     Rd: [10., 100.]

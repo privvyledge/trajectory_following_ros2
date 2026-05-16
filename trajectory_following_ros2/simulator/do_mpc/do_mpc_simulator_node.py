@@ -118,6 +118,7 @@ class KinematicDoMPCSimulationNode(Node):
         self.y = 0.0  # todo: remove
         self.yaw = 0.0  # todo: remove
         self.speed = 0.0  # todo: remove
+        self.speed_prev = 0.0  # todo: remove
         self.yaw_rate = 0.0  # todo: remove
         self.acceleration = 0.0  # todo: remove
         self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))  # todo: remove
@@ -180,13 +181,15 @@ class KinematicDoMPCSimulationNode(Node):
         self.yaw = self.zk[3, 0]  # self.yaw += self.speed * math.tan(uk[1, 0]) / self.WHEELBASE * dt
 
         self.yaw_rate = (self.speed / self.WHEELBASE) * math.tan(uk[1, 0])
-        self.acceleration = self.speed / self.sample_time
+        self.acceleration = (self.speed - self.speed_prev) / self.sample_time
 
         self.publish_odometry()
         self.publish_acceleration()
 
         self.rear_x = self.x - ((self.WHEELBASE / 2) * math.cos(self.yaw))
         self.rear_y = self.y - ((self.WHEELBASE / 2) * math.sin(self.yaw))
+        self.speed_prev = self.speed
+
 
     def publish_odometry(self):
         """

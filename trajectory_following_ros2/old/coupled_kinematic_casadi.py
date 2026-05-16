@@ -454,6 +454,7 @@ class KinematicCoupledCasadi(Node):
                 # acquire lock
                 if data_queue.full():
                     drop = data_queue.get(block=True)  # remove one item
+
                 else:
                     data_queue.put(data, block=True)
                 # release the lock
@@ -814,9 +815,6 @@ class KinematicCoupledCasadi(Node):
                 self.cumulative_distance += trajectory_utils.calculate_current_arc_length(
                         self.speed, normalized_yaw_diff, self.sample_time)
 
-                # update previous input
-                self.u_prev = self.uk.copy()
-
                 if self.use_opti:
                     self.controller.update(state=[x, y, vel, psi],
                                            ref_traj=[reference_traj['x_ref'][:-1], reference_traj['y_ref'][:-1],
@@ -955,6 +953,10 @@ class KinematicCoupledCasadi(Node):
                 self.velocity_cmd = predicted_vel_state[1, 0]  # float(predicted_vel_state[1])
                 # self.velocity_cmd = vel + self.acc_cmd * self.sample_time
 
+                # update previous input if the solver was successful
+                if solution_status:
+                    self.u_prev = self.uk.copy()
+
                 self.uk[0, 0] = self.acc_cmd
                 self.uk[1, 0] = self.delta_cmd
 
@@ -1077,11 +1079,11 @@ class KinematicCoupledCasadi(Node):
         ackermann_cmd.header.stamp = self.get_clock().now().to_msg()
         ackermann_cmd.header.frame_id = self.robot_frame  # self.frame_id
         ackermann_cmd.drive.steering_angle = self.delta_cmd
-        if self.delta_rate_cmd:
+        if self.delta_rate_cmd is not None:
             ackermann_cmd.drive.steering_angle_velocity = self.delta_rate_cmd
         ackermann_cmd.drive.speed = self.velocity_cmd
         ackermann_cmd.drive.acceleration = self.acc_cmd
-        if self.jerk_cmd:
+        if self.jerk_cmd is not None:
             ackermann_cmd.drive.jerk = self.jerk_cmd
         self.ackermann_cmd_pub.publish(ackermann_cmd)
 

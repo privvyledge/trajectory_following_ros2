@@ -146,7 +146,7 @@ class Vehicle(object):
         A[2, 2] = 1.0
         A[3, 3] = 1.0
         A[0, 2] = dt * math.cos(phi)
-        A[0, 3] = - dt * v * math.sin(phi)
+        A[0, 3] = -dt * v * math.sin(phi)
         A[1, 2] = dt * math.sin(phi)
         A[1, 3] = dt * v * math.cos(phi)
         A[3, 2] = dt * math.tan(delta) / self.WHEELBASE

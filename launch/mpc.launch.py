@@ -48,7 +48,7 @@ def generate_launch_description():
     waypoints_csv = LaunchConfiguration('waypoints_csv')
 
     # Constraints
-    saturate_inputs = LaunchConfiguration('saturate_inputs')
+    saturate_input = LaunchConfiguration('saturate_input')
     allow_reversing = LaunchConfiguration('allow_reversing')
     max_speed = LaunchConfiguration('max_speed')
     min_speed = LaunchConfiguration('min_speed')
@@ -201,8 +201,8 @@ def generate_launch_description():
             description='Path to the waypoints csv file.'
     )
 
-    saturate_inputs_la = DeclareLaunchArgument(
-            'saturate_inputs',
+    saturate_input_la = DeclareLaunchArgument(
+            'saturate_input',
             default_value='True',
             description='Whether to saturate the inputs before sending to the actuators.'
                         'Not necessary for MPC nodes as the optimal solution should already do this.'
@@ -416,7 +416,7 @@ def generate_launch_description():
              robot_frame_la, global_frame_la,
              frequency_la, publish_twist_topic_la, wheelbase_la, ode_type_la,
              load_waypoints_la, waypoints_csv_la,
-             saturate_inputs_la, allow_reversing_la, max_speed_la, min_speed_la, max_accel_la, max_decel_la,
+             saturate_input_la, allow_reversing_la, max_speed_la, min_speed_la, max_accel_la, max_decel_la,
              max_steer_la, min_steer_la, max_steer_rate_la, desired_speed_la,
              mpc_toolbox_la, control_type_la, horizon_la, sample_time_la, prediction_time_la,
              R_diagonal_la, Rd_diagonal_la, Q_diagonal_la, Qf_diagonal_la,
@@ -447,7 +447,7 @@ def generate_launch_description():
         # 'min_steer': min_steer,
         # 'max_steer_rate': max_steer_rate,
         # 'desired_speed': desired_speed,
-        # 'saturate_inputs': saturate_inputs,
+        # 'saturate_input': saturate_input,
         # 'allow_reversing': allow_reversing,
         # 'horizon': horizon,
         # 'sample_time': sample_time,
@@ -584,7 +584,7 @@ def generate_launch_description():
                 SetParameter(name='min_steer', value=min_steer, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='max_steer_rate', value=max_steer_rate, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='desired_speed', value=desired_speed, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='saturate_inputs', value=saturate_inputs, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='saturate_input', value=saturate_input, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='allow_reversing', value=allow_reversing, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='horizon', value=horizon, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='sample_time', value=sample_time, condition=IfCondition(load_params_from_args)),

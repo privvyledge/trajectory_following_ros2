@@ -65,7 +65,7 @@ class Trajectory(object):
     def __init__(self, search_index_number=10, goal_tolerance=0.2, stop_speed=0.5 / 3.6):
         """Constructor for Trajectory"""
         self.state_keys = ['x', 'y', 'speed', 'yaw', 'omega',
-                           'curvature', 'cum_dist', 'vy', 'omega', 'acc']
+                           'curvature', 'cum_dist', 'vy', 'acc']
         self.state_key_to_column = {key: i for i, key in enumerate(self.state_keys)}
 
         self.trajectory_keys = ['x', 'y', 'speed', 'yaw', 'omega',
