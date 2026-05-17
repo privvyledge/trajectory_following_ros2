@@ -1,4 +1,3 @@
-import math
 import sys
 from typing import Optional
 
@@ -9,12 +8,6 @@ from rclpy.executors import MultiThreadedExecutor, ExternalShutdownException
 
 from trajectory_following_ros2.base_tracker import BaseTrajectoryTracker
 from trajectory_following_ros2.backends.base_solver import BaseSolver, SolverResult
-
-try:
-    OBSTACLES_AVAILABLE = True
-    from derived_object_msgs.msg import ObjectArray
-except ImportError:
-    OBSTACLES_AVAILABLE = False
 
 from trajectory_following_ros2.casadi.kinematic_mpc_casadi_opti import KinematicMPCCasadiOpti
 from trajectory_following_ros2.casadi.kinematic_mpc_casadi import KinematicMPCCasadi
@@ -137,10 +130,6 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
         self.declare_parameter('slack_scale_input_rate', [1.0, 1.0])
         self.declare_parameter('slack_upper_bound_input_rate', [1e9, 1e9])
         self.declare_parameter('slack_objective_is_quadratic', False)
-        self.declare_parameter('ego_radius', -1.0)
-        self.declare_parameter('obstacle_collision_avoidance_method', 'euclidean')
-        self.declare_parameter('obstacle_topic', 'fake_obstacles/object_array')
-        self.declare_parameter('num_obstacles', 0)
 
     def _init_solver(self) -> Optional[BaseSolver]:
         ode_type = self.get_parameter('ode_type').value
@@ -200,23 +189,6 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
 
         self.get_logger().info(f'CasADi MPC built (ode={ode_type}, opti={use_opti}).')
 
-        # obstacle subscription (casadi only)
-        self._num_obstacles = num_obstacles
-        self.obstacles = []
-        self.n_obstacle_states = 3
-        self.obstacle_states: Optional[np.ndarray] = None
-        self.obstacle_collision_avoidance_method = collision_method
-        if num_obstacles > 0 and OBSTACLES_AVAILABLE:
-            obstacle_topic = self.get_parameter('obstacle_topic').value
-            self.obstacle_sub = self.create_subscription(
-                ObjectArray, obstacle_topic, self._obstacle_callback, 1,
-                callback_group=self.subscription_group)
-            self.get_logger().info(
-                f'Obstacle avoidance enabled: {num_obstacles} obstacles on {obstacle_topic}')
-        elif num_obstacles > 0:
-            self.get_logger().warn(
-                'num_obstacles > 0 but derived_object_msgs not available.')
-
         return CasAdiSolverAdapter(
             controller, use_opti=use_opti,
             num_obstacles=num_obstacles,
@@ -242,32 +214,6 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
             self._solver.update_obstacles(self.obstacle_states)  # type: ignore[attr-defined]
 
         super()._control_timer_callback()
-
-    def _obstacle_callback(self, data: 'ObjectArray'):
-        obstacles = []
-        for obj in data.objects:
-            pos = [obj.pose.position.x, obj.pose.position.y, obj.pose.position.z]
-            shape = {
-                obj.shape.BOX: 'BOX',
-                obj.shape.SPHERE: 'SPHERE',
-                obj.shape.CYLINDER: 'CYLINDER',
-            }.get(obj.shape.type, 'BOX')
-
-            if shape == 'SPHERE' and obj.shape.dimensions:
-                radius = obj.shape.dimensions[0]
-            elif shape == 'CYLINDER' and len(obj.shape.dimensions) >= 2:
-                radius = obj.shape.dimensions[1]
-            elif shape == 'BOX' and len(obj.shape.dimensions) >= 3:
-                l, w, h = obj.shape.dimensions[:3]
-                radius = (math.sqrt(l**2 + w**2 + h**2) / 2) / 1.3
-            else:
-                continue
-
-            dist = np.linalg.norm(np.array(pos[:2]) - np.array([self.x, self.y]))
-            obstacles.append({'state': [pos[0], pos[1], radius], 'distance': dist})
-
-        self.obstacles = sorted(obstacles, key=lambda o: o['distance'])
-
 
 def main(args=None):
     rclpy.init(args=args)

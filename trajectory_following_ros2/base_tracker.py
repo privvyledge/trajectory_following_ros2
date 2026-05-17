@@ -28,6 +28,12 @@ from trajectory_following_ros2.utils.Trajectory import Trajectory
 import trajectory_following_ros2.utils.trajectory_utils as trajectory_utils
 from trajectory_following_ros2.backends.base_solver import BaseSolver, SolverResult
 
+try:
+    OBSTACLES_AVAILABLE = True
+    from derived_object_msgs.msg import ObjectArray
+except ImportError:
+    OBSTACLES_AVAILABLE = False
+
 _STALE_ODOM_THRESHOLD_S = 0.5  # seconds before odom is considered stale
 
 
@@ -118,6 +124,10 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('n_ind_search', 10)
         self.declare_parameter('smooth_yaw', False)
         self.declare_parameter('debug', False)
+        self.declare_parameter('num_obstacles', 0)
+        self.declare_parameter('ego_radius', -1.0)
+        self.declare_parameter('obstacle_topic', 'fake_obstacles/object_array')
+        self.declare_parameter('obstacle_collision_avoidance_method', 'euclidean')
 
     def _read_parameters(self):
         self.robot_frame = self.get_parameter('robot_frame').value
@@ -161,6 +171,7 @@ class BaseTrajectoryTracker(Node, ABC):
         self.n_ind_search = self.get_parameter('n_ind_search').value
         self.smooth_yaw = self.get_parameter('smooth_yaw').value
         self.debug = self.get_parameter('debug').value
+        self._num_obstacles = self.get_parameter('num_obstacles').value
         self.dt = self.sample_time = 1.0 / self.control_rate
         if not self.prediction_time:
             self.prediction_time = self.sample_time * self.horizon
@@ -212,6 +223,10 @@ class BaseTrajectoryTracker(Node, ABC):
         self._consecutive_failures = 0
 
         self._last_odom_stamp = None
+
+        self.obstacles: list = []
+        self.n_obstacle_states: int = 3
+        self.obstacle_states: Optional[np.ndarray] = None
 
         self.trajectory = Trajectory(
             search_index_number=10,
@@ -266,6 +281,17 @@ class BaseTrajectoryTracker(Node, ABC):
         self.mpc_goal_pub = self.create_publisher(PointStamped, 'mpc/goal_point', 1)
         self.mpc_path_pub = self.create_publisher(Path, 'mpc/predicted_path', 1)
         self.mpc_reference_path_pub = self.create_publisher(Path, 'mpc/reference_path', 1)
+
+        if self._num_obstacles > 0 and OBSTACLES_AVAILABLE:
+            obstacle_topic = self.get_parameter('obstacle_topic').value
+            self.obstacle_sub = self.create_subscription(
+                ObjectArray, obstacle_topic, self._obstacle_callback, 1,
+                callback_group=self.subscription_group)
+            self.get_logger().info(
+                f'Obstacle avoidance enabled: {self._num_obstacles} obstacles on {obstacle_topic}')
+        elif self._num_obstacles > 0:
+            self.get_logger().warn(
+                'num_obstacles > 0 but derived_object_msgs not available.')
 
         self.mpc_timer = self.create_timer(
             self.sample_time, self._control_timer_callback,
@@ -394,6 +420,31 @@ class BaseTrajectoryTracker(Node, ABC):
         """Return a consistent (x, y, speed, yaw, omega) snapshot under the state mutex."""
         with self.mutex:
             return self.x, self.y, self.speed, self.yaw, self.omega
+
+    def _obstacle_callback(self, data: 'ObjectArray'):
+        obstacles = []
+        for obj in data.objects:
+            pos = [obj.pose.position.x, obj.pose.position.y, obj.pose.position.z]
+            shape = {
+                obj.shape.BOX: 'BOX',
+                obj.shape.SPHERE: 'SPHERE',
+                obj.shape.CYLINDER: 'CYLINDER',
+            }.get(obj.shape.type, 'BOX')
+
+            if shape == 'SPHERE' and obj.shape.dimensions:
+                radius = obj.shape.dimensions[0]
+            elif shape == 'CYLINDER' and len(obj.shape.dimensions) >= 2:
+                radius = obj.shape.dimensions[1]
+            elif shape == 'BOX' and len(obj.shape.dimensions) >= 3:
+                l, w, h = obj.shape.dimensions[:3]
+                radius = (math.sqrt(l**2 + w**2 + h**2) / 2) / 1.3
+            else:
+                continue
+
+            dist = np.linalg.norm(np.array(pos[:2]) - np.array([self.x, self.y]))
+            obstacles.append({'state': [pos[0], pos[1], radius], 'distance': dist})
+
+        self.obstacles = sorted(obstacles, key=lambda o: o['distance'])
 
     # ------------------------------------------------------------------
     # Main control loop
