@@ -383,6 +383,7 @@ class KinematicMPCCasadiOpti(object):
 
         # input derivative cost.
         self.u_rate_dv[0, :] = (self.u_dv[0, :] - self.previous_input.T)  # / self.Ts
+        cost += self._quad_form(self.u_rate_dv[0, :], self.Rd)
         for i in range(self.horizon - 1):
             self.u_rate_dv[i + 1, :] = (self.u_dv[i + 1, :] - self.u_dv[i, :])  # / self.Ts
             cost += self._quad_form(self.u_rate_dv[i + 1, :], self.Rd)

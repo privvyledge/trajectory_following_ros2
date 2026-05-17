@@ -276,7 +276,7 @@ class Trajectory(object):
         """
         Todo:
             * refactor speed stopping.
-            * enable looping
+            * enable looping, e.g replaying the trajectory when we are done or get back to the initial position after an optional delay
         :param state:
         :param goal:
         :param tind: target index

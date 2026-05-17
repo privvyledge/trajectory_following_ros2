@@ -107,6 +107,8 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         self.declare_parameter('scale_cost', False)
         self.declare_parameter('generate_mpc_model', True)
         self.declare_parameter('build_with_cython', True)
+        self.declare_parameter('qp_solver', 'PARTIAL_CONDENSING_HPIPM')
+        self.declare_parameter('nlp_solver_type', 'SQP_RTI')
         self.declare_parameter('model_directory',
                                os.path.join(
                                    get_package_share_directory('trajectory_following_ros2'),
@@ -120,6 +122,8 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         scale_cost = self.get_parameter('scale_cost').value
         generate = self.get_parameter('generate_mpc_model').value
         with_cython = self.get_parameter('build_with_cython').value
+        qp_solver = self.get_parameter('qp_solver').value
+        nlp_solver_type = self.get_parameter('nlp_solver_type').value
         model_dir = self.get_parameter('model_directory').value
 
         build_path = os.path.join(model_dir, 'c_generated_code')
@@ -136,8 +140,13 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
             scale_cost=scale_cost,
             Q=self.Q, R=self.R, Qe=self.Qf, Rd=self.Rd,
             wheelbase=self.WHEELBASE,
+            vel_min=self.MIN_SPEED, vel_max=self.MAX_SPEED,
+            acc_min=self.MAX_DECEL, acc_max=self.MAX_ACCEL,
+            delta_min=self.MIN_STEER_ANGLE, delta_max=self.MAX_STEER_ANGLE,
             cost_module=stage_cost_type,
             cost_module_e=terminal_cost_type,
+            qp_solver=qp_solver,
+            nlp_solver_type=nlp_solver_type,
             generate=True,
             build=generate,
             with_cython=with_cython,

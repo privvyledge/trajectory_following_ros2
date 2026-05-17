@@ -11,7 +11,6 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
-from rclpy.duration import Duration
 from rclpy.time import Time
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult, ParameterType
 
@@ -221,6 +220,7 @@ class BaseTrajectoryTracker(Node, ABC):
         )
 
         self.mutex = threading.Lock()
+        self._u_prev_from_echo = False
         _q = 5
         self.location_queue = queue.Queue(maxsize=_q)
         self.mpc_reference_states_queue = queue.Queue(maxsize=_q)
@@ -252,6 +252,9 @@ class BaseTrajectoryTracker(Node, ABC):
         self.accel_sub = self.create_subscription(
             AccelWithCovarianceStamped, self.acceleration_topic, self.acceleration_callback,
             1, callback_group=self.subscription_group)
+        self.drive_echo_sub = self.create_subscription(
+            AckermannDriveStamped, self.ackermann_cmd_topic, self._drive_echo_callback,
+            1, callback_group=self.subscription_group)
 
         self.ackermann_cmd_pub = self.create_publisher(
             AckermannDriveStamped, self.ackermann_cmd_topic, 1)
@@ -276,16 +279,15 @@ class BaseTrajectoryTracker(Node, ABC):
     # Subscriptions callbacks
     # ------------------------------------------------------------------
 
-    def path_callback(self, data: Path):
+    async def path_callback(self, data: Path):
         path_frame_id = data.header.frame_id
 
         # Resolve TF if path is not already in the controller's global frame.
         tf_tx = tf_ty = tf_yaw = 0.0
         if path_frame_id and path_frame_id != self.global_frame:
             try:
-                tf_stamped = self.tf_buffer.lookup_transform(
-                    self.global_frame, path_frame_id, Time(),
-                    timeout=Duration(seconds=1.0))
+                tf_stamped = await self.tf_buffer.lookup_transform_async(
+                    self.global_frame, path_frame_id, Time())
                 t = tf_stamped.transform.translation
                 r = tf_stamped.transform.rotation
                 tf_tx, tf_ty = t.x, t.y
@@ -297,12 +299,14 @@ class BaseTrajectoryTracker(Node, ABC):
                     f'{self.global_frame}: {e}')
                 return
 
+        # todo: switch to numpy and vectorize since data.poses is just a list of poses
         cos_tf = math.cos(tf_yaw)
         sin_tf = math.sin(tf_yaw)
 
         coordinate_list, yaw_list = [], []
         for pose_msg in data.poses:
             p = pose_msg.pose.position
+            # todo: compare with tf2_geometry_msgs.do_transform_pose()
             coordinate_list.append([
                 cos_tf * p.x - sin_tf * p.y + tf_tx,
                 sin_tf * p.x + cos_tf * p.y + tf_ty,
@@ -346,22 +350,32 @@ class BaseTrajectoryTracker(Node, ABC):
 
         pose = data.pose.pose
         twist = data.twist.twist
-        self.x, self.y = pose.position.x, pose.position.y
+        x = pose.position.x
+        y = pose.position.y
         q = pose.orientation
-        _, _, self.yaw = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
-        self.vx = twist.linear.x
-        self.vy = twist.linear.y
-        self.vz = twist.linear.z
-        self.omega = self.yaw_rate = twist.angular.z
+        _, _, yaw = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
+        vx = twist.linear.x
+        vy = twist.linear.y
+        vz = twist.linear.z
+        omega = twist.angular.z
         try:
-            self.direction = self.vx / abs(self.vx)
+            direction = vx / abs(vx)
         except ZeroDivisionError:
-            self.direction = 1.0
-        self.speed = self.vx
-        self.rear_x = self.x - (self.WHEELBASE / 2) * math.cos(self.yaw)
-        self.rear_y = self.y - (self.WHEELBASE / 2) * math.sin(self.yaw)
+            direction = 1.0
+        speed = vx
+        rear_x = x - (self.WHEELBASE / 2) * math.cos(yaw)
+        rear_y = y - (self.WHEELBASE / 2) * math.sin(yaw)
 
-        self.update_queue(self.location_queue, [self.x, self.y])
+        with self.mutex:
+            self.x, self.y = x, y
+            self.yaw = yaw
+            self.vx, self.vy, self.vz = vx, vy, vz
+            self.omega = self.yaw_rate = omega
+            self.direction = direction
+            self.speed = speed
+            self.rear_x, self.rear_y = rear_x, rear_y
+
+        self.update_queue(self.location_queue, [x, y])
 
         if not self.initial_pose_received:
             self.initial_pose_received = True
@@ -369,6 +383,17 @@ class BaseTrajectoryTracker(Node, ABC):
     def acceleration_callback(self, data: AccelWithCovarianceStamped):
         self.initial_accel_received = True
         self.acceleration = data.accel.accel.linear.x
+
+    def _drive_echo_callback(self, msg: AckermannDriveStamped):
+        with self.mutex:
+            self.u_prev[0, 0] = msg.drive.acceleration
+            self.u_prev[1, 0] = msg.drive.steering_angle
+            self._u_prev_from_echo = True
+
+    def _snapshot_state(self):
+        """Return a consistent (x, y, speed, yaw, omega) snapshot under the state mutex."""
+        with self.mutex:
+            return self.x, self.y, self.speed, self.yaw, self.omega
 
     # ------------------------------------------------------------------
     # Main control loop
@@ -388,7 +413,8 @@ class BaseTrajectoryTracker(Node, ABC):
 
         # 2. Solver initialization — once, after first odom received
         if not self.mpc_initialized and self.initial_pose_received and self._solver is not None:
-            x0 = np.array([self.x, self.y, self.speed, self.yaw])
+            _x, _y, _vel, _psi, _ = self._snapshot_state()
+            x0 = np.array([_x, _y, _vel, _psi])
             self._solver.initialize(x0)
             self.mpc_initialized = True
             self.get_logger().info('MPC solver initialized.')
@@ -409,7 +435,7 @@ class BaseTrajectoryTracker(Node, ABC):
             return
 
         # 5. Snapshot state (avoid race with odom callback)
-        x, y, vel, psi, omega = self.x, self.y, self.speed, self.yaw, self.omega
+        x, y, vel, psi, omega = self._snapshot_state()
 
         # 6. Update trajectory state
         self._update_trajectory_state(x, y, vel, psi, omega)
@@ -443,12 +469,16 @@ class BaseTrajectoryTracker(Node, ABC):
         self.zk[:, 0] = x0
 
         # 10. Solve
-        result: SolverResult = self._solver.solve(x0, xref, self.u_prev.flatten())
+        with self.mutex:
+            u_prev_snapshot = self.u_prev.copy()
+        result: SolverResult = self._solver.solve(x0, xref, u_prev_snapshot.flatten())
 
         # 11. Track consecutive failures; zero-command safety after N=5.
         if result.is_optimal:
             self._consecutive_failures = 0
-            self.u_prev[:, 0] = result.u_prev
+            if not self._u_prev_from_echo:
+                with self.mutex:
+                    self.u_prev[:, 0] = result.u_prev
         else:
             self._consecutive_failures += 1
             self.get_logger().warn(
@@ -630,6 +660,7 @@ class BaseTrajectoryTracker(Node, ABC):
             pt.point.x, pt.point.y = float(goal[0]), float(goal[1])
             self.mpc_goal_pub.publish(pt)
 
+        # todo: vectorize the loops since they are just lists and use np.tolist()
         if mpc_predicted_states is not None:
             path_msg = Path()
             path_msg.header.stamp = timestamp

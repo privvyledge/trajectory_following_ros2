@@ -25,12 +25,17 @@ from trajectory_following_ros2.acados.kinematic_model import kinematic_model
 def acados_settings(Tf, N, x0=None, scale_cost=True,
                     Q=None, R=None, Qe=None, Rd=None,
                     wheelbase=0.256,
+                    vel_min=None, vel_max=None,
+                    acc_min=None, acc_max=None,
+                    delta_min=None, delta_max=None,
                     cost_module='external', cost_module_e='external',
+                    qp_solver='PARTIAL_CONDENSING_HPIPM',
+                    nlp_solver_type='SQP_RTI',
+                    qp_solver_cond_N=None,
                     generate=True, build=True, with_cython=True,
                     num_iterations=10, tolerance=1e-6,
-                    mpc_config_file="kinematic_bicycle_acados_ocp.json", code_export_directory="c_generated_code"
-
-):
+                    mpc_config_file="kinematic_bicycle_acados_ocp.json",
+                    code_export_directory="c_generated_code"):
     # generate = True  # generates the OCP and stores in the json file
     # build = True  # builds/compiles the model and stores in code_export_directory
     # the cython version is faster than bare C because there is no call overhead as opposed to the C code call overhead
@@ -41,6 +46,20 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
 
     # export model
     model, constraint = kinematic_model()
+
+    # Override constraint bounds from ROS params (fall back to kinematic_model defaults if None)
+    if vel_min is not None:
+        model.vel_min = vel_min
+    if vel_max is not None:
+        model.vel_max = vel_max
+    if acc_min is not None:
+        model.acc_min = acc_min
+    if acc_max is not None:
+        model.acc_max = acc_max
+    if delta_min is not None:
+        model.delta_min = delta_min
+    if delta_max is not None:
+        model.delta_max = delta_max
 
     # define acados ODE
     model_ac = AcadosModel()
@@ -183,8 +202,8 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         u_rate = model.u - u_prev
         # u_rate = casadi.vertcat(u_rate, casadi.diff(u_dv))  # to pack with horizon
 
-        u_rate_cost = u_rate.T @ Rd @ u_rate  # doesn't work for now. Add to cost
-        ocp.model.cost_expr_ext_cost = 0.5 * (y - yref).T @ W @ (y - yref)  # todo: normalize angle
+        u_rate_cost = 0.5 * u_rate.T @ Rd @ u_rate
+        ocp.model.cost_expr_ext_cost = 0.5 * (y - yref).T @ W @ (y - yref) + u_rate_cost  # todo: normalize angle
 
     else:
         raise AttributeError(f'Invalid cost type ({cost_module}) specified.')
@@ -278,10 +297,10 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         ocp.constraints.x0 = x0
 
     # set QP solver and integration
-    ocp.solver_options.qp_solver = "PARTIAL_CONDENSING_HPIPM"
+    ocp.solver_options.qp_solver = qp_solver
     # PARTIAL_CONDENSING_HPIPM, FULL_CONDENSING_QPOASES, FULL_CONDENSING_HPIPM,
     # PARTIAL_CONDENSING_QPDUNES, PARTIAL_CONDENSING_OSQP, FULL_CONDENSING_DAQP
-    ocp.solver_options.nlp_solver_type = "SQP_RTI"  # SQP_RTI, SQP. SQP_RTI does only one iteration while SQP solves to a certain tolerance
+    ocp.solver_options.nlp_solver_type = nlp_solver_type  # SQP_RTI, SQP. SQP_RTI does only one iteration while SQP solves to a certain tolerance
     # ocp.solver_options.globalization = 'MERIT_BACKTRACKING'  # turns on globalization. 'FUNNEL_L1PEN_LINESEARCH' if not self.use_RTI else 'MERIT_BACKTRACKING'
     ocp.solver_options.hessian_approx = "GAUSS_NEWTON"  # 'GAUSS_NEWTON', 'EXACT'.
     ocp.solver_options.integrator_type = "ERK"  # 'IRK' (implicit), 'ERK' (explicit), 'GNSF', 'DISCRETE', 'LIFTED_IRK'
@@ -297,7 +316,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     ocp.solver_options.nlp_solver_max_iter = num_iterations
     # ocp.solver_options.tol = tolerance  # 1e-4
     # ocp.solver_options.nlp_solver_tol_comp = 1e-1
-    ocp.solver_options.qp_solver_cond_N = int(N / 2)  # int(N / 2)  # or N if scale_cost=False or 1
+    ocp.solver_options.qp_solver_cond_N = qp_solver_cond_N if qp_solver_cond_N is not None else int(N / 2)
     # ocp.solver_options.qp_solver_warm_start = 2
     ocp.solver_options.qp_solver_iter_max = num_iterations
     # ocp.solver_options.qp_tol = tolerance  # 1e-3
