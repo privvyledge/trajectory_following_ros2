@@ -35,7 +35,9 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
                     generate=True, build=True, with_cython=True,
                     num_iterations=10, tolerance=1e-6,
                     mpc_config_file="kinematic_bicycle_acados_ocp.json",
-                    code_export_directory="c_generated_code"):
+                    code_export_directory="c_generated_code",
+                    num_obstacles=0, ego_radius=1.0, safe_distance=0.5,
+                    obstacle_slack_weight=100.0):
     # generate = True  # generates the OCP and stores in the json file
     # build = True  # builds/compiles the model and stores in code_export_directory
     # the cython version is faster than bare C because there is no call overhead as opposed to the C code call overhead
@@ -69,7 +71,12 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     model_ac.xdot = model.xdot
     model_ac.u = model.u
     model_ac.z = model.z
-    model_ac.p = model.p
+    if num_obstacles > 0:
+        _obs_states = casadi.SX.sym('obs_states', 3 * num_obstacles)
+        _ego_r = casadi.SX.sym('ego_radius_p', 1)
+        model_ac.p = casadi.vertcat(model.p, _obs_states, _ego_r)
+    else:
+        model_ac.p = model.p
     model_ac.name = model.name
     ocp.model = model_ac
 
@@ -139,6 +146,12 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         *np.zeros(nx),  # zk
         *np.zeros(nu),  # u_prev
     ])
+    if num_obstacles > 0:
+        ocp.parameter_values = np.concatenate([
+            ocp.parameter_values,
+            np.ones(3 * num_obstacles) * 1000.0,  # obs_states: far away (won't constrain)
+            [ego_radius],
+        ])
 
     '''
     LINEAR_LS:
@@ -249,6 +262,44 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     # ocp.cost.zu = 100 * np.ones((ns,))  # gradient wrt upper slack at intermediate shooting nodes (0 to N-1)
     # ocp.cost.Zl = 1 * np.ones((ns,))  # diagonal of Hessian wrt lower slack at intermediate shooting nodes (0 to N-1)
     # ocp.cost.Zu = 1 * np.ones((ns,))  # diagonal of Hessian wrt upper slack at intermediate shooting nodes (0 to N-1)
+
+    # Euclidean obstacle-avoidance nonlinear constraints (stage 0..N-1 via con_h_expr,
+    # terminal stage N via con_h_expr_e).  CBF is not supported for acados because the
+    # CBF condition h(k+1)-h(k)+γh(k)>=0 links two stages and cannot be expressed in
+    # acados's per-stage con_h_expr without augmenting the state vector.
+    if num_obstacles > 0:
+        h_exprs = [
+            (model.x[0] - _obs_states[3 * j]) ** 2
+            + (model.x[1] - _obs_states[3 * j + 1]) ** 2
+            - (_ego_r + _obs_states[3 * j + 2] + safe_distance) ** 2
+            for j in range(num_obstacles)
+        ]
+        h_expr = casadi.vertcat(*h_exprs)
+        ocp.model.con_h_expr = h_expr    # stages 0..N-1
+        ocp.model.con_h_expr_e = h_expr  # stage N (con_h_expr_e uses only model.x, no model.u)
+
+        ocp.constraints.lh = np.zeros(num_obstacles)
+        ocp.constraints.uh = np.full(num_obstacles, 1e15)
+        ocp.constraints.lh_e = np.zeros(num_obstacles)
+        ocp.constraints.uh_e = np.full(num_obstacles, 1e15)
+
+        ocp.constraints.idxsh = np.arange(num_obstacles, dtype=int)
+        ocp.constraints.idxsh_e = np.arange(num_obstacles, dtype=int)
+        ocp.constraints.lsh = np.zeros(num_obstacles)
+        ocp.constraints.ush = np.full(num_obstacles, 1e15)
+        ocp.constraints.lsh_e = np.zeros(num_obstacles)
+        ocp.constraints.ush_e = np.full(num_obstacles, 1e15)
+
+        # Linear slack cost on lower slack only (zu=0: h>=0 cannot be violated from above).
+        # TODO: expose Zl/Zl_e for quadratic penalty if stronger penalization is needed.
+        ocp.cost.zl = obstacle_slack_weight * np.ones(num_obstacles)
+        ocp.cost.zu = np.zeros(num_obstacles)
+        ocp.cost.Zl = np.zeros(num_obstacles)
+        ocp.cost.Zu = np.zeros(num_obstacles)
+        ocp.cost.zl_e = obstacle_slack_weight * np.ones(num_obstacles)
+        ocp.cost.zu_e = np.zeros(num_obstacles)
+        ocp.cost.Zl_e = np.zeros(num_obstacles)
+        ocp.cost.Zu_e = np.zeros(num_obstacles)
 
     # setting constraints
     ocp.constraints.constr_type = 'BGH'  # b: box/decision variables, g: dynamics, h:nonlinear constraints

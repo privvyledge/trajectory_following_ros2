@@ -225,14 +225,14 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
 
     def _control_timer_callback(self):
         """Update obstacle states before each solve, then delegate to base."""
-        if self._num_obstacles > 0 and self._solver is not None:
+        if self._solver is not None and self._num_obstacles > 0:
             if self.obstacle_states is None:
                 self.obstacle_states = np.ones(
                     (self.n_obstacle_states * self._num_obstacles,
                      self.horizon + 1)) * 1000.0
                 self.obstacle_states[2::3, :] = 1.0  # radii
 
-            for k in range(self.horizon):
+            for k in range(self.horizon + 1):  # N+1 to fill terminal column used by Euclidean k=N
                 for j in range(self._num_obstacles):
                     idx = 3 * j
                     if len(self.obstacles) > j:

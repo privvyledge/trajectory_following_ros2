@@ -462,48 +462,45 @@ class DiscreteKinematicMPCCasadi(object):
         if self.n_obstacles > 0:
             distance_expression_list = []
 
-            if self.collision_avoidance_scheme == 'cbf':
-                cbf_list = []  # same
-                h_k_list = []  # same
-
             slack_obs_flag = int(not casadi.is_equal(
                 self.P_obstacle_avoidance, casadi.DM.zeros((self.n_obstacles, self.n_obstacles))))
 
-            for k in range(self.horizon):
-                ego_pose = self.z_dv[0:3, k]  # get ego position (x, y). self.z_dv[0:3, k], z_pred_list[0:3, k]
-                ego_pose_plus_1 = self.z_dv[0:3, k + 1]  # k + 1. self.z_dv[0:3, k + 1], z_pred_list[0:3, k + 1]
+            # Euclidean: constrain stages 0..N (full horizon including terminal k=N).
+            # CBF: constrain stages 0..N-1; the h(k+1) term at k=N-1 implicitly covers k=N.
+            # Previously the loop ran range(self.horizon) for both, leaving the terminal
+            # state unconstrained for Euclidean — fixed here.
+            n_stages = self.horizon + 1 if self.collision_avoidance_scheme == 'euclidean' \
+                else self.horizon
+            for k in range(n_stages):
                 for i in range(self.n_obstacles):
-                    obstacle_state = self.obstacles[3 * i:3 * i + 3, k]  # get obstacle state (x, y, radius)
-                    obstacle_state_plus_1 = self.obstacles[3 * i:3 * i + 3, k + 1]
-                    distance_expression = casadi.sumsqr(
-                        ego_pose[0:2] - obstacle_state[0:2]
-                    )  # avoid norm_2 or sqrt since they have undefined derivatives at 0. casadi.sqrt(casadi.sumsqr(ego_pose[0:2] - obstacle_state[0:2])) is the same as casadi.norm_2(ego_pose[0:2] - obstacle_state[0:2])
-                    distance_expression -= (self.ego_radius + obstacle_state[
-                        2] + self.safe_distance - (slack_obs_flag * self.sl_obs_dv[:, k])) ** 2  # to avoid symbolic values in the LBG constraint. Square to avoid using sqrt in distance_expression above
+                    ego_xy = self.z_dv[0:2, k]
+                    obs_state = self.obstacles[3 * i:3 * i + 3, k]
+                    # Use per-obstacle slack sl_obs_dv[i, k] (scalar).
+                    # Prior code used sl_obs_dv[:, k] (all-obstacle column), which produced
+                    # n_obstacles sub-expressions per constraint and mismatched lbg/ubg for
+                    # n_obstacles > 1.
+                    sl_i = self.sl_obs_dv[i, k] if slack_obs_flag else 0
+                    dist_sq = casadi.sumsqr(ego_xy - obs_state[0:2])
+                    h = dist_sq - (self.ego_radius + obs_state[2]
+                                   + self.safe_distance - sl_i) ** 2
 
-                    if self.collision_avoidance_scheme == "euclidean":
-                        distance_expression_list.append(distance_expression)
-                        lbg = casadi.vertcat(lbg, np.zeros((self.n_obstacles, 1)))  # 0
-                        ubg = casadi.vertcat(ubg, np.ones((self.n_obstacles, 1)) * np.inf)  # np.inf
-                    elif self.collision_avoidance_scheme == "cbf":
-                        h_k = distance_expression  # h(k)
-                        h_k_plus_1 = casadi.sumsqr(ego_pose_plus_1[0:2] - obstacle_state_plus_1[0:2]) - (self.ego_radius + obstacle_state_plus_1[2] + self.safe_distance - (slack_obs_flag * self.sl_obs_dv[:, k + 1])) ** 2  # h(k+1)
-                        delta_h_xk_uk = h_k_plus_1 - h_k
-                        distance_expression_list.append(delta_h_xk_uk + (self.gamma * h_k))
-                        lbg = casadi.vertcat(
-                            lbg, np.zeros((self.n_obstacles, 1)))
-                        ubg = casadi.vertcat(
-                            ubg, np.ones((self.n_obstacles, 1)) * np.inf)
+                    if self.collision_avoidance_scheme == 'euclidean':
+                        distance_expression_list.append(h)
+                        lbg = casadi.vertcat(lbg, casadi.DM([[0.]]))
+                        ubg = casadi.vertcat(ubg, casadi.DM([[casadi.inf]]))
+                    elif self.collision_avoidance_scheme == 'cbf':
+                        ego_xy_next = self.z_dv[0:2, k + 1]
+                        obs_state_next = self.obstacles[3 * i:3 * i + 3, k + 1]
+                        sl_i_next = self.sl_obs_dv[i, k + 1] if slack_obs_flag else 0
+                        dist_sq_next = casadi.sumsqr(ego_xy_next - obs_state_next[0:2])
+                        h_next = dist_sq_next - (self.ego_radius + obs_state_next[2]
+                                                  + self.safe_distance - sl_i_next) ** 2
+                        distance_expression_list.append(h_next - h + self.gamma * h)
+                        lbg = casadi.vertcat(lbg, casadi.DM([[0.]]))
+                        ubg = casadi.vertcat(ubg, casadi.DM([[casadi.inf]]))
 
-                        # h_k_list.append(h_k)
-                    else:
-                        distance_expression = casadi.DM(0)
-                        # todo: add other collision avoidance schemes
             self.obstacle_distances = casadi.vertcat(*distance_expression_list)
-            constraints = casadi.vertcat(
-                constraints,
-                self.obstacle_distances
-            )
+            constraints = casadi.vertcat(constraints, self.obstacle_distances)
 
         # lbx = [-casadi.inf, -casadi.inf, vel_bound[0], -2 * casadi.pi] * (self.horizon + 1)  # state constraints
         # ubx = [casadi.inf, casadi.inf, vel_bound[1], 2 * casadi.pi] * (self.horizon + 1)  # state constraints
