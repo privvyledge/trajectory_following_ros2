@@ -190,7 +190,7 @@ class MPC(object):
         mterm = (self.Qf[0, 0] * (self.model.x['pos_x'] - self.model.tvp['x_ref']) ** 2
                  + self.Qf[1, 1] * (self.model.x['pos_y'] - self.model.tvp['y_ref']) ** 2
                  + self.Qf[2, 2] * (self.model.x['vel'] - self.model.tvp['vel_ref']) ** 2
-                 # + self.Qf[3, 3] * (self.model.x['psi'] - self.model.tvp['psi_ref']) ** 2
+                 + self.Qf[3, 3] * (self.model.aux['psi_diff']) ** 2
                  )  # terminal/mayer cost
 
         # lterm = lterm + self.R[0, 0] * (self.model.u['acc'] ** 2) + \
