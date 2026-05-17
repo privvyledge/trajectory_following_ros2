@@ -14,8 +14,8 @@ class KinematicBicycleModel(object):
     """docstring for ClassName"""
 
     def __init__(self, nx=4, nu=2, x0=None,
-                 vel_bound=(-5.0, 5.0), delta_bound=(-23.0, 23.0), acc_bound=(-3.0, 3.0),
-                 jerk_bound=(-1.5, 1.5), delta_rate_bound=(-352.9411764706, 352.9411764706),
+                 vel_bound=(-5.0, 5.0), delta_bound=(-np.radians(23.0), np.radians(23.0)), acc_bound=(-3.0, 3.0),
+                 jerk_bound=(-1.5, 1.5), delta_rate_bound=(-np.radians(352.9411764706), np.radians(352.9411764706)),
                  vehicle_parameters=None, sample_time=0.001, symbol_type='MX',
                  model_type='kinematic', model_name='vehicle_kinematic_model', discretization_method='cvodes',
                  discrete=False):
@@ -184,15 +184,15 @@ class KinematicBicycleModel(object):
         # model.psi_max = -2 * np.pi
 
         # input bounds
-        model.delta_min = np.radians(delta_bound[0])  # minimum steering angle [rad]
-        model.delta_max = np.radians(delta_bound[1])  # maximum steering angle [rad]
+        model.delta_min = delta_bound[0]  # minimum steering angle [rad]
+        model.delta_max = delta_bound[1]  # maximum steering angle [rad]
 
         model.acc_min = acc_bound[0]
         model.acc_max = acc_bound[1]
 
         # input rate bounds. Todo: setup as non-linear constraints
-        model.delta_rate_min = np.radians(delta_rate_bound[0])
-        model.delta_rate_max = np.radians(delta_rate_bound[1])
+        model.delta_rate_min = delta_rate_bound[0]
+        model.delta_rate_max = delta_rate_bound[1]
 
         model.jerk_min = jerk_bound[0]
         model.jerk_max = jerk_bound[1]
@@ -370,15 +370,15 @@ class KinematicBicycleModel(object):
         # model.psi_max = -2 * np.pi
 
         # input bounds
-        model.delta_min = np.radians(delta_bound[0])  # minimum steering angle [rad]
-        model.delta_max = np.radians(delta_bound[1])  # maximum steering angle [rad]
+        model.delta_min = delta_bound[0]  # minimum steering angle [rad]
+        model.delta_max = delta_bound[1]  # maximum steering angle [rad]
 
         model.acc_min = acc_bound[0]
         model.acc_max = acc_bound[1]
 
         # input rate bounds. Todo: setup as non-linear constraints
-        model.delta_rate_min = np.radians(delta_rate_bound[0])
-        model.delta_rate_max = np.radians(delta_rate_bound[1])
+        model.delta_rate_min = delta_rate_bound[0]
+        model.delta_rate_max = delta_rate_bound[1]
 
         model.jerk_min = jerk_bound[0]
         model.jerk_max = jerk_bound[1]
@@ -528,8 +528,8 @@ class KinematicBicycleModel(object):
 
 if __name__ == '__main__':
     kin_bic_model = KinematicBicycleModel(nx=4, nu=2, x0=None,
-                                          vel_bound=(-5.0, 5.0), delta_bound=(-23.0, 23.0), acc_bound=(-3.0, 3.0),
-                                          jerk_bound=(-1.5, 1.5), delta_rate_bound=(-352.9411764706, 352.9411764706),
+                                          vel_bound=(-5.0, 5.0), delta_bound=(-np.radians(23.0), np.radians(23.0)), acc_bound=(-3.0, 3.0),
+                                          jerk_bound=(-1.5, 1.5), delta_rate_bound=(-np.radians(352.9411764706), np.radians(352.9411764706)),
                                           vehicle_parameters=None, sample_time=0.001,
                                           model_type='kinematic', model_name='vehicle_kinematic_model',
                                           discretization_method='cvodes')

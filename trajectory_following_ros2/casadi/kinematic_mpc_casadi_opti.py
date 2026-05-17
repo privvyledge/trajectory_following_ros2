@@ -41,8 +41,8 @@ class KinematicMPCCasadiOpti(object):
                  nx=4, nu=2, x0=None, u0=None,
                  Q=(1e-1, 1e-8, 1e-8, 1e-8), R=(1e-3, 5e-3),
                  Qf=(0.0, 0.0, 0.0, 0.0), Rd=(0.0, 0.0),
-                 vel_bound=(-5.0, 5.0), delta_bound=(-23.0, 23.0), acc_bound=(-3.0, 3.0),
-                 jerk_bound=(-1.5, 1.5), delta_rate_bound=(-352.9411764706, 352.9411764706),
+                 vel_bound=(-5.0, 5.0), delta_bound=(-np.radians(23.0), np.radians(23.0)), acc_bound=(-3.0, 3.0),
+                 jerk_bound=(-1.5, 1.5), delta_rate_bound=(-np.radians(352.9411764706), np.radians(352.9411764706)),
                  warmstart=True, solver_options=None, solver_type='nlp', solver='ipopt', suppress_ipopt_output=True,
                  normalize_yaw_error=True,
                  slack_weights_u_rate=(0.0, 0.0),  # (1e-6, 1e-6)
@@ -216,7 +216,7 @@ class KinematicMPCCasadiOpti(object):
             jerk_bound=None, delta_rate_bound=None, reset=False
     ):
         if delta_bound is None:
-            delta_bound = [-23.0, 23.0]
+            delta_bound = [-np.radians(23.0), np.radians(23.0)]
 
         if vel_bound is None:
             vel_bound = [-10.0, 10.0]
@@ -228,7 +228,7 @@ class KinematicMPCCasadiOpti(object):
             jerk_bound = [-1.5, 1.5]
 
         if delta_rate_bound is None:
-            delta_rate_bound = [-352.9411764706, 352.9411764706]
+            delta_rate_bound = [-np.radians(352.9411764706), np.radians(352.9411764706)]
 
         # initial state constraints
         self.mpc.subject_to(self.x_dv[0] == self.current_state[0])
@@ -315,9 +315,9 @@ class KinematicMPCCasadiOpti(object):
         # Input Bound Constraints
         self.mpc.subject_to(self.mpc.bounded(acc_bound[0], self.acc_dv, acc_bound[1]))
         self.mpc.subject_to(
-            self.mpc.bounded(np.radians(delta_bound[0]),
+            self.mpc.bounded(delta_bound[0],
                              self.delta_dv,
-                             np.radians(delta_bound[1])))
+                             delta_bound[1]))
 
         # Input Rate Bound Constraints. todo: refactor without for loop and test, i.e use a for-loop or map to assign the rates and set the bound
         slack_flag = int(not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))))
@@ -329,9 +329,9 @@ class KinematicMPCCasadiOpti(object):
                 (jerk_bound[1] * self.Ts) + (slack_flag * self.V_scale_u_rate[0, 0] * self.sl_acc_dv[0])))
 
         self.mpc.subject_to(self.mpc.bounded(
-                (np.radians(delta_rate_bound[0]) * self.Ts) - (slack_flag * self.V_scale_u_rate[1, 1] * self.sl_delta_dv[0]),
+                (delta_rate_bound[0] * self.Ts) - (slack_flag * self.V_scale_u_rate[1, 1] * self.sl_delta_dv[0]),
                 self.delta_rate_dv[0],
-                (np.radians(delta_rate_bound[1]) * self.Ts) + (slack_flag * self.V_scale_u_rate[1, 1] * self.sl_delta_dv[0])))
+                (delta_rate_bound[1] * self.Ts) + (slack_flag * self.V_scale_u_rate[1, 1] * self.sl_delta_dv[0])))
 
         for i in range(self.horizon - 1):
             self.jerk_dv[i + 1] = self.acc_dv[i + 1] - self.acc_dv[i]
@@ -341,9 +341,9 @@ class KinematicMPCCasadiOpti(object):
                     self.jerk_dv[i + 1],
                     (jerk_bound[1] * self.Ts) + (slack_flag * self.V_scale_u_rate[0, 0] * self.sl_acc_dv[i + 1])))
             self.mpc.subject_to(self.mpc.bounded(
-                    (np.radians(delta_rate_bound[0]) * self.Ts) - (slack_flag * self.V_scale_u_rate[1, 1] * self.sl_delta_dv[i + 1]),
+                    (delta_rate_bound[0] * self.Ts) - (slack_flag * self.V_scale_u_rate[1, 1] * self.sl_delta_dv[i + 1]),
                     self.delta_rate_dv[i + 1],
-                    (np.radians(delta_rate_bound[1]) * self.Ts) + (slack_flag * self.V_scale_u_rate[1, 1] * self.sl_delta_dv[i + 1])
+                    (delta_rate_bound[1] * self.Ts) + (slack_flag * self.V_scale_u_rate[1, 1] * self.sl_delta_dv[i + 1])
             ))
         # Slack Bound Constraints.
         if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
