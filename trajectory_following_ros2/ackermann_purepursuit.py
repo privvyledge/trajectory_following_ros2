@@ -20,6 +20,8 @@ class AckermannPurePursuit(BaseTrajectoryTracker):
     pub/sub infrastructure (odom, path, speed callbacks, publishers).
     """
 
+    _odom_topic_default = 'odometry/filtered'
+
     def __init__(self):
         super().__init__('purepursuit')
         # Re-create yaw_rate publisher under purepursuit namespace
@@ -31,9 +33,6 @@ class AckermannPurePursuit(BaseTrajectoryTracker):
     # ------------------------------------------------------------------
 
     def _declare_backend_parameters(self):
-        # PP overrides the odom default to match the old node's default
-        # (odom_topic is already declared in base, but we need to override
-        #  the default. Easiest: just set it in our __init__ after super().__init__.)
         self.declare_parameter('lookahead_distance', 0.4)
         self.declare_parameter('min_lookahead', 0.3)
         self.declare_parameter('max_lookahead', 10.452)

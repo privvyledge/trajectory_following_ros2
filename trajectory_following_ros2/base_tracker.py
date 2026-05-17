@@ -9,9 +9,10 @@ from scipy import interpolate
 
 import rclpy
 from rclpy.node import Node
-from rclpy.parameter import Parameter
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.duration import Duration
+from rclpy.time import Time
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult, ParameterType
 
 from tf2_ros.transform_listener import TransformListener
@@ -41,7 +42,12 @@ class BaseTrajectoryTracker(Node, ABC):
 
     For non-MPC controllers (e.g. Pure Pursuit) that do not use BaseSolver,
     override _control_timer_callback() completely and return None from _init_solver().
+
+    Override ``_odom_topic_default`` as a class attribute to change the default
+    odometry topic (MPC nodes: ``odometry/local``; PurePursuit: ``odometry/filtered``).
     """
+
+    _odom_topic_default: str = 'odometry/local'
 
     def __init__(self, node_name: str):
         super().__init__(node_name)
@@ -103,7 +109,7 @@ class BaseTrajectoryTracker(Node, ABC):
                                descriptor=ParameterDescriptor(type=ParameterType.PARAMETER_DOUBLE_ARRAY))
         self.declare_parameter('path_topic', 'trajectory/path')
         self.declare_parameter('speed_topic', 'trajectory/speed')
-        self.declare_parameter('odom_topic', 'odometry/local')
+        self.declare_parameter('odom_topic', self._odom_topic_default)
         self.declare_parameter('acceleration_topic', 'accel/local')
         self.declare_parameter('ackermann_cmd_topic', 'drive')
         self.declare_parameter('publish_twist_topic', True)
@@ -204,6 +210,7 @@ class BaseTrajectoryTracker(Node, ABC):
         self.run_count = 0
         self.solution_status = False
         self.warmstart_variables = {}
+        self._consecutive_failures = 0
 
         self._last_odom_stamp = None
 
@@ -271,13 +278,38 @@ class BaseTrajectoryTracker(Node, ABC):
 
     def path_callback(self, data: Path):
         path_frame_id = data.header.frame_id
+
+        # Resolve TF if path is not already in the controller's global frame.
+        tf_tx = tf_ty = tf_yaw = 0.0
+        if path_frame_id and path_frame_id != self.global_frame:
+            try:
+                tf_stamped = self.tf_buffer.lookup_transform(
+                    self.global_frame, path_frame_id, Time(),
+                    timeout=Duration(seconds=1.0))
+                t = tf_stamped.transform.translation
+                r = tf_stamped.transform.rotation
+                tf_tx, tf_ty = t.x, t.y
+                _, _, tf_yaw = tf_transformations.euler_from_quaternion(
+                    [r.x, r.y, r.z, r.w])
+            except Exception as e:
+                self.get_logger().error(
+                    f'path_callback: cannot transform {path_frame_id} → '
+                    f'{self.global_frame}: {e}')
+                return
+
+        cos_tf = math.cos(tf_yaw)
+        sin_tf = math.sin(tf_yaw)
+
         coordinate_list, yaw_list = [], []
         for pose_msg in data.poses:
             p = pose_msg.pose.position
-            coordinate_list.append([p.x, p.y])
+            coordinate_list.append([
+                cos_tf * p.x - sin_tf * p.y + tf_tx,
+                sin_tf * p.x + cos_tf * p.y + tf_ty,
+            ])
             q = pose_msg.pose.orientation
             _, _, yaw = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
-            yaw_list.append(yaw)
+            yaw_list.append(yaw + tf_yaw)
 
         self.path = np.array(coordinate_list)
         self.des_yaw_list = np.array(yaw_list)
@@ -413,7 +445,24 @@ class BaseTrajectoryTracker(Node, ABC):
         # 10. Solve
         result: SolverResult = self._solver.solve(x0, xref, self.u_prev.flatten())
 
-        # 11. Unpack result
+        # 11. Track consecutive failures; zero-command safety after N=5.
+        if result.is_optimal:
+            self._consecutive_failures = 0
+            self.u_prev[:, 0] = result.u_prev
+        else:
+            self._consecutive_failures += 1
+            self.get_logger().warn(
+                f'Solver suboptimal (status={result.status}, '
+                f'consecutive={self._consecutive_failures})',
+                throttle_duration_sec=1.0)
+            if self._consecutive_failures >= 5:
+                self.get_logger().error(
+                    f'{self._consecutive_failures} consecutive solver failures — zeroing commands.',
+                    throttle_duration_sec=1.0)
+                self._publish_zero_command()
+                return
+
+        # Unpack result
         self.acc_cmd = result.accel_cmd
         self.delta_cmd = result.steering_cmd
         self.velocity_cmd = result.velocity_cmd
@@ -421,9 +470,6 @@ class BaseTrajectoryTracker(Node, ABC):
         self.delta_rate_cmd = result.steering_rate_cmd
         self.solution_time = result.solve_time
         self.solution_status = result.is_optimal
-
-        if result.is_optimal:
-            self.u_prev[:, 0] = result.u_prev
 
         self.uk[0, 0] = self.acc_cmd
         self.uk[1, 0] = self.delta_cmd
