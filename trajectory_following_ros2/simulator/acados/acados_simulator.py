@@ -61,13 +61,15 @@ class Simulator(object):
             *np.zeros(nx),  # zk
             *np.zeros(nu),  # u_prev
         ])
-        sim.solver_options.integrator_type = 'IRK'  # IRK, ERK, GNSF
-        # for implicit integrator
-        # sim.solver_options.newton_iter = 10  # for implicit integrator
-        # sim.solver_options.newton_tol = 1e-8
-        # sim.solver_options.collocation_type = "GAUSS_LEGENDRE"
-        sim.solver_options.num_stages = 4  # 8, 4, 2
-        sim.solver_options.num_steps = 3  # 100, 3, 2
+        sim.solver_options.integrator_type = 'ERK'  # IRK, ERK, GNSF
+        # num_stages: ERK order = num_stages (4 → RK4). Increase to 6/8 only if
+        #   the ODE is stiff or high-frequency; for a kinematic bicycle at ≤50 Hz
+        #   RK4 (4 stages) is more than sufficient.
+        sim.solver_options.num_stages = 4  # RK4
+        # num_steps: sub-steps per control interval T=dt. 1 is fine when dt ≤ 0.05 s
+        #   and dynamics are smooth. Increase (e.g. 3–5) if you see drift at higher
+        #   speeds, larger dt, or when validating against a reference integrator.
+        sim.solver_options.num_steps = 1
         # sim.solver_options.nlp_solver_tol_eq = 1e-9
         sim.solver_options.T = dt
         # sensitivity_propagation

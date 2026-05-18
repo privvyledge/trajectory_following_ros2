@@ -36,8 +36,8 @@ class Simulator(object):
         # Setup the parameters for the simulator
         simulator_params = {
             'integration_tool': 'cvodes',
-            'abstol': 1e-10,
-            'reltol': 1e-10,
+            'abstol': 1e-6,
+            'reltol': 1e-6,
             't_step': sample_time
         }
         self.simulator.set_param(**simulator_params)
