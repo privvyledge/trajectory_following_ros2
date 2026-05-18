@@ -27,6 +27,7 @@ from geometry_msgs.msg import AccelWithCovarianceStamped, PoseStamped
 from trajectory_following_ros2.utils.Trajectory import Trajectory
 import trajectory_following_ros2.utils.trajectory_utils as trajectory_utils
 from trajectory_following_ros2.backends.base_solver import BaseSolver, SolverResult
+from trajectory_following_ros2.utils.mpc_weight_utils import bryson_weights
 
 try:
     OBSTACLES_AVAILABLE = True
@@ -129,6 +130,15 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('obstacle_topic', 'fake_obstacles/object_array')
         self.declare_parameter('obstacle_collision_avoidance_method', 'euclidean')
 
+        # Bryson's rule weight parameters (active when use_bryson_weights: true)
+        self.declare_parameter('use_bryson_weights', False)
+        self.declare_parameter('max_error_x', 1.0)    # m
+        self.declare_parameter('max_error_y', 0.3)    # m
+        self.declare_parameter('max_error_v', 0.5)    # m/s
+        self.declare_parameter('max_error_psi', 0.1)  # rad
+        self.declare_parameter('bryson_max_accel', 3.0)   # m/s²
+        self.declare_parameter('bryson_max_steer', 0.4)   # rads
+
     def _read_parameters(self):
         self.robot_frame = self.get_parameter('robot_frame').value
         self.global_frame = self.get_parameter('global_frame').value
@@ -139,6 +149,11 @@ class BaseTrajectoryTracker(Node, ABC):
         self.WHEELBASE = self.get_parameter('wheelbase').value
         self.MAX_STEER_ANGLE = math.radians(self.get_parameter('max_steer').value)
         self.MIN_STEER_ANGLE = math.radians(self.get_parameter('min_steer').value)
+        if abs(self.MAX_STEER_ANGLE) > math.pi:
+            self.get_logger().warn(
+                f'max_steer={self.get_parameter("max_steer").value} deg converts to '
+                f'{self.MAX_STEER_ANGLE:.3f} rad — value > π rad; '
+                'did you declare it in radians instead of degrees?')
         self.MIN_JERK = self.get_parameter('min_jerk').value
         self.MAX_JERK = self.get_parameter('max_jerk').value
         self.MAX_STEER_RATE = math.radians(self.get_parameter('max_steer_rate').value)
@@ -154,11 +169,31 @@ class BaseTrajectoryTracker(Node, ABC):
         self.NU = self.get_parameter('n_inputs').value
         self.horizon = int(self.get_parameter('horizon').value)
         self.prediction_time = self.get_parameter('prediction_time').value
-        self.R = np.diag(self.get_parameter('R').get_parameter_value().double_array_value)
-        self.Rd = np.diag(self.get_parameter('Rd').get_parameter_value().double_array_value)
-        self.Q = np.diag(self.get_parameter('Q').get_parameter_value().double_array_value)
-        qf_vals = self.get_parameter('Qf').get_parameter_value().double_array_value
-        self.Qf = np.diag(qf_vals) if qf_vals is not None else self.Q.copy()
+        if self.get_parameter('use_bryson_weights').value:
+            self.Q, self.R, _Rd = bryson_weights(
+                max_state_errors={
+                    'x':   self.get_parameter('max_error_x').value,
+                    'y':   self.get_parameter('max_error_y').value,
+                    'v':   self.get_parameter('max_error_v').value,
+                    'psi': self.get_parameter('max_error_psi').value,
+                },
+                max_inputs={
+                    'a':     self.get_parameter('bryson_max_accel').value,
+                    'delta': self.get_parameter('bryson_max_steer').value,
+                },
+                max_input_rates={
+                    'jerk':       abs(self.get_parameter('max_jerk').value),
+                    'steer_rate': self.MAX_STEER_RATE,
+                },
+            )
+            self.Rd = _Rd
+            self.Qf = self.Q.copy()
+        else:
+            self.R = np.diag(self.get_parameter('R').get_parameter_value().double_array_value)
+            self.Rd = np.diag(self.get_parameter('Rd').get_parameter_value().double_array_value)
+            self.Q = np.diag(self.get_parameter('Q').get_parameter_value().double_array_value)
+            qf_vals = self.get_parameter('Qf').get_parameter_value().double_array_value
+            self.Qf = np.diag(qf_vals) if qf_vals is not None else self.Q.copy()
         self.path_topic = self.get_parameter('path_topic').value
         self.speed_topic = self.get_parameter('speed_topic').value
         self.odom_topic = self.get_parameter('odom_topic').value

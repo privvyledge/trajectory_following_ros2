@@ -29,3 +29,15 @@
 
     generate_mpc_model: True
     build_with_cython: True
+
+    # Bryson's rule weight computation (use_bryson_weights: true ignores Q/R/Rd/Qf above)
+    # Q_ii = 1/e_max_i², R_jj = 1/u_max_j², Rd_jj = 1/udot_max_j²
+    # Qf is set equal to Q. Rd uses max_jerk and max_steer_rate (already declared above).
+    # NOTE: bryson_max_steer is in RADIANS (unlike max_steer which is in degrees).
+    use_bryson_weights: false
+    max_error_x: 1.0      # m     → Q_x   = 1.0
+    max_error_y: 0.3      # m     → Q_y   ≈ 11.1  (tighter laterally)
+    max_error_v: 0.5      # m/s   → Q_v   = 4.0
+    max_error_psi: 0.1    # rad   → Q_psi = 100.0
+    bryson_max_accel: 3.0 # m/s²  → R_a   ≈ 0.11
+    bryson_max_steer: 0.4 # rad   → R_d   = 6.25  (NOT degrees)
