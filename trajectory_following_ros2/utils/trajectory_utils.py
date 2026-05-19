@@ -326,6 +326,33 @@ def calculate_current_arc_length(current_speed, normalized_yaw_diff, dt):
     return s
 
 
+def predict_state_rk4(x0, u, delay, wheelbase):
+    """Propagate kinematic bicycle state forward by `delay` seconds (RK4, constant u). 
+    Todo: in future could handle different models, e.g dynamics
+
+    State: [x, y, v, psi].  Inputs: [a, delta] (rad).  Rear-axle reference point.
+    """
+    if delay <= 0.0:
+        return x0
+    a, delta = float(u[0]), float(u[1])
+    tan_d = math.tan(delta)
+
+    def f(x):
+        v, psi = x[2], x[3]
+        return np.array([
+            v * math.cos(psi),
+            v * math.sin(psi),
+            a,
+            (v / wheelbase) * tan_d if wheelbase > 0 else 0.0,
+        ])
+
+    k1 = f(x0)
+    k2 = f(x0 + delay / 2 * k1)
+    k3 = f(x0 + delay / 2 * k2)
+    k4 = f(x0 + delay * k3)
+    return x0 + (delay / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+
 def calculate_curvature_all(cdists, psis, smooth=True):
     """
     Calculates the curvature of every point and optionally smoothes them

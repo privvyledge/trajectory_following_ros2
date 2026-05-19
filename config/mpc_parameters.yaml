@@ -41,3 +41,10 @@
     max_error_psi: 0.1    # rad   → Q_psi = 100.0
     bryson_max_accel: 3.0 # m/s²  → R_a   ≈ 0.11
     bryson_max_steer: 0.4 # rad   → R_d   = 6.25  (NOT degrees)
+
+    # MPC computation delay compensation (Method A: forward simulation with RK4)
+    # Set estimated_delay to sensor_lag + expected_solve_time + actuator_deadtime (seconds).
+    # delay_compensation_method: 'forward_simulation' (only supported option for now)
+    delay_compensation_enabled: false
+    delay_compensation_method: 'forward_simulation'
+    estimated_delay: 0.0

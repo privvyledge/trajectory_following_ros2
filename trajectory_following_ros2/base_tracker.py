@@ -129,6 +129,10 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('ego_radius', -1.0)
         self.declare_parameter('obstacle_topic', 'fake_obstacles/object_array')
         self.declare_parameter('obstacle_collision_avoidance_method', 'euclidean')
+        self.declare_parameter('actuator_feedback_topic', '')
+        self.declare_parameter('delay_compensation_enabled', False)
+        self.declare_parameter('delay_compensation_method', 'forward_simulation')
+        self.declare_parameter('estimated_delay', 0.0)
 
         # Bryson's rule weight parameters (active when use_bryson_weights: true)
         self.declare_parameter('use_bryson_weights', False)
@@ -199,6 +203,10 @@ class BaseTrajectoryTracker(Node, ABC):
         self.odom_topic = self.get_parameter('odom_topic').value
         self.acceleration_topic = self.get_parameter('acceleration_topic').value
         self.ackermann_cmd_topic = self.get_parameter('ackermann_cmd_topic').value
+        self.actuator_feedback_topic = self.get_parameter('actuator_feedback_topic').value
+        self.delay_compensation_enabled = self.get_parameter('delay_compensation_enabled').value
+        self.delay_compensation_method = self.get_parameter('delay_compensation_method').value
+        self.estimated_delay = self.get_parameter('estimated_delay').value
         self.publish_twist_topic = self.get_parameter('publish_twist_topic').value
         self.twist_topic = self.get_parameter('twist_topic').value
         self.desired_speed = self.get_parameter('desired_speed').value
@@ -305,6 +313,12 @@ class BaseTrajectoryTracker(Node, ABC):
         self.drive_echo_sub = self.create_subscription(
             AckermannDriveStamped, self.ackermann_cmd_topic, self._drive_echo_callback,
             1, callback_group=self.subscription_group)
+        if self.actuator_feedback_topic and self.actuator_feedback_topic != self.ackermann_cmd_topic:
+            self.actuator_feedback_sub = self.create_subscription(
+                AckermannDriveStamped, self.actuator_feedback_topic, self._drive_echo_callback,
+                1, callback_group=self.subscription_group)
+            self.get_logger().info(
+                f'Actuator feedback u_prev source: {self.actuator_feedback_topic}')
 
         self.ackermann_cmd_pub = self.create_publisher(
             AckermannDriveStamped, self.ackermann_cmd_topic, 1)
@@ -557,6 +571,11 @@ class BaseTrajectoryTracker(Node, ABC):
         # 10. Solve
         with self.mutex:
             u_prev_snapshot = self.u_prev.copy()
+
+        if self.delay_compensation_enabled and self.estimated_delay > 0.0:
+            x0 = trajectory_utils.predict_state_rk4(
+                x0, u_prev_snapshot.flatten(), self.estimated_delay, self.WHEELBASE)
+
         result: SolverResult = self._solver.solve(x0, xref, u_prev_snapshot.flatten())
 
         # 11. Track consecutive failures; zero-command safety after N=5.
@@ -729,6 +748,13 @@ class BaseTrajectoryTracker(Node, ABC):
         if not self.mpc_initialized or self.run_count == 0:
             return
 
+        goal_has_subs = self.mpc_goal_pub.get_subscription_count() > 0
+        path_has_subs = self.mpc_path_pub.get_subscription_count() > 0
+        ref_has_subs = self.mpc_reference_path_pub.get_subscription_count() > 0
+
+        if not (goal_has_subs or path_has_subs or ref_has_subs):
+            return
+
         timestamp = self.get_clock().now().to_msg()
 
         goal = self.goal_queue.get(block=False) if not self.goal_queue.empty() else None
@@ -739,7 +765,7 @@ class BaseTrajectoryTracker(Node, ABC):
             self.mpc_reference_states_queue.get(block=False)
             if not self.mpc_reference_states_queue.empty() else None)
 
-        if goal is not None:
+        if goal is not None and goal_has_subs:
             pt = PointStamped()
             pt.header.stamp = timestamp
             pt.header.frame_id = self.global_frame
@@ -747,7 +773,7 @@ class BaseTrajectoryTracker(Node, ABC):
             self.mpc_goal_pub.publish(pt)
 
         # todo: vectorize the loops since they are just lists and use np.tolist()
-        if mpc_predicted_states is not None:
+        if mpc_predicted_states is not None and path_has_subs:
             path_msg = Path()
             path_msg.header.stamp = timestamp
             path_msg.header.frame_id = self.global_frame
@@ -765,7 +791,7 @@ class BaseTrajectoryTracker(Node, ABC):
                 path_msg.poses.append(pose)
             self.mpc_path_pub.publish(path_msg)
 
-        if mpc_reference_states is not None:
+        if mpc_reference_states is not None and ref_has_subs:
             ref_msg = Path()
             ref_msg.header.stamp = timestamp
             ref_msg.header.frame_id = self.global_frame
