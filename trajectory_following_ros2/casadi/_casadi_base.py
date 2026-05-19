@@ -236,6 +236,9 @@ class KinematicMPCBase(ABC):
                 solver_options=self.solver_options,
                 solver=solver, solver_type=solver_type)
 
+        self.solution = None
+        self.solution_dict = None
+
         for _ in range(5):
             self.solution = self.solve()
 

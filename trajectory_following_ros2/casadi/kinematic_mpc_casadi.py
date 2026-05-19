@@ -3,26 +3,6 @@ See:
     To parallelize casadi:
         * https://web.casadi.org/docs/#for-loop-equivalents
         * https://github.com/nirajbasnet/Nonlinear_MPCC_for_autonomous_racing/blob/master/nonlinear_mpc_casadi/scripts/Nonlinear_MPC.py#L157
-
-Todo:
-    * set solver [done]
-    * simulate [done]
-    * setup cost and constraints using vertcat [done]
-    * set constraints as lbx, lbg, ubx, ubg instead [done]
-    * add terminal state cost [done]
-    * add rate change cost [done]
-    * add method to set weights [done]
-    * add method to reset, i.e set all back to zero, e.g u_prev, z_k, z_dv, z_ref, [Done]
-    * add solver options [Done]
-    * add model generation/loading, i.e code generation or compilation
-        * Do-mpc example:
-    * create run method to first update, (optionally) set weights, (optionally) reset, solve
-    * setup rate constraints [done]
-    * setup slack on rate constraints
-    * rename variables
-    * replace for loops with map
-    * implement my discretizer
-
 """
 import time
 import numpy as np
@@ -507,6 +487,7 @@ class KinematicMPCCasadi(KinematicMPCBase):
                     'solver_stats': self.solver.stats()
                     }
 
+        self.solution_dict = sol_dict
         return sol_dict
 
 
