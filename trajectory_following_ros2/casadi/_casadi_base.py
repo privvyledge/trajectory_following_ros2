@@ -14,6 +14,8 @@ class KinematicMPCBase(ABC):
         solve                 -- return sol_dict
     """
 
+    _use_symbolic_weights: bool = True
+
     def __init__(self, vehicle=None, horizon=15, sample_time=0.02, wheelbase=0.256,
                  nx=4, nu=2, x0=None, u0=None,
                  Q=(1e-1, 1e-8, 1e-8, 1e-8), R=(1e-3, 5e-3),
@@ -44,6 +46,10 @@ class KinematicMPCBase(ABC):
         self.R = casadi.diag(R)
         self.Qf = casadi.diag(Qf)
         self.Rd = casadi.diag(Rd)
+        self.Q_diag_value = casadi.DM(Q).flatten()
+        self.R_diag_value = casadi.DM(R).flatten()
+        self.Qf_diag_value = casadi.DM(Qf).flatten()
+        self.Rd_diag_value = casadi.DM(Rd).flatten()
         self.P_u_rate = (casadi.diag(slack_weights_u_rate)
                          if slack_weights_u_rate is not None
                          else casadi.DM.zeros(self.nu, self.nu))
@@ -268,6 +274,15 @@ class KinematicMPCBase(ABC):
                                    casadi.DM.zeros(self.n_obstacles, self.n_obstacles)):
                 self.sl_obs_dv = self.symbol_type.sym(
                     'sl_obs_dv', self.n_obstacles, horizon + 1)
+        if self._use_symbolic_weights:
+            self.Q_sym = self.symbol_type.sym('Q_diag', nx)
+            self.R_sym = self.symbol_type.sym('R_diag', nu)
+            self.Qf_sym = self.symbol_type.sym('Qf_diag', nx)
+            self.Rd_sym = self.symbol_type.sym('Rd_diag', nu)
+            self.Q = casadi.diag(self.Q_sym)
+            self.R = casadi.diag(self.R_sym)
+            self.Qf = casadi.diag(self.Qf_sym)
+            self.Rd = casadi.diag(self.Rd_sym)
         objective = 0.0
         constraints = []
         return mpc, objective, constraints
@@ -384,13 +399,14 @@ class KinematicMPCBase(ABC):
             self.lam_g_value = warmstart_variables['lam_g']
             self.lam_p_value = warmstart_variables['lam_p']
 
-    def set_weights(self, Q, R, Qf=None, Rd=None):
-        self.Q = casadi.diag(Q)
-        self.R = casadi.diag(R)
-        if Qf is not None:
-            self.Qf = casadi.diag(Qf)
-        if Rd is not None:
-            self.Rd = casadi.diag(Rd)
+    def set_weights(self, Q, R, Rd, Qf):
+        def _to_flat(w):
+            w = np.asarray(w, dtype=float)
+            return np.diag(w) if w.ndim == 2 else w.flatten()
+        self.Q_diag_value = _to_flat(Q)
+        self.R_diag_value = _to_flat(R)
+        self.Rd_diag_value = _to_flat(Rd)
+        self.Qf_diag_value = _to_flat(Qf)
 
     def reset(self, z0=None):
         if z0 is None:

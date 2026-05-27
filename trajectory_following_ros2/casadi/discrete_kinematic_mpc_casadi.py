@@ -300,6 +300,9 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
                 self.obstacles, 3 * self.n_obstacles * (self.horizon + 1), 1)
             opt_params = casadi.vertcat(opt_params, flat_obstacles, self.ego_radius)
 
+        if self._use_symbolic_weights:
+            opt_params = casadi.vertcat(opt_params, self.Q_sym, self.R_sym, self.Qf_sym, self.Rd_sym)
+
         g = casadi.vertcat(constraints)
 
         optimization_prob = {'f': cost, 'x': opt_variables, 'p': opt_params, 'g': g}
@@ -570,6 +573,14 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
                                    3 * self.n_obstacles * (self.horizon + 1), 1),
                     self.ego_radius_value
                 )
+            if self._use_symbolic_weights:
+                opt_parameters = casadi.vertcat(
+                    opt_parameters,
+                    casadi.DM(self.Q_diag_value),
+                    casadi.DM(self.R_diag_value),
+                    casadi.DM(self.Qf_diag_value),
+                    casadi.DM(self.Rd_diag_value),
+                )
 
             dual_variables = {}
             if self.warmstart:
@@ -727,8 +738,9 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
             z_k_value = casadi.reshape(
                 opt_parameters[self.nx * (self.horizon + 1):self.nx * (self.horizon + 1) + self.nx],
                 self.nx, 1).full()
+            _up_start = self.nx * (self.horizon + 1) + self.nx
             u_prev_value = casadi.reshape(
-                opt_parameters[self.nx * (self.horizon + 1) + self.nx:],
+                opt_parameters[_up_start:_up_start + self.nu],
                 self.nu, 1).full()
             iteration_count = None
             is_opt = False

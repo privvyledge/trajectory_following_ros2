@@ -20,7 +20,12 @@ class AcadosSolverAdapter(BaseSolver):
     def __init__(self, controller, horizon: int, wheelbase: float,
                  stage_cost_type: str = 'NONLINEAR_LS',
                  terminal_cost_type: str = 'NONLINEAR_LS',
-                 num_obstacles: int = 0, ego_radius: float = 1.0):
+                 num_obstacles: int = 0, ego_radius: float = 1.0,
+                 has_weight_params: bool = False,
+                 Q: Optional[np.ndarray] = None,
+                 R: Optional[np.ndarray] = None,
+                 Qe: Optional[np.ndarray] = None,
+                 Rd: Optional[np.ndarray] = None):
         self._controller = controller
         self._horizon = horizon
         self._wheelbase = wheelbase
@@ -29,9 +34,23 @@ class AcadosSolverAdapter(BaseSolver):
         self._num_obstacles = num_obstacles
         self._ego_radius = ego_radius
         self._obstacle_states: Optional[np.ndarray] = None  # (3*n_obs, N+1)
+        self._has_weight_params = has_weight_params
+        if has_weight_params:
+            self._Q_diag = np.diag(Q) if Q is not None else np.ones(4)
+            self._R_diag = np.diag(R) if R is not None else np.ones(2)
+            self._Qe_diag = np.diag(Qe) if Qe is not None else np.ones(4)
+            self._Rd_diag = np.diag(Rd) if Rd is not None else np.ones(2)
 
     def update_obstacles(self, obstacle_states: np.ndarray) -> None:
         self._obstacle_states = obstacle_states
+
+    def set_weights(self, Q: np.ndarray, R: np.ndarray,
+                    Rd: np.ndarray, Qf: np.ndarray) -> None:
+        if self._has_weight_params:
+            self._Q_diag = np.diag(Q)
+            self._R_diag = np.diag(R)
+            self._Rd_diag = np.diag(Rd)
+            self._Qe_diag = np.diag(Qf)
 
     def _obs_params(self, k: int) -> list:
         """Return the obstacle portion of the p vector for stage k."""
@@ -54,6 +73,10 @@ class AcadosSolverAdapter(BaseSolver):
         self._controller.constraints_set(0, 'lbx', x0)
         self._controller.constraints_set(0, 'ubx', x0)
 
+        weight_params = (
+            [*self._Q_diag, *self._R_diag, *self._Qe_diag, *self._Rd_diag]
+            if self._has_weight_params else []
+        )
         for j in range(self._horizon):
             yref = xref[:, j]
             if self._stage_cost_type in ('LINEAR_LS', 'NONLINEAR_LS'):
@@ -62,6 +85,8 @@ class AcadosSolverAdapter(BaseSolver):
             p = [self._wheelbase, *yref, *np.zeros(2), *x0, *u_prev]
             if self._num_obstacles > 0:
                 p = [*p, *self._obs_params(j)]
+            if self._has_weight_params:
+                p = [*p, *weight_params]
             self._controller.set(j, 'p', np.array(p))
 
         yref_N = xref[:, self._horizon]
@@ -70,6 +95,8 @@ class AcadosSolverAdapter(BaseSolver):
         p_N = [self._wheelbase, *yref_N, *np.zeros(2), *x0, *u_prev]
         if self._num_obstacles > 0:
             p_N = [*p_N, *self._obs_params(self._horizon)]
+        if self._has_weight_params:
+            p_N = [*p_N, *weight_params]
         self._controller.set(self._horizon, 'p', np.array(p_N))
 
         t0 = time.process_time()
@@ -167,7 +194,7 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         cwd = os.getcwd()
         os.chdir(build_path)
 
-        _, _, controller, _ = acados_settings(
+        _, _, controller, _, has_weight_params = acados_settings(
             Tf=self.prediction_time,
             N=self.horizon,
             x0=self.zk,
@@ -207,6 +234,8 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
             terminal_cost_type=terminal_cost_type,
             num_obstacles=num_obstacles,
             ego_radius=ego_radius,
+            has_weight_params=has_weight_params,
+            Q=self.Q, R=self.R, Qe=self.Qf, Rd=self.Rd,
         )
 
     def _control_timer_callback(self):

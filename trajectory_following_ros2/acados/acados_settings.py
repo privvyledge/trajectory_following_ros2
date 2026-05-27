@@ -71,12 +71,23 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     model_ac.xdot = model.xdot
     model_ac.u = model.u
     model_ac.z = model.z
+
     if num_obstacles > 0:
         _obs_states = casadi.SX.sym('obs_states', 3 * num_obstacles)
         _ego_r = casadi.SX.sym('ego_radius_p', 1)
         model_ac.p = casadi.vertcat(model.p, _obs_states, _ego_r)
     else:
         model_ac.p = model.p
+
+    _has_weight_params = (cost_module.lower() == 'external'
+                          and cost_module_e.lower() == 'external')
+    if _has_weight_params:
+        _Q_sym = casadi.SX.sym('Q_diag', model.x.size()[0])
+        _R_sym = casadi.SX.sym('R_diag', model.u.size()[0])
+        _Qe_sym = casadi.SX.sym('Qe_diag', model.x.size()[0])
+        _Rd_sym = casadi.SX.sym('Rd_diag', model.u.size()[0])
+        model_ac.p = casadi.vertcat(model_ac.p, _Q_sym, _R_sym, _Qe_sym, _Rd_sym)
+    
     model_ac.name = model.name
     ocp.model = model_ac
 
@@ -152,6 +163,11 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
             np.ones(3 * num_obstacles) * 1000.0,  # obs_states: far away (won't constrain)
             [ego_radius],
         ])
+    if _has_weight_params:
+        ocp.parameter_values = np.concatenate([
+            ocp.parameter_values,
+            np.diag(Q), np.diag(R), np.diag(Qe), np.diag(Rd),
+        ])
 
     '''
     LINEAR_LS:
@@ -207,16 +223,13 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
 
     elif cost_module.lower() == "EXTERNAL".lower():
         ocp.cost.cost_type = "EXTERNAL"
-        y = casadi.vertcat(
-                model.x,
-                model.u
+        z_err = model.x - zref
+        u_err = model.u - uref
+        u_rate_err = model.u - u_prev  # casadi.vertcat(u_rate, casadi.diff(u_dv))  # to pack with horizon
+        ocp.model.cost_expr_ext_cost = (
+            0.5 * unscale * (casadi.dot(_Q_sym * z_err, z_err) + casadi.dot(_R_sym * u_err, u_err))
+            + 0.5 * casadi.dot(_Rd_sym * u_rate_err, u_rate_err)
         )
-        # cost expression = model.x.T @ Q @ model.x  + model.u.T @ R @ model.u
-        u_rate = model.u - u_prev
-        # u_rate = casadi.vertcat(u_rate, casadi.diff(u_dv))  # to pack with horizon
-
-        u_rate_cost = 0.5 * u_rate.T @ Rd @ u_rate
-        ocp.model.cost_expr_ext_cost = 0.5 * (y - yref).T @ W @ (y - yref) + u_rate_cost  # todo: normalize angle
 
     else:
         raise AttributeError(f'Invalid cost type ({cost_module}) specified.')
@@ -249,11 +262,9 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
 
     elif cost_module_e.lower() == "EXTERNAL".lower():
         ocp.cost.cost_type_e = "EXTERNAL"
-        y_e = casadi.vertcat(
-                model.x,
-        )
         yref_e = yref[:nx]
-        ocp.model.cost_expr_ext_cost_e = 0.5 * (y_e - yref_e).T @ W_e @ (y_e - yref_e)  # todo: normalize angle
+        z_err_e = model.x - yref_e
+        ocp.model.cost_expr_ext_cost_e = 0.5 / unscale * casadi.dot(_Qe_sym * z_err_e, z_err_e)
 
     else:
         raise AttributeError(f'Invalid cost type ({cost_module_e}) specified.')
@@ -388,10 +399,10 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         acados_solver = AcadosOcpSolver(ocp, json_file=mpc_config_file,
                                         build=build, generate=generate, verbose=True)
 
-    return constraint, model, acados_solver, ocp
+    return constraint, model, acados_solver, ocp, _has_weight_params
 
 
 if __name__ == "__main__":
-    constraint, model, acados_solver, ocp = acados_settings(Tf=1.0, N=25)
+    constraint, model, acados_solver, ocp, _ = acados_settings(Tf=1.0, N=25)
     AcadosOcpSolver.generate(ocp, json_file="kinematic_bicycle_acados_ocp.json")
     # AcadosOcpSolver.build(ocp.code_export_directory, with_cython=True)

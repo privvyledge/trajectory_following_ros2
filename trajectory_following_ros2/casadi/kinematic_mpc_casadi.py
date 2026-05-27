@@ -218,6 +218,8 @@ class KinematicMPCCasadi(KinematicMPCBase):
             opt_variables = casadi.vertcat(opt_variables, flat_sl)
 
         opt_params = casadi.vertcat(flat_z_ref, flat_z_k, flat_u_prev)
+        if self._use_symbolic_weights:
+            opt_params = casadi.vertcat(opt_params, self.Q_sym, self.R_sym, self.Qf_sym, self.Rd_sym)
 
         g = casadi.vertcat(constraints)
 
@@ -337,6 +339,14 @@ class KinematicMPCCasadi(KinematicMPCBase):
                 casadi.reshape(self.z_k_value, self.nx, 1),
                 casadi.reshape(self.u_prev_value, self.nu, 1),
             )
+            if self._use_symbolic_weights:
+                opt_parameters = casadi.vertcat(
+                    opt_parameters,
+                    casadi.DM(self.Q_diag_value),
+                    casadi.DM(self.R_diag_value),
+                    casadi.DM(self.Qf_diag_value),
+                    casadi.DM(self.Rd_diag_value),
+                )
 
             dual_variables = {}
             if self.warmstart:
@@ -458,8 +468,9 @@ class KinematicMPCCasadi(KinematicMPCBase):
             z_k_value = casadi.reshape(
                 opt_parameters[self.nx * (self.horizon + 1):self.nx * (self.horizon + 1) + self.nx],
                 self.nx, 1).full()
+            _up_start = self.nx * (self.horizon + 1) + self.nx
             u_prev_value = casadi.reshape(
-                opt_parameters[self.nx * (self.horizon + 1) + self.nx:],
+                opt_parameters[_up_start:_up_start + self.nu],
                 self.nu, 1).full()
             iteration_count = None
             is_opt = False

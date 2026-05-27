@@ -27,6 +27,10 @@ class BaseSolver(ABC):
     def initialize(self, x0: np.ndarray) -> None:
         """One-time warm-start after the first odometry message. Default: no-op."""
 
+    def set_weights(self, Q: np.ndarray, R: np.ndarray,
+                    Rd: np.ndarray, Qf: np.ndarray) -> None:
+        """Update cost weight matrices between solves. Default: no-op."""
+
     @abstractmethod
     def solve(self, x0: np.ndarray, xref: np.ndarray,
               u_prev: np.ndarray) -> SolverResult:

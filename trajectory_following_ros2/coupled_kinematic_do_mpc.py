@@ -21,6 +21,13 @@ class DoMpcSolverAdapter(BaseSolver):
         self._controller.mpc.x0 = x0.reshape(-1, 1)
         self._controller.mpc.set_initial_guess()
 
+    def set_weights(self, Q: np.ndarray, R: np.ndarray,
+                    Rd: np.ndarray, Qf: np.ndarray) -> None:
+        self._controller.Q_diag_value = np.diag(Q)
+        self._controller.R_diag_value = np.diag(R)
+        self._controller.Rd_diag_value = np.diag(Rd)
+        self._controller.Qf_diag_value = np.diag(Qf)
+
     def solve(self, x0: np.ndarray, xref: np.ndarray,
               u_prev: np.ndarray) -> SolverResult:
         # xref: (4, N+1) → reference_states expects (N+1, 4)

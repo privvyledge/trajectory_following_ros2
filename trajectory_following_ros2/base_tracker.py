@@ -173,31 +173,7 @@ class BaseTrajectoryTracker(Node, ABC):
         self.NU = self.get_parameter('n_inputs').value
         self.horizon = int(self.get_parameter('horizon').value)
         self.prediction_time = self.get_parameter('prediction_time').value
-        if self.get_parameter('use_bryson_weights').value:
-            self.Q, self.R, _Rd = bryson_weights(
-                max_state_errors={
-                    'x':   self.get_parameter('max_error_x').value,
-                    'y':   self.get_parameter('max_error_y').value,
-                    'v':   self.get_parameter('max_error_v').value,
-                    'psi': self.get_parameter('max_error_psi').value,
-                },
-                max_inputs={
-                    'a':     self.get_parameter('bryson_max_accel').value,
-                    'delta': self.get_parameter('bryson_max_steer').value,
-                },
-                max_input_rates={
-                    'jerk':       abs(self.get_parameter('max_jerk').value),
-                    'steer_rate': self.MAX_STEER_RATE,
-                },
-            )
-            self.Rd = _Rd
-            self.Qf = self.Q.copy()
-        else:
-            self.R = np.diag(self.get_parameter('R').get_parameter_value().double_array_value)
-            self.Rd = np.diag(self.get_parameter('Rd').get_parameter_value().double_array_value)
-            self.Q = np.diag(self.get_parameter('Q').get_parameter_value().double_array_value)
-            qf_vals = self.get_parameter('Qf').get_parameter_value().double_array_value
-            self.Qf = np.diag(qf_vals) if qf_vals is not None else self.Q.copy()
+        self._recompute_weights()
         self.path_topic = self.get_parameter('path_topic').value
         self.speed_topic = self.get_parameter('speed_topic').value
         self.odom_topic = self.get_parameter('odom_topic').value
@@ -279,6 +255,8 @@ class BaseTrajectoryTracker(Node, ABC):
 
         self.mutex = threading.Lock()
         self._u_prev_from_echo = False
+        self._warned_twist_frame = False
+        self._warned_pose_frame = False
         _q = 5
         self.location_queue = queue.Queue(maxsize=_q)
         self.mpc_reference_states_queue = queue.Queue(maxsize=_q)
@@ -359,9 +337,18 @@ class BaseTrajectoryTracker(Node, ABC):
 
         # Resolve TF if path is not already in the controller's global frame.
         tf_tx = tf_ty = tf_yaw = 0.0
-        if path_frame_id and path_frame_id != self.global_frame:
+        if path_frame_id and self.global_frame and path_frame_id != self.global_frame:
             try:
-                tf_stamped = await self.tf_buffer.lookup_transform_async(
+                # wait_for_transform_async blocks this coroutine (non-blocking to executor)
+                # until the transform is available. This is critical when path arrives via
+                # transient-local QoS before TF is up — lookup_transform_async raises
+                # immediately on a missing transform and the callback would return early,
+                # never to be called again by the latching publisher.
+                self.get_logger().info(
+                    f'path_callback: waiting for TF {path_frame_id} → {self.global_frame}')
+                await self.tf_buffer.wait_for_transform_async(
+                    self.global_frame, path_frame_id, Time())
+                tf_stamped = self.tf_buffer.lookup_transform(
                     self.global_frame, path_frame_id, Time())
                 t = tf_stamped.transform.translation
                 r = tf_stamped.transform.rotation
@@ -373,6 +360,11 @@ class BaseTrajectoryTracker(Node, ABC):
                     f'path_callback: cannot transform {path_frame_id} → '
                     f'{self.global_frame}: {e}')
                 return
+        elif path_frame_id and not self.global_frame:
+            self.get_logger().warn(
+                f'global_frame is empty; path frame "{path_frame_id}" will be used as-is '
+                '(no TF transform applied). Set global_frame to enable frame correction.',
+                throttle_duration_sec=10.0)
 
         # todo: switch to numpy and vectorize since data.poses is just a list of poses
         cos_tf = math.cos(tf_yaw)
@@ -429,8 +421,45 @@ class BaseTrajectoryTracker(Node, ABC):
         y = pose.position.y
         q = pose.orientation
         _, _, yaw = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
-        vx = twist.linear.x
-        vy = twist.linear.y
+
+        # Transform pose to global_frame when the localizer publishes in a different frame
+        # (e.g. odom frame while global_frame='map'). Uses the latest cached TF entry so
+        # this is non-blocking at 50 Hz. Skips silently (with one logged warning) until TF
+        # is available — the raw pose is used in the meantime.
+        pose_frame = data.header.frame_id
+        if pose_frame and self.global_frame and pose_frame != self.global_frame:
+            try:
+                tf = self.tf_buffer.lookup_transform(self.global_frame, pose_frame, Time())
+                t = tf.transform.translation
+                r = tf.transform.rotation
+                _, _, tf_yaw = tf_transformations.euler_from_quaternion(
+                    [r.x, r.y, r.z, r.w])
+                c, s = math.cos(tf_yaw), math.sin(tf_yaw)
+                x, y = c * x - s * y + t.x, s * x + c * y + t.y
+                yaw += tf_yaw
+            except Exception:
+                if not self._warned_pose_frame:
+                    self.get_logger().warn(
+                        f'odom frame "{pose_frame}" != global_frame "{self.global_frame}"; '
+                        'TF not yet available — using raw odom pose until transform appears.')
+                    self._warned_pose_frame = True
+
+        # Project twist to body frame when the localizer publishes it in the world frame.
+        # ROS 2 convention: twist is in child_frame_id. If that differs from robot_frame,
+        # rotate the planar components into the body frame using the current heading.
+        child_frame = data.child_frame_id
+        if child_frame and child_frame != self.robot_frame:
+            if not self._warned_twist_frame:
+                self.get_logger().warn(
+                    f'odom child_frame_id "{child_frame}" != robot_frame "{self.robot_frame}"; '
+                    'projecting twist.linear to body frame.')
+                self._warned_twist_frame = True
+            c, s = math.cos(yaw), math.sin(yaw)
+            vx = twist.linear.x * c + twist.linear.y * s
+            vy = -twist.linear.x * s + twist.linear.y * c
+        else:
+            vx = twist.linear.x
+            vy = twist.linear.y
         vz = twist.linear.z
         omega = twist.angular.z
         try:
@@ -810,6 +839,34 @@ class BaseTrajectoryTracker(Node, ABC):
                 ref_msg.poses.append(pose)
             self.mpc_reference_path_pub.publish(ref_msg)
 
+    def _recompute_weights(self):
+        """Read Q/R/Rd/Qf from current ROS parameters (or Bryson's rule) and update self."""
+        if self.get_parameter('use_bryson_weights').value:
+            self.Q, self.R, _Rd = bryson_weights(
+                max_state_errors={
+                    'x':   self.get_parameter('max_error_x').value,
+                    'y':   self.get_parameter('max_error_y').value,
+                    'v':   self.get_parameter('max_error_v').value,
+                    'psi': self.get_parameter('max_error_psi').value,
+                },
+                max_inputs={
+                    'a':     self.get_parameter('bryson_max_accel').value,
+                    'delta': self.get_parameter('bryson_max_steer').value,
+                },
+                max_input_rates={
+                    'jerk':       abs(self.get_parameter('max_jerk').value),
+                    'steer_rate': self.MAX_STEER_RATE,
+                },
+            )
+            self.Rd = _Rd
+            self.Qf = self.Q.copy()
+        else:
+            self.R = np.diag(self.get_parameter('R').get_parameter_value().double_array_value)
+            self.Rd = np.diag(self.get_parameter('Rd').get_parameter_value().double_array_value)
+            self.Q = np.diag(self.get_parameter('Q').get_parameter_value().double_array_value)
+            qf_vals = self.get_parameter('Qf').get_parameter_value().double_array_value
+            self.Qf = np.diag(qf_vals) if qf_vals is not None else self.Q.copy()
+
     def parameter_change_callback(self, params):
         result = SetParametersResult(successful=True)
         for param in params:
@@ -833,6 +890,12 @@ class BaseTrajectoryTracker(Node, ABC):
                 self.MAX_DECEL = param.value
             elif param.name == 'desired_speed':
                 self.desired_speed = param.value
+            elif param.name in ('Q', 'R', 'Rd', 'Qf', 'use_bryson_weights',
+                                'max_error_x', 'max_error_y', 'max_error_v', 'max_error_psi',
+                                'bryson_max_accel', 'bryson_max_steer'):
+                self._recompute_weights()
+                if self._solver is not None:
+                    self._solver.set_weights(self.Q, self.R, self.Rd, self.Qf)
             else:
                 result.successful = False
             self.get_logger().info(

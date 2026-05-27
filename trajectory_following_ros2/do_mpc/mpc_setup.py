@@ -30,6 +30,10 @@ class MPC(object):
         self.R = R
         self.Qf = Qf
         self.Rd = Rd
+        self.Q_diag_value = np.diag(Q).copy()
+        self.R_diag_value = np.diag(R).copy()
+        self.Qf_diag_value = np.diag(Qf).copy()
+        self.Rd_diag_value = np.diag(Rd).copy()
 
         self.Ts = sample_time
         self.compile = compile_mpc
@@ -168,29 +172,44 @@ class MPC(object):
         return mpc
         
     def tvp_fun(self, t_now):
-        """
-        provides data into time-varying parameters.
-        """
-        # self.tvp_template['_tvp', 0] = [xk, yk, vel_k, psi_k]
-        self.tvp_template['_tvp', :] = np.vsplit(self.reference_states, self.horizon + 1)
-        # or self.tvp_template['_tvp', 0:(self.horizon + 1)] = casadi.vertsplit(self.reference_states)
-
+        """Provides reference states and cost weights as time-varying parameters."""
+        Q = self.Q_diag_value
+        R = self.R_diag_value
+        Qf = self.Qf_diag_value
+        Rd = self.Rd_diag_value
+        for k in range(self.horizon + 1):
+            ref = self.reference_states[k]
+            self.tvp_template['_tvp', k, 'x_ref'] = ref[0]
+            self.tvp_template['_tvp', k, 'y_ref'] = ref[1]
+            self.tvp_template['_tvp', k, 'vel_ref'] = ref[2]
+            self.tvp_template['_tvp', k, 'psi_ref'] = ref[3]
+            self.tvp_template['_tvp', k, 'Q_0'] = Q[0]
+            self.tvp_template['_tvp', k, 'Q_1'] = Q[1]
+            self.tvp_template['_tvp', k, 'Q_2'] = Q[2]
+            self.tvp_template['_tvp', k, 'Q_3'] = Q[3]
+            self.tvp_template['_tvp', k, 'R_0'] = R[0]
+            self.tvp_template['_tvp', k, 'R_1'] = R[1]
+            self.tvp_template['_tvp', k, 'Qf_0'] = Qf[0]
+            self.tvp_template['_tvp', k, 'Qf_1'] = Qf[1]
+            self.tvp_template['_tvp', k, 'Qf_2'] = Qf[2]
+            self.tvp_template['_tvp', k, 'Qf_3'] = Qf[3]
+            self.tvp_template['_tvp', k, 'Rd_0'] = Rd[0]
+            self.tvp_template['_tvp', k, 'Rd_1'] = Rd[1]
         return self.tvp_template
 
     def objective_function_setup(self):
-        # path following
-        lterm = (self.Q[0, 0] * (self.model.x['pos_x'] - self.model.tvp['x_ref']) ** 2
-                 + self.Q[1, 1] * (self.model.x['pos_y'] - self.model.tvp['y_ref']) ** 2
-                 + self.Q[2, 2] * (self.model.x['vel'] - self.model.tvp['vel_ref']) ** 2
-                 + self.Q[3, 3] * (self.model.aux['psi_diff']) ** 2
-                 # + self.Q[3, 3] * (self.model.x['psi'] - self.model.tvp['psi_ref']) ** 2
-                 + self.R[0, 0] * (self.model.u['acc']) ** 2
-                 + self.R[1, 1] * (self.model.u['delta']) ** 2
+        # path following — weights read from TVPs so they can be updated at runtime
+        lterm = (self.model.tvp['Q_0'] * (self.model.x['pos_x'] - self.model.tvp['x_ref']) ** 2
+                 + self.model.tvp['Q_1'] * (self.model.x['pos_y'] - self.model.tvp['y_ref']) ** 2
+                 + self.model.tvp['Q_2'] * (self.model.x['vel'] - self.model.tvp['vel_ref']) ** 2
+                 + self.model.tvp['Q_3'] * (self.model.aux['psi_diff']) ** 2
+                 + self.model.tvp['R_0'] * (self.model.u['acc']) ** 2
+                 + self.model.tvp['R_1'] * (self.model.u['delta']) ** 2
                  )  # stage/lagrange cost
-        mterm = (self.Qf[0, 0] * (self.model.x['pos_x'] - self.model.tvp['x_ref']) ** 2
-                 + self.Qf[1, 1] * (self.model.x['pos_y'] - self.model.tvp['y_ref']) ** 2
-                 + self.Qf[2, 2] * (self.model.x['vel'] - self.model.tvp['vel_ref']) ** 2
-                 + self.Qf[3, 3] * (self.model.aux['psi_diff']) ** 2
+        mterm = (self.model.tvp['Qf_0'] * (self.model.x['pos_x'] - self.model.tvp['x_ref']) ** 2
+                 + self.model.tvp['Qf_1'] * (self.model.x['pos_y'] - self.model.tvp['y_ref']) ** 2
+                 + self.model.tvp['Qf_2'] * (self.model.x['vel'] - self.model.tvp['vel_ref']) ** 2
+                 + self.model.tvp['Qf_3'] * (self.model.aux['psi_diff']) ** 2
                  )  # terminal/mayer cost
 
         # lterm = lterm + self.R[0, 0] * (self.model.u['acc'] ** 2) + \
@@ -211,7 +230,7 @@ class MPC(object):
         # mterm = mtimes([x_packed.T, self.Q, x_packed])
 
         self.mpc.set_objective(lterm=lterm, mterm=mterm)
-        self.mpc.set_rterm(acc=self.Rd[0, 0], delta=self.Rd[1, 1])  # input penalty
+        self.mpc.set_rterm(acc=self.model.tvp['Rd_0'], delta=self.model.tvp['Rd_1'])  # input penalty
 
     def constraints_setup(
             self, vel_bound=None, delta_bound=None, acc_bound=None, reset=False

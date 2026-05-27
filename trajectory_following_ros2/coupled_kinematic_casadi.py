@@ -30,6 +30,11 @@ class CasAdiSolverAdapter(BaseSolver):
     def initialize(self, x0: np.ndarray) -> None:
         pass  # CasADi is ready after construction
 
+    def set_weights(self, Q: np.ndarray, R: np.ndarray,
+                    Rd: np.ndarray, Qf: np.ndarray) -> None:
+        if not self._use_opti:
+            self._controller.set_weights(Q, R, Rd, Qf)
+
     def update_obstacles(self, obstacle_states: np.ndarray):
         self._obstacle_states = obstacle_states
 
