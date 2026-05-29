@@ -11,6 +11,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.time import Time
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult, ParameterType
 
@@ -114,6 +115,12 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('Qf', [0.04, 0.04, 0.1, 1.0],
                                descriptor=ParameterDescriptor(type=ParameterType.PARAMETER_DOUBLE_ARRAY))
         self.declare_parameter('path_topic', 'trajectory/path')
+        self.declare_parameter(
+            'path_qos', 'transient_local',
+            ParameterDescriptor(description=(
+                "QoS durability for the path subscription. "
+                "'transient_local' (default): latching — waypoint_loader style. "
+                "'volatile': live replanning — Nav2 /plan style.")))
         self.declare_parameter('speed_topic', 'trajectory/speed')
         self.declare_parameter('odom_topic', self._odom_topic_default)
         self.declare_parameter('acceleration_topic', 'accel/local')
@@ -133,6 +140,13 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('delay_compensation_enabled', False)
         self.declare_parameter('delay_compensation_method', 'forward_simulation')
         self.declare_parameter('estimated_delay', 0.0)
+
+        self.declare_parameter(
+            'executor_threads', 3,
+            ParameterDescriptor(description=(
+                'Number of threads for MultiThreadedExecutor. '
+                'Minimum 3 (MPC timer + subscriptions + debug timer). '
+                'Increase on multi-core hardware (e.g. 4-6 on Jetson Orin).')))
 
         # Bryson's rule weight parameters (active when use_bryson_weights: true)
         self.declare_parameter('use_bryson_weights', False)
@@ -175,6 +189,7 @@ class BaseTrajectoryTracker(Node, ABC):
         self.prediction_time = self.get_parameter('prediction_time').value
         self._recompute_weights()
         self.path_topic = self.get_parameter('path_topic').value
+        self.path_qos = self.get_parameter('path_qos').value
         self.speed_topic = self.get_parameter('speed_topic').value
         self.odom_topic = self.get_parameter('odom_topic').value
         self.acceleration_topic = self.get_parameter('acceleration_topic').value
@@ -276,9 +291,16 @@ class BaseTrajectoryTracker(Node, ABC):
 
         latching_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
 
+        if self.path_qos == 'volatile':
+            path_sub_qos = QoSProfile(depth=1, durability=DurabilityPolicy.VOLATILE)
+            self.get_logger().info(
+                f'Path subscription QoS: VOLATILE (Nav2 mode) on {self.path_topic}')
+        else:
+            path_sub_qos = latching_qos
+
         self.path_sub = self.create_subscription(
             Path, self.path_topic, self.path_callback,
-            qos_profile=latching_qos)
+            qos_profile=path_sub_qos)
         self.speed_sub = self.create_subscription(
             Float32MultiArray, self.speed_topic, self.desired_speed_callback,
             qos_profile=latching_qos)
@@ -549,7 +571,10 @@ class BaseTrajectoryTracker(Node, ABC):
             self.get_logger().info('MPC solver initialized.')
 
         # 3. Lazy trajectory initialization
-        if self.path_received and self.desired_speed_received and not self.trajectory_initialized:
+        # Speed topic is optional: if desired_speed is set directly (e.g. Nav2 mode),
+        # proceed without waiting for the speed subscription.
+        _speeds_ready = self.desired_speed_received or abs(self.desired_speed) > 0.0
+        if self.path_received and _speeds_ready and not self.trajectory_initialized:
             self._init_trajectory()
 
         if not (self.mpc_initialized and self.trajectory_initialized):
@@ -680,6 +705,13 @@ class BaseTrajectoryTracker(Node, ABC):
 
     def _init_trajectory(self):
         tc = self.trajectory.trajectory_key_to_column
+        if self.speeds is None:
+            # No speed topic received — synthesize a constant-speed profile from desired_speed.
+            v = max(abs(self.desired_speed), 0.1)
+            self.speeds = np.full(len(self.path), v)
+            self.get_logger().info(
+                f'No speed topic received; using constant desired_speed={v:.2f} m/s '
+                'for trajectory timing.')
         relative_times, relative_dts = trajectory_utils.calc_path_relative_time(
             self.path, self.speeds, min_dt=1.0)
 
@@ -914,3 +946,34 @@ class BaseTrajectoryTracker(Node, ABC):
             data_queue.put_nowait(data)
         except queue.Full:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Executor factory — used by every controller node's main()
+# ---------------------------------------------------------------------------
+
+_EXECUTOR_THREADS_MIN = 3  # MPC timer + subscriptions + debug timer
+
+
+def _make_executor(node: BaseTrajectoryTracker) -> MultiThreadedExecutor:
+    """Create a ``MultiThreadedExecutor`` sized from *node*'s ``executor_threads`` parameter.
+
+    Reads the parameter after node construction so the value already reflects
+    any overrides from the launch file, YAML config, or ``--ros-args``.
+
+    The minimum is ``_EXECUTOR_THREADS_MIN`` (3): one thread each for the MPC
+    timer (``MutuallyExclusiveCallbackGroup``), sensor subscriptions
+    (``ReentrantCallbackGroup``), and debug publishing
+    (``ReentrantCallbackGroup``).  Values below the minimum are clamped with a
+    logged warning.  The node is added to the executor before returning.
+    """
+    requested = node.get_parameter('executor_threads').value
+    if requested < _EXECUTOR_THREADS_MIN:
+        node.get_logger().warn(
+            f'executor_threads={requested} is below the minimum of '
+            f'{_EXECUTOR_THREADS_MIN}; clamping. '
+            'Needs one thread each for the MPC timer, subscriptions, and debug publishing.')
+        requested = _EXECUTOR_THREADS_MIN
+    executor = MultiThreadedExecutor(num_threads=requested)
+    executor.add_node(node)
+    return executor

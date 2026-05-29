@@ -6,10 +6,10 @@ from typing import Optional
 import numpy as np
 
 import rclpy
-from rclpy.executors import MultiThreadedExecutor, ExternalShutdownException
+from rclpy.executors import ExternalShutdownException
 from ament_index_python.packages import get_package_share_directory
 
-from trajectory_following_ros2.base_tracker import BaseTrajectoryTracker
+from trajectory_following_ros2.base_tracker import BaseTrajectoryTracker, _make_executor
 from trajectory_following_ros2.backends.base_solver import BaseSolver, SolverResult
 from trajectory_following_ros2.acados.acados_settings import acados_settings
 
@@ -263,8 +263,7 @@ def main(args=None):
     rclpy.init(args=args)
     try:
         node = KinematicCoupledAcados()
-        executor = MultiThreadedExecutor(num_threads=3)
-        executor.add_node(node)
+        executor = _make_executor(node)
         try:
             executor.spin()
         finally:
