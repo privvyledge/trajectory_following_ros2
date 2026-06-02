@@ -29,10 +29,10 @@ def kinematic_model(symbol_type='SX'):
     '''Casadi Model'''
     if symbol_type.lower() == 'MX'.lower():
         symbol = MX
-        
+
     elif symbol_type.lower() == 'SX'.lower():
         symbol = SX
-    
+
     else:
         raise Exception('Invalid Symbol Type')
 
@@ -96,7 +96,7 @@ def kinematic_model(symbol_type='SX'):
             (vel / wheelbase) * tan(delta)
     )  # continuous non-linear model
 
-    '''Constraints/bounds. 
+    '''Constraints/bounds.
     Todo: add rate constraints'''
     # state bounds
     # model.x_min = -inf
@@ -107,9 +107,6 @@ def kinematic_model(symbol_type='SX'):
 
     model.vel_min = -1.5
     model.vel_max = 1.5
-
-    model.psi_min = -np.pi
-    model.psi_max = np.pi
 
     # input bounds
     model.acc_min = -3.0
@@ -143,5 +140,3 @@ def kinematic_model(symbol_type='SX'):
     model.params = params
 
     return model, constraint
-
-

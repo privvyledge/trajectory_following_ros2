@@ -27,7 +27,7 @@ class KinematicMPCBase(ABC):
                  delta_rate_bound=(-np.radians(352.9411764706), np.radians(352.9411764706)),
                  symbol_type='MX', warmstart=True,
                  solver_options=None, solver_type='nlp', solver='ipopt',
-                 suppress_ipopt_output=True, normalize_yaw_error=True,
+                 suppress_ipopt_output=True, max_iter=2000, normalize_yaw_error=True,
                  slack_weights_u_rate=(1e-6, 1e-6),
                  slack_scale_u_rate=(1.0, 1.0),
                  slack_upper_bound_u_rate=None,
@@ -46,10 +46,10 @@ class KinematicMPCBase(ABC):
         self.R = casadi.diag(R)
         self.Qf = casadi.diag(Qf)
         self.Rd = casadi.diag(Rd)
-        self.Q_diag_value = casadi.DM(Q).flatten()
-        self.R_diag_value = casadi.DM(R).flatten()
-        self.Qf_diag_value = casadi.DM(Qf).flatten()
-        self.Rd_diag_value = casadi.DM(Rd).flatten()
+        self.Q_diag_value = np.asarray(Q, dtype=float).flatten()
+        self.R_diag_value = np.asarray(R, dtype=float).flatten()
+        self.Qf_diag_value = np.asarray(Qf, dtype=float).flatten()
+        self.Rd_diag_value = np.asarray(Rd, dtype=float).flatten()
         self.P_u_rate = (casadi.diag(slack_weights_u_rate)
                          if slack_weights_u_rate is not None
                          else casadi.DM.zeros(self.nu, self.nu))
@@ -74,6 +74,7 @@ class KinematicMPCBase(ABC):
         self.solver_type = solver_type
         self.solver_ = solver
         self.code_gen_mode = code_gen_mode
+        self.max_iter = max_iter
         self.normalize_yaw_error = normalize_yaw_error
 
         self.Ts = sample_time

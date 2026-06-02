@@ -31,8 +31,6 @@ import time
 import numpy as np
 import casadi
 
-from trajectory_following_ros2.casadi.kinematic_bicycle_model import KinematicBicycleModel
-
 
 class KinematicMPCCasadiOpti(object):
     """docstring for ClassName"""
@@ -44,10 +42,11 @@ class KinematicMPCCasadiOpti(object):
                  vel_bound=(-5.0, 5.0), delta_bound=(-np.radians(23.0), np.radians(23.0)), acc_bound=(-3.0, 3.0),
                  jerk_bound=(-1.5, 1.5), delta_rate_bound=(-np.radians(352.9411764706), np.radians(352.9411764706)),
                  warmstart=True, solver_options=None, solver_type='nlp', solver='ipopt', suppress_ipopt_output=True,
+                 max_iter=2000,
                  normalize_yaw_error=True,
                  slack_weights_u_rate=(0.0, 0.0),  # (1e-6, 1e-6)
                  slack_scale_u_rate=(1.0, 1.0),
-                 slack_upper_bound_u_rate=None, #(1., np.radians(30.0)), (np.inf, np.inf)
+                 slack_upper_bound_u_rate=None,  # (1., np.radians(30.0)), (np.inf, np.inf)
                  slack_objective_is_quadratic=False):
         """ Constructor for KinematicMPCCasadiOpti """
         # self.vehicle = vehicle
@@ -77,6 +76,7 @@ class KinematicMPCCasadiOpti(object):
         self.solver_options = solver_options
         self.solver_type = solver_type
         self.solver_ = solver
+        self.max_iter = max_iter
 
         if self.solver_ in ["osqp", "qpoases"] or self.solver_type in ['quad', 'conic', 'qp']:
             self.solver_type = 'conic'  # casadi opti uses conic (or sqpmethod in newer versions of casadi) for SQPs, etc
@@ -156,8 +156,8 @@ class KinematicMPCCasadiOpti(object):
         # Parameters
         self.previous_input = mpc.parameter(nu)
         self.current_state = mpc.parameter(nx)  # z_k = [x_0, y_0, v_0, psi_0]
-        ''' 
-        Reference trajectory. 
+        '''
+        Reference trajectory.
         The first index is the desired state at time k+1, i.e z_ref[0, :] = z_desired
         The second index selects the state element from [x_k, y_k, v_k, psi_k]
         '''
@@ -170,7 +170,7 @@ class KinematicMPCCasadiOpti(object):
         # Decision variables
         '''
         Actual trajectory we will follow given the optimal solution.
-        The first index is the timestep k, i.e. self.z_dv[0,:] is z_0.	
+        The first index is the timestep k, i.e. self.z_dv[0,:] is z_0.
         It has self.N+1 timesteps since we go from z_0, ..., z_self.N.
         Second index is the state element, as detailed below.
         '''
@@ -414,7 +414,8 @@ class KinematicMPCCasadiOpti(object):
                 ipopt_options = {
                     'ipopt.print_level': not suppress_output,
                     'ipopt.sb': 'yes',
-                    'ipopt.max_iter': 2000,
+                    # Opti/IPOPT path. Original default: 2000.
+                    'ipopt.max_iter': self.max_iter,
                     'ipopt.acceptable_tol': 1e-8,
                     'ipopt.acceptable_obj_change_tol': 1e-6,
                 }
@@ -424,7 +425,9 @@ class KinematicMPCCasadiOpti(object):
             elif solver == 'osqp':
                 osqp_options = {
                     'verbose': not suppress_output,
-                    'max_iter': 2000,
+                    # Opti/OSQP path. Original default: 2000. OSQP iterations are first-order
+                    # ADMM steps — scale differs from IPOPT barrier iterations; O(100-4000) typical.
+                    'max_iter': self.max_iter,
                     'eps_pr': 1e-8,
                     'eps_r': 1e-8,
                     'warm_start_dual': True,
@@ -482,7 +485,7 @@ class KinematicMPCCasadiOpti(object):
         """
         st = time.process_time()
 
-        sl_mpc = np.zeros((self.horizon, self.nu)) # or return None
+        sl_mpc = np.zeros((self.horizon, self.nu))  # or return None
         try:
             sol = self.solver()  # todo: make this an attribute
 

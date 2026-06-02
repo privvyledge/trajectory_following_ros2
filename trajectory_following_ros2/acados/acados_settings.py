@@ -87,7 +87,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         _Qe_sym = casadi.SX.sym('Qe_diag', model.x.size()[0])
         _Rd_sym = casadi.SX.sym('Rd_diag', model.u.size()[0])
         model_ac.p = casadi.vertcat(model_ac.p, _Q_sym, _R_sym, _Qe_sym, _Rd_sym)
-    
+
     model_ac.name = model.name
     ocp.model = model_ac
 
@@ -314,37 +314,23 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
 
     # setting constraints
     ocp.constraints.constr_type = 'BGH'  # b: box/decision variables, g: dynamics, h:nonlinear constraints
-    ocp.constraints.lbx = np.array([model.vel_min, model.psi_min])  # state lower bound
-    ocp.constraints.ubx = np.array([model.vel_max, model.psi_max])  # state upper bound
-    ocp.constraints.idxbx = np.array([2, 3])  # index/indices of states with constraints, else +/-casadi.infinity
+    ocp.constraints.lbx = np.array([model.vel_min])  # state lower bound
+    ocp.constraints.ubx = np.array([model.vel_max])  # state upper bound
+    ocp.constraints.idxbx = np.array([2])  # velocity only; psi is unconstrained (continuous integrator state)
 
     ocp.constraints.lbu = np.array([model.acc_min, model.delta_min])  # input lower bound
     ocp.constraints.ubu = np.array([model.acc_max, model.delta_max])  # input upper bound
     ocp.constraints.idxbu = np.array([0, 1])
 
-    # # Soft/slack state bounds: to map lower and upper slack vectors onto x(T). todo: enable
-    # ocp.constraints.lsbx = np.array([-2 * np.pi])  # np.zeros([nsbx])
-    # ocp.constraints.usbx = np.array([2 * np.pi])  # np.zeros([nsbx])
+    # # Soft/slack state bounds on velocity (todo: enable if needed)
+    # ocp.constraints.lsbx = np.zeros([nsbx])
+    # ocp.constraints.usbx = np.zeros([nsbx])
     # ocp.constraints.idxsbx = np.array(range(nsbx))
     #
-    # # nonlinear constraints as defined by the symbol/function/equation model_ac.con_h_expr = constraint.expr. todo: add rate constraints
-    # ocp.constraints.lh = np.array(
-    #         [
-    #             model.psi_min,
-    #             # model.throttle_min,
-    #             # model.delta_min,
-    #         ]
-    # )
-    # ocp.constraints.uh = np.array(
-    #         [
-    #             model.psi_max,
-    #             # model.throttle_max,
-    #             # model.delta_max,
-    #         ]
-    # )
-    # # Lower bounds on slacks corresponding to soft lower bounds for nonlinear constraints
+    # # Nonlinear constraints (todo: add rate constraints)
+    # ocp.constraints.lh = np.array([model.delta_min])
+    # ocp.constraints.uh = np.array([model.delta_max])
     # ocp.constraints.lsh = np.zeros(nsh)
-    # # Lower bounds on slacks corresponding to soft upper bounds for nonlinear constraints
     # ocp.constraints.ush = np.zeros(nsh)
     # ocp.constraints.idxsh = np.array(range(nsh))
 

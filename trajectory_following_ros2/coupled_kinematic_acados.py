@@ -259,6 +259,7 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
 
         super()._control_timer_callback()
 
+
 def main(args=None):
     rclpy.init(args=args)
     try:

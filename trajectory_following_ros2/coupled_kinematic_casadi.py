@@ -12,20 +12,21 @@ from trajectory_following_ros2.backends.base_solver import BaseSolver, SolverRes
 from trajectory_following_ros2.casadi.kinematic_mpc_casadi_opti import KinematicMPCCasadiOpti
 from trajectory_following_ros2.casadi.kinematic_mpc_casadi import KinematicMPCCasadi
 from trajectory_following_ros2.casadi.discrete_kinematic_mpc_casadi import DiscreteKinematicMPCCasadi
-import tf_transformations
 
 
 class CasAdiSolverAdapter(BaseSolver):
     """Wraps KinematicMPCCasadi / Opti / Discrete to conform to BaseSolver."""
 
     def __init__(self, controller, use_opti: bool = False,
-                 num_obstacles: int = 0, n_obstacle_states: int = 3):
+                 num_obstacles: int = 0, n_obstacle_states: int = 3,
+                 solver: str = 'ipopt'):
         self._controller = controller
         self._use_opti = use_opti
         self._warmstart = {}
         self._num_obstacles = num_obstacles
         self._obstacle_states: Optional[np.ndarray] = None
         self._n_obs_states = n_obstacle_states
+        self._solver_name = solver
 
     def initialize(self, x0: np.ndarray) -> None:
         pass  # CasADi is ready after construction
@@ -65,14 +66,36 @@ class CasAdiSolverAdapter(BaseSolver):
 
         sol = self._controller.solve()
 
-        # Persist warmstart variables
-        self._warmstart['z_ws'] = sol['z_mpc']
-        self._warmstart['u_ws'] = sol['u_mpc']
-        self._warmstart['lam_x'] = sol.get('lam_x')
-        self._warmstart['lam_g'] = sol.get('lam_g')
-        self._warmstart['lam_p'] = sol.get('lam_p')
-        self._warmstart['sl_ws'] = sol.get('sl_mpc')
-        self._warmstart['sl_obs_ws'] = sol.get('sl_obs_ws')
+        # Persist warmstart variables only when the solution is usable.
+        # Degenerate statuses leave the NLP at a bad point — clear the dict so
+        # the next call does a cold start rather than inheriting a poisoned guess.
+        _DEGENERATE = {
+            'Search_Direction_Becomes_Too_Small',
+            'Infeasible_Problem_Detected',
+            'Restoration_Failed',
+            'Error_In_Step_Computation',
+        }
+        return_status = str(sol.get('solver_stats', {}).get('return_status', ''))
+        if return_status not in _DEGENERATE:
+            # Receding-horizon shift: the warm-start for step k+1 should begin
+            # at the state the solver predicted for k+1, not the current k.
+            # Shift left by one column and hold the terminal state/input.
+            z_ws = sol['z_mpc']   # (nx, N+1)
+            u_ws = sol['u_mpc']   # (nu, N)
+            self._warmstart['z_ws'] = np.concatenate(
+                [z_ws[:, 1:], z_ws[:, -1:]], axis=1)
+            self._warmstart['u_ws'] = np.concatenate(
+                [u_ws[:, 1:], u_ws[:, -1:]], axis=1)
+            # Dual variables cut IPOPT from ~30 cold iterations to 5-15.
+            # For sqpmethod they hurt convergence so we skip them there.
+            _use_duals = self._solver_name == 'ipopt'
+            self._warmstart['lam_x'] = sol.get('lam_x') if _use_duals else None
+            self._warmstart['lam_g'] = sol.get('lam_g') if _use_duals else None
+            self._warmstart['lam_p'] = sol.get('lam_p') if _use_duals else None
+            self._warmstart['sl_ws'] = sol.get('sl_mpc')
+            self._warmstart['sl_obs_ws'] = sol.get('sl_obs_ws')
+        else:
+            self._warmstart.clear()
 
         z_mpc = sol['z_mpc']  # opti: (N+1, nx); non-opti: (nx, N+1)
         u_mpc = sol['u_mpc']  # opti: (N, nu); non-opti: (nu, N)
@@ -81,11 +104,11 @@ class CasAdiSolverAdapter(BaseSolver):
             # rows = timesteps, cols = states
             x_sequence = z_mpc.T          # (nx, N+1)
             u_sequence = u_mpc.T          # (nu, N)
-            vel_next = float(z_mpc[1, 2]) # row=k+1, col=vel
+            vel_next = float(z_mpc[1, 2])  # row=k+1, col=vel
         else:
             x_sequence = z_mpc             # (nx, N+1)
             u_sequence = u_mpc             # (nu, N)
-            vel_next = float(z_mpc[2, 1]) # row=vel, col=k+1
+            vel_next = float(z_mpc[2, 1])  # row=vel, col=k+1
 
         acc_cmd = float(sol['u_control'][0])
         delta_cmd = float(sol['u_control'][1])
@@ -126,6 +149,8 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
     def _declare_backend_parameters(self):
         self.declare_parameter('ode_type', 'discrete_kinematic_coupled')
         self.declare_parameter('use_opti', False)
+        # Iteration budget — meaning depends on solver/solver_type.
+        # Node default (15) is appropriate for qrqp/sqpmethod. Raise to >=100 for IPOPT.
         self.declare_parameter('max_iter', 15)
         self.declare_parameter('termination_condition', 1e-6)
         self.declare_parameter('normalize_yaw_error', True)
@@ -139,9 +164,23 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
     def _init_solver(self) -> Optional[BaseSolver]:
         ode_type = self.get_parameter('ode_type').value
         use_opti = self.get_parameter('use_opti').value
+        max_iter = int(self.get_parameter('max_iter').value)
         normalize_yaw_error = self.get_parameter('normalize_yaw_error').value
         solver_type = self.get_parameter('solver_type').value
         solver = self.get_parameter('solver').value
+
+        _is_ipopt = (solver_type == 'nlp' and solver == 'ipopt') or \
+                    (solver_type == 'quad' and solver == 'ipopt')
+        _is_osqp = (solver == 'osqp')
+        if _is_ipopt and max_iter < 50:
+            self.get_logger().warn(
+                f'max_iter={max_iter} is very low for IPOPT (solver_type={solver_type}, '
+                f'solver={solver}). IPOPT typically needs 50-300 iterations without warm-start. '
+                f'Consider max_iter >= 100.')
+        elif _is_osqp and max_iter < 100:
+            self.get_logger().warn(
+                f'max_iter={max_iter} is very low for OSQP (first-order ADMM). '
+                f'OSQP typically needs 100-4000 steps. Consider max_iter >= 500.')
         slack_weights = list(
             self.get_parameter('slack_weights_input_rate').get_parameter_value().double_array_value)
         slack_scale = list(
@@ -173,6 +212,7 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
             delta_rate_bound=(-self.MAX_STEER_RATE, self.MAX_STEER_RATE),
             solver_type=solver_type, solver=solver,
             suppress_ipopt_output=True,
+            max_iter=max_iter,
             normalize_yaw_error=normalize_yaw_error,
             slack_weights_u_rate=slack_weights,
             slack_scale_u_rate=slack_scale,
@@ -197,7 +237,8 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
         return CasAdiSolverAdapter(
             controller, use_opti=use_opti,
             num_obstacles=num_obstacles,
-            n_obstacle_states=3)
+            n_obstacle_states=3,
+            solver=solver)
 
     def _control_timer_callback(self):
         """Update obstacle states before each solve, then delegate to base."""
@@ -219,6 +260,7 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
             self._solver.update_obstacles(self.obstacle_states)  # type: ignore[attr-defined]
 
         super()._control_timer_callback()
+
 
 def main(args=None):
     rclpy.init(args=args)

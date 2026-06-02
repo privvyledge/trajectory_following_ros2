@@ -26,7 +26,7 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
                  jerk_bound=(-1.5, 1.5), delta_rate_bound=(-np.radians(352.9411764706), np.radians(352.9411764706)),
                  symbol_type='MX', warmstart=True,
                  solver_options=None, solver_type='nlp', solver='ipopt', suppress_ipopt_output=True,
-                 normalize_yaw_error=True,
+                 max_iter=100, normalize_yaw_error=True,
                  slack_weights_u_rate=(1e-6, 1e-6),
                  slack_scale_u_rate=(1.0, 1.0),
                  slack_upper_bound_u_rate=None,
@@ -44,7 +44,7 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
             jerk_bound=jerk_bound, delta_rate_bound=delta_rate_bound,
             symbol_type=symbol_type, warmstart=warmstart,
             solver_options=solver_options, solver_type=solver_type, solver=solver,
-            suppress_ipopt_output=suppress_ipopt_output,
+            suppress_ipopt_output=suppress_ipopt_output, max_iter=max_iter,
             normalize_yaw_error=normalize_yaw_error,
             slack_weights_u_rate=slack_weights_u_rate,
             slack_scale_u_rate=slack_scale_u_rate,
@@ -322,7 +322,9 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
                     ipopt_options = {
                         'ipopt.print_level': not suppress_output,
                         'ipopt.sb': 'yes',
-                        'ipopt.max_iter': 100,
+                        # Discrete NLP via IPOPT. Original default: 100 (lower than continuous
+                        # because discrete LTV + warm-start converges in fewer barrier iterations).
+                        'ipopt.max_iter': self.max_iter,
                         'ipopt.acceptable_tol': 1e-8,
                         'ipopt.acceptable_obj_change_tol': 1e-6,
                         'error_on_fail': False,  # to raise an exception if the solver fails to find a solution
@@ -361,7 +363,8 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
                         ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.mu_init'] = 1e-5  # 1e-3
                         # ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.linear_solver'] = 'ma27'
                         ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.sb'] = 'yes'
-                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.max_iter'] = 100
+                        # IPOPT used as inner QP solver via nlpsol. Original default: 100.
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.max_iter'] = self.max_iter
                         ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.acceptable_tol'] = 1e-8
                         ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.acceptable_obj_change_tol'] = 1e-6
                         ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.print_level'] = 0
@@ -402,7 +405,7 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
                 "jit_options": {
                     "flags": flags, "compiler": compiler, "verbose": True,
                     # "compiler_flags": flags
-                }, # use ("compiler": "ccache gcc") if ccache is installed for a performance boost
+                },  # use ("compiler": "ccache gcc") if ccache is installed for a performance boost
                 'jit_cleanup': False  # True: delete files on shutdown
                        }
             solver_options.update(jit_options)
@@ -412,7 +415,7 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
             f must be convex and g must be linear
             solvers: qpoases, osqp
             '''
-            quad_solver = solver_
+            quad_solver = solver
             if quad_solver not in ["osqp", "qpoases", "qrqp", "ipopt"]:
                 quad_solver = 'osqp'  # osqp, qpoases
                 print(f"solver: {solver} not valid. Defaulting to {quad_solver}")
@@ -437,7 +440,10 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
                     "print_time": not suppress_output,
                     "convexify_strategy": "regularize",  # NONE|regularize|eigen- reflect|eigen-clip
                     "convexify_margin": 1e-4,
-                    "max_iter": 30,  # ipopt, 2000
+                    # Outer SQP iterations for sqpmethod (default code path for solver='qrqp').
+                    # Original default: 200. For real-time use, 10-30 is typical; warm-starting
+                    # means most ticks converge in 1-5 iterations.
+                    "max_iter": self.max_iter,
                     "hessian_approximation": "exact",   # "limited-memory" (sqpmethod), "exact" (all plugins), "gauss-neuton" (scpgen). Feasiblesqpmethod only works with exact and get better performance with regularization
                     # "tol_du": 1e-10,  # ipopt, qrqp
                     # "tol_pr": 1e-10,   # ipopt
@@ -455,7 +461,6 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
                 common_qp_sol_options = {
                         "print_problem": not suppress_output,
                         "print_out": not suppress_output,
-                        "print_iter": not suppress_output,  # disable for osqp/QPOases/ipopt
                         "print_time": not suppress_output,
                         # 'printLevel': 'none',  # For QPOases
                         "error_on_fail": False,
@@ -464,6 +469,9 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
                         'verbose': not suppress_output,
                         # "sparse": True, # (for QPOases only)
                     }  # common to ipopt and the QP solvers
+                if quad_solver != 'ipopt':
+                    # ipopt (used via nlpsol) does not support print_iter; qrqp/OSQP/QPOases do
+                    common_qp_sol_options["print_iter"] = not suppress_output
 
                 if solver_options.get('qpsol_options', None) is None:
                     solver_options['qpsol_options'] = common_qp_sol_options

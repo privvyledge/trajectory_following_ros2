@@ -23,7 +23,7 @@ class KinematicMPCCasadi(KinematicMPCBase):
                  jerk_bound=(-1.5, 1.5), delta_rate_bound=(-np.radians(352.9411764706), np.radians(352.9411764706)),
                  symbol_type='MX', warmstart=True,
                  solver_options=None, solver_type='nlp', solver='ipopt', suppress_ipopt_output=True,
-                 normalize_yaw_error=True,
+                 max_iter=2000, normalize_yaw_error=True,
                  slack_weights_u_rate=(1e-6, 1e-6),
                  slack_scale_u_rate=(1.0, 1.0),
                  slack_upper_bound_u_rate=None,
@@ -37,7 +37,7 @@ class KinematicMPCCasadi(KinematicMPCBase):
             jerk_bound=jerk_bound, delta_rate_bound=delta_rate_bound,
             symbol_type=symbol_type, warmstart=warmstart,
             solver_options=solver_options, solver_type=solver_type, solver=solver,
-            suppress_ipopt_output=suppress_ipopt_output,
+            suppress_ipopt_output=suppress_ipopt_output, max_iter=max_iter,
             normalize_yaw_error=normalize_yaw_error,
             slack_weights_u_rate=slack_weights_u_rate,
             slack_scale_u_rate=slack_scale_u_rate,
@@ -237,7 +237,9 @@ class KinematicMPCCasadi(KinematicMPCBase):
                 ipopt_options = {
                     'ipopt.print_level': not suppress_output,
                     'ipopt.sb': 'yes',
-                    'ipopt.max_iter': 2000,
+                    # Continuous NLP via IPOPT. Original default: 2000 (full barrier-method
+                    # iterations). For RTI-style use, lower to match control rate budget.
+                    'ipopt.max_iter': self.max_iter,
                     'ipopt.acceptable_tol': 1e-8,
                     'ipopt.acceptable_obj_change_tol': 1e-6,
                     'error_on_fail': 0,  # to raise an exception if the solver fails to find a solution
@@ -273,7 +275,7 @@ class KinematicMPCCasadi(KinematicMPCBase):
                 "jit_options": {
                     "flags": flags, "compiler": compiler, "verbose": True,
                     "compiler_flags": flags
-                }, # use ("compiler": "ccache gcc") if ccache is installed for a performance boost
+                },  # use ("compiler": "ccache gcc") if ccache is installed for a performance boost
                 'jit_cleanup': False  # True: delete fails on shutdown
                        }
             solver_options.update(jit_options)
