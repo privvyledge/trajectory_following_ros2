@@ -73,6 +73,7 @@ setup(
                 'twist_to_ackermann = trajectory_following_ros2.twist_to_ackermann_drive:main',
                 'waypoint_recorder = trajectory_following_ros2.waypoint_recorder:main',
                 'waypoint_loader = trajectory_following_ros2.waypoint_loader:main',
+                'trajectory_visualizer = trajectory_following_ros2.viz.visualizer_node:main',
             ],
         },
 )

@@ -9,22 +9,15 @@ Remap nav2 path topic to
 """
 
 import os
-import yaml
-import pathlib
+
 import numpy as np
 
 from launch import LaunchDescription
 from ament_index_python.packages import get_package_share_directory
-from launch.actions import (DeclareLaunchArgument, GroupAction,
-                            IncludeLaunchDescription, SetEnvironmentVariable)
+from launch.actions import DeclareLaunchArgument, GroupAction
 from launch.conditions import IfCondition, LaunchConfigurationEquals
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PythonExpression
-from launch_ros.actions import Node, SetRemap, PushRosNamespace, SetParametersFromFile, SetParameter
-from launch.actions import DeclareLaunchArgument
-from launch_ros.actions import PushRosNamespace
-from launch_ros.descriptions import ParameterFile
-from nav2_common.launch import RewrittenYaml, ReplaceString
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node, PushRosNamespace, SetParametersFromFile, SetParameter
 
 
 def generate_launch_description():
@@ -34,6 +27,11 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time')
     use_namespace = LaunchConfiguration('use_namespace', default=False)
     namespace = LaunchConfiguration('namespace', default='')
+    load_visualizer = LaunchConfiguration('load_visualizer', default=False)
+    viz_spawn_viewer = LaunchConfiguration('viz_spawn_viewer', default=True)
+    viz_recording_path = LaunchConfiguration('viz_recording_path', default='')
+    viz_actuator_feedback_topic = LaunchConfiguration('viz_actuator_feedback_topic', default='')
+    viz_reference_cmd_topic = LaunchConfiguration('viz_reference_cmd_topic', default='')
     params_file = LaunchConfiguration('params_file')
     load_params_from_file = LaunchConfiguration('load_params_from_file', default=True)
     load_params_from_args = LaunchConfiguration('load_params_from_args', default=True)
@@ -409,6 +407,32 @@ def generate_launch_description():
             description='The rate at which to publish debugging/visualization topics. If <= 0, no topics are published.'
     )
 
+    load_visualizer_la = DeclareLaunchArgument(
+            'load_visualizer',
+            default_value='False',
+            description='Launch the Rerun trajectory visualizer node. Requires rerun-sdk (pip install rerun-sdk).'
+    )
+    viz_spawn_viewer_la = DeclareLaunchArgument(
+            'viz_spawn_viewer',
+            default_value='True',
+            description='Spawn the Rerun viewer process automatically when the visualizer starts.'
+    )
+    viz_recording_path_la = DeclareLaunchArgument(
+            'viz_recording_path',
+            default_value='',
+            description='Path to save a .rrd Rerun recording file. Empty = no file saved.'
+    )
+    viz_actuator_feedback_topic_la = DeclareLaunchArgument(
+            'viz_actuator_feedback_topic',
+            default_value='',
+            description='AckermannDriveStamped topic carrying actual hardware actuator state (optional).'
+    )
+    viz_reference_cmd_topic_la = DeclareLaunchArgument(
+            'viz_reference_cmd_topic',
+            default_value='',
+            description='AckermannDriveStamped topic carrying reference commands from a driver dataset (optional).'
+    )
+
     # Create Launch Description
     ld = LaunchDescription(
             [declare_use_sim_time_cmd, use_namespace_la, namespace_la, params_file_la,
@@ -428,7 +452,9 @@ def generate_launch_description():
              distance_tolerance_la, speed_tolerance_la,
              declare_log_level_cmd,
              odom_topic_la, ackermann_cmd_topic_la, twist_topic_la, acceleration_topic_la, path_topic_la,
-             speed_topic_la, debug_frequency_la]
+             speed_topic_la, debug_frequency_la,
+             load_visualizer_la, viz_spawn_viewer_la, viz_recording_path_la,
+             viz_actuator_feedback_topic_la, viz_reference_cmd_topic_la]
     )
 
     common_parameters = {
@@ -552,7 +578,7 @@ def generate_launch_description():
             condition=LaunchConfigurationEquals('control_type', 'purepursuit'),
             package='trajectory_following_ros2',
             executable='purepursuit',
-            name=f'purepursuit_node',
+            name='purepursuit_node',
             output='screen',
             parameters=[
                 # params_file,
@@ -560,6 +586,13 @@ def generate_launch_description():
             ],
     )
 
+    visualizer_node = Node(
+            condition=IfCondition(load_visualizer),
+            package='trajectory_following_ros2',
+            executable='trajectory_visualizer',
+            name='trajectory_visualizer_node',
+            output='screen',
+    )
 
     load_nodes = GroupAction(
             actions=[
@@ -641,6 +674,11 @@ def generate_launch_description():
                 # Waypoint Parameters
                 SetParameter(name='file_path', value=waypoints_csv, condition=IfCondition(load_params_from_args)),
 
+                # Visualizer parameters (only affect trajectory_visualizer_node)
+                SetParameter(name='spawn_viewer', value=viz_spawn_viewer, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='recording_path', value=viz_recording_path, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='actuator_feedback_topic', value=viz_actuator_feedback_topic, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='reference_cmd_topic', value=viz_reference_cmd_topic, condition=IfCondition(load_params_from_args)),
 
                 # # Remap common topics
                 # SetRemap(src='trajectory/path', dst=path_topic),
@@ -658,6 +696,7 @@ def generate_launch_description():
                 casadi_mpc_node,
                 do_mpc_node,
                 custom_purepursuit_node,
+                visualizer_node,
             ])
 
     # Add the actions to launch all of the mpc nodes
