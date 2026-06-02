@@ -1,7 +1,4 @@
 import numpy as np
-import casadi
-import matplotlib.pyplot as plt
-import matplotlib.patches as plt_patches
 
 from acados_template import AcadosModel
 from acados_template import AcadosSim, AcadosSimSolver

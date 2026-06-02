@@ -5,14 +5,10 @@ Sources:
 """
 
 import numpy as np
-from casadi import *
-from casadi.tools import *
+from casadi import *  # noqa: F401,F403
+from casadi.tools import *  # noqa: F401,F403
 import matplotlib.pyplot as plt
 import matplotlib.patches as plt_patches
-
-
-import pdb
-import sys
 
 import do_mpc
 
@@ -23,7 +19,7 @@ CAR_OUTLINE = '#B7950B'
 
 class Simulator(object):
     """docstring for ClassName"""
-    
+
     def __init__(self, vehicle, sample_time=0.02):
         """Constructor for Simulator"""
         self.vehicle = vehicle

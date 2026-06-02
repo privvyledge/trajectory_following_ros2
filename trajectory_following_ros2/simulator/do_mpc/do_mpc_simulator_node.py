@@ -18,7 +18,7 @@ class DoMpcSimulator(BaseSimulator):
 
     def _build_integrator(self):
         vehicle_model = BicycleKinematicModel(
-            length=self.WHEELBASE, width=0.192, sample_time=self.sample_time)
+            wheelbase=self.WHEELBASE, width=0.192, sample_time=self.sample_time)
         # TVP placeholders required by the do-mpc model structure; not used by simulator.
         vehicle_model.wp_id = 0
         vehicle_model.reference_path = [[0., 0., 0., 0.]]

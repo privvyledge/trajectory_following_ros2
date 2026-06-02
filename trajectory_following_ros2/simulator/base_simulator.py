@@ -48,7 +48,7 @@ class BaseSimulator(Node, ABC):
         self.declare_parameter(
             'global_frame', 'odom',
             pd(description='Global/world frame (odom or map).'))
-        self.declare_parameter('update_rate', 50.0)
+        self.declare_parameter('update_rate', 20.0)
         self.declare_parameter('wheelbase', 0.256)
         self.declare_parameter(
             'min_steer', -30.0,
@@ -59,10 +59,10 @@ class BaseSimulator(Node, ABC):
         self.declare_parameter(
             'max_steer_rate', 60.0 / 0.17,
             pd(description='Maximum steering rate (degrees/s).'))
-        self.declare_parameter('max_speed', 100.5)
-        self.declare_parameter('min_speed', -100.5)
-        self.declare_parameter('max_accel', 30.0)
-        self.declare_parameter('max_decel', -30.0)
+        self.declare_parameter('max_speed', 10.5)
+        self.declare_parameter('min_speed', -10.5)
+        self.declare_parameter('max_accel', 3.0)
+        self.declare_parameter('max_decel', -3.0)
         self.declare_parameter('saturate_input', True)
         self.declare_parameter('n_states', 4)
         self.declare_parameter('n_inputs', 2)
