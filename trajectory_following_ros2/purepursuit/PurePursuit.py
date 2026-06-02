@@ -42,7 +42,7 @@ class PurePursuit(object):
         # alpha1 = find_angle(v1, v2)
         alpha = math.atan2(goal_y - current_y, goal_x - current_x) - current_psi
 
-        ''' (Optional) Get cross-track error: 
+        ''' (Optional) Get cross-track error:
                 the lateral distance between the heading vector and the goal point in body frame'''
         crosstrack_error = math.sin(alpha) * self.lookahead
         # crosstrack_error = goal_y - current_y

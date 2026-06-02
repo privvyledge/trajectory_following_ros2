@@ -72,14 +72,13 @@ class KinematicBicycleModel(object):
         constraint = types.SimpleNamespace()  # todo: switch to a class instead
         model = types.SimpleNamespace()  # todo: switch to a class instead
 
-        if symbol_type.lower() == 'MX'.lower():
-            symbol_type = casadi.MX
-
-        elif symbol_type.lower() == 'SX'.lower():
-            symbol_type = casadi.SX
-
-        else:
-            raise Exception('Invalid Symbol Type')
+        if isinstance(symbol_type, str):
+            if symbol_type.lower() == 'mx':
+                symbol_type = casadi.MX
+            elif symbol_type.lower() == 'sx':
+                symbol_type = casadi.SX
+            else:
+                raise Exception('Invalid Symbol Type')
 
         # state
         x = symbol_type.sym("x")
@@ -252,14 +251,13 @@ class KinematicBicycleModel(object):
         constraint = types.SimpleNamespace()  # todo: switch to a class instead
         model = types.SimpleNamespace()  # todo: switch to a class instead
 
-        if symbol_type.lower() == 'MX'.lower():
-            symbol_type = casadi.MX
-
-        elif symbol_type.lower() == 'SX'.lower():
-            symbol_type = casadi.SX
-
-        else:
-            raise Exception('Invalid Symbol Type')
+        if isinstance(symbol_type, str):
+            if symbol_type.lower() == 'mx':
+                symbol_type = casadi.MX
+            elif symbol_type.lower() == 'sx':
+                symbol_type = casadi.SX
+            else:
+                raise Exception('Invalid Symbol Type')
 
         # state
         x = symbol_type.sym("x")
@@ -391,7 +389,6 @@ class KinematicBicycleModel(object):
                 model.x0 = np.zeros(z.shape[0])
         else:
             model.x0 = z0
-
 
         # Define model struct
         params = types.SimpleNamespace()

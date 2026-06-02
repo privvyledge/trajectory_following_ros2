@@ -7,7 +7,11 @@ import numpy as np
 
 @dataclass
 class SolverResult:
-    """Normalized output from any MPC solver backend."""
+    """Normalized output from any MPC solver backend.
+
+    Attributes populated by every backend's solve() call.
+    """
+
     accel_cmd: float = 0.0          # [m/s²]  first optimal input
     steering_cmd: float = 0.0       # [rad]   first optimal input
     velocity_cmd: float = 0.0       # [m/s]   k+1 predicted velocity (sent to VESC as speed)

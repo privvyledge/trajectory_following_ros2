@@ -86,9 +86,8 @@ class AckermannPurePursuit(BaseTrajectoryTracker):
             return
 
         # Goal check
-        if self.trajectory.check_goal(
-                self.x, self.y, self.speed,
-                self.final_goal, self.current_idx, self.path.shape[0]):
+        if self.trajectory.is_goal_reached(
+                self.x, self.y, self.speed, self.final_goal):
             self.get_logger().info('Final goal reached.')
             self._publish_zero_command()
             return

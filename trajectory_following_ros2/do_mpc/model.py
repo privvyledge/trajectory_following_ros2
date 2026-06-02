@@ -10,7 +10,7 @@ import do_mpc
 
 class BicycleKinematicModel(object):
     """docstring for ClassName"""
-    
+
     def __init__(self, wheelbase, width, sample_time, model_type='continuous'):
         """Constructor for BicycleKinematicModel"""
         # car parameters
@@ -33,7 +33,6 @@ class BicycleKinematicModel(object):
             self.model = self.model_setup()
         else:
             self.model = self.discrete_model_setup()
-
 
     def model_setup(self):
         model_type = "continuous"  # either 'discrete' or 'continuous'

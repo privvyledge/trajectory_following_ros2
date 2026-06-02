@@ -1,3 +1,4 @@
+# flake8: noqa
 import matplotlib
 matplotlib.use('TkAgg')
 import math

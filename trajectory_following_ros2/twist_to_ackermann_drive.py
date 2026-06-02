@@ -2,29 +2,10 @@ import math
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
-# libraries
-import numpy as np
-import time
-from threading import Lock
-
-# TF
-from tf2_ros import TransformBroadcaster
-import tf_transformations
-
-# messages
 from rcl_interfaces.msg import ParameterDescriptor
-from std_msgs.msg import String, Header, Float32MultiArray, Float64
-from sensor_msgs.msg import LaserScan
-from visualization_msgs.msg import Marker
-from geometry_msgs.msg import Point, Pose, PoseStamped, PoseArray, Quaternion, PolygonStamped, Polygon, Point32, \
-    PoseWithCovarianceStamped, PointStamped, TransformStamped
-from nav_msgs.msg import Odometry
-from nav_msgs.srv import GetMap
-
-from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import Twist
+from ackermann_msgs.msg import AckermannDriveStamped
 
 
 class Twist2Ackermann(Node):
@@ -61,8 +42,7 @@ class Twist2Ackermann(Node):
 
         # Setup publishers
         self.ackermann_cmd_pub = self.create_publisher(AckermannDriveStamped, self.ackermann_cmd_topic, 1)
-        timer_period = 0.05
-        # self.timer = self.create_timer(timer_period, self.timer_callback)
+        # self.timer = self.create_timer(0.05, self.timer_callback)
 
         self.get_logger().info('twist_to_ackermann node started. ')
 
@@ -89,7 +69,7 @@ class Twist2Ackermann(Node):
             yaw_rate = msg.angular.z
             steering_angle = self.yaw_rate_to_steering_angle(longitudinal_velocity, yaw_rate)
 
-        ######### Begin saturation
+        # Begin saturation
         if longitudinal_velocity > 3.0:
             self.get_logger().info('Saturating speed. ')
             longitudinal_velocity = 3.0
@@ -103,7 +83,7 @@ class Twist2Ackermann(Node):
         if steering_angle < -0.4:
             self.get_logger().info('Saturating steering_angle. ')
             steering_angle = -0.4
-        ######### End saturation
+        # End saturation
 
         ackermann_cmd = AckermannDriveStamped()
         ackermann_cmd.header.stamp = self.get_clock().now().to_msg()

@@ -6,7 +6,6 @@ import os
 import numpy as np
 # from casadi import *
 import casadi
-from casadi import mtimes, vertcat, vertsplit
 # from casadi.tools import *
 import do_mpc
 from trajectory_following_ros2.do_mpc.model import BicycleKinematicModel
@@ -170,7 +169,7 @@ class MPC(object):
         }
         mpc.set_param(**setup_mpc)
         return mpc
-        
+
     def tvp_fun(self, t_now):
         """Provides reference states and cost weights as time-varying parameters."""
         Q = self.Q_diag_value

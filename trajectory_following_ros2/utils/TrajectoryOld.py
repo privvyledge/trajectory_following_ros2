@@ -341,8 +341,8 @@ class Trajectory(object):
     def smooth_and_interpolate_coordinates(self, coordinates, method='rgds',
                                            window_length=9, kernel_type='gaussian', polynomial_order=3, std_dev=2,
                                            weight_data=0.5, weight_smooth=0.5, tolerance=0.000001):
-        unique, indices = np.unique(coordinates, axis=0, return_index=True)
-        coordinates = coordinates[indices, :]
+        _, indices = np.unique(coordinates, axis=0, return_index=True)
+        coordinates = coordinates[np.sort(indices), :]
         x, y = coordinates[:, 0], coordinates[:, 1]
         # l = len(x)
         # t = np.linspace(0, 1, l - 2, endpoint=True)
