@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+
+# IDE / editor
+.idea/
+.vscode/
+.antigravitycli/
+
+# colcon / ROS 2 workspace build artifacts
+build/
+install/
+log/
+
+# acados / generated solver code
+c_generated_code*/
+acados_ocp_*.json
+kinematic_bicycle_acados_integrator.json
+
+# Rerun recordings
+*.rrd
