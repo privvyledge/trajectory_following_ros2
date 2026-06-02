@@ -95,6 +95,14 @@ class Trajectory(object):
         self.MAXIMUM_SEARCH_RADIUS = 25.0  # maximum search radius (m)
         self.STOP_SPEED = stop_speed  # stop speed (stop permitted when speed < speed_stop)
 
+        # Reference speed policy (forwarded to generate_reference_trajectory_by_interpolation).
+        # Defaults preserve the legacy constant-v_target behaviour; the owning node sets
+        # these from its ROS parameters. See generate_reference_trajectory_by_interpolation.
+        self.a_lat_max = 0.0            # lateral-accel limit (m/s²); 0 disables curvature cap
+        self.use_speed_profile = False  # sample the recorded speed column over the horizon
+        self.min_reference_speed = 0.0  # forward creep floor (m/s)
+        self.max_reference_speed = None  # upper speed cap (m/s); None => use v_target alone
+
     def calc_nearest_index(self, waypoints=None, state=None, current_index=None, num_neighbours=10,
                            min_search_radius=0.0, max_search_radius=30.0, use_euclidean_distance=True, workers=1):
         if waypoints is None:
@@ -268,39 +276,42 @@ class Trajectory(object):
                 target_index,
                 self.trajectory_key_to_column,
                 horizon=prediction_horizon,
-                v_target=target_speed, dt=dt)
+                v_target=target_speed, dt=dt,
+                a_lat_max=self.a_lat_max,
+                use_speed_profile=self.use_speed_profile,
+                v_min=self.min_reference_speed,
+                v_max=self.max_reference_speed)
 
         return target_index, reference_trajectory, goal_waypoint1, goal_waypoint2, goal_waypoint3
 
-    def check_goal(self, x, y, vel, goal, tind, nind):
+    def reset_progress(self):
+        """Reset traversal progress to the start of the trajectory.
+
+        Called on a lap restart (looping) or a bag-replay backward time jump.
+        Only the traversal indices are reset; the stored trajectory data is left
+        intact. The owning node resets its own progress counters (current_idx,
+        cumulative_distance) alongside this call.
         """
-        Todo:
-            * refactor speed stopping.
-            * enable looping, e.g replaying the trajectory when we are done or get back to the initial position after an optional delay
-        :param state:
-        :param goal:
-        :param tind: target index
-        :param nind: number of indices
-        :return:
+        self.previous_index = 0
+        self.current_index = 0
+        self.goal_index = 0
+
+    def is_goal_reached(self, x, y, vel, goal=None):
+        """True when the vehicle is at the final goal: within goal_tolerance of
+        the goal point AND nearly stopped (speed within STOP_SPEED of the goal
+        speed).
+
+        Replaces the old check_goal(): drops the abs(tind - nind) >= 5 guard,
+        which was unsatisfiable on dense paths — the target index tops out well
+        below the waypoint count there, so the guard forced the result to False
+        on every tick — along with the count-vs-max-index off-by-one it relied
+        on. End-of-path detection now lives in calc_ref_trajectory (ref_traj is
+        None); this method only answers "stopped at the goal?".
         """
-        # check goal
-        # dx = state.x - goal[0]
-        # dy = state.y - goal[1]
-        # d = math.hypot(dx, dy)
+        if goal is None:
+            goal = self.goal
         d = trajectory_utils.get_distance(np.array([x, y]).reshape((1, -1)),
                                           goal[0:2].reshape(1, -1)).item()
-
-        isgoal = (d <= self.GOAL_DIS)
-
-        if abs(tind - nind) >= 5:
-            isgoal = False
-
-        # isstop = (abs(vel) <= self.STOP_SPEED)  # todo: refactor
-        tolerance = 1.0
-        isstop = abs(vel - self.STOP_SPEED) <= tolerance
-        isstop = True
-
-        if isgoal and isstop:  # and (tind >= nind)
-            return True
-
-        return False
+        near_goal = (d <= self.GOAL_DIS)
+        stopped = (abs(vel - goal[2]) <= self.STOP_SPEED)
+        return near_goal and stopped

@@ -16,11 +16,14 @@ Msgs:
     Path: http://docs.ros.org/en/noetic/api/nav_msgs/html/msg/Path.html
     Marker: text and pose
 """
+import sys
 import numpy as np
 
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.duration import Duration
+from rclpy.clock import Clock, ClockType
 
 from tf2_ros import TransformException, LookupException
 from tf2_ros.transform_listener import TransformListener
@@ -45,7 +48,7 @@ class WaypointRecorderNode(Node):
         self.declare_parameter('file_path', '')
         self.declare_parameter('waypoint_source', 'odometry')
         self.declare_parameter('save_interval', 0.1)  # seconds
-        self.declare_parameter('target_frame_id', 'odom',
+        self.declare_parameter('target_frame_id', 'map',
                                ParameterDescriptor(description='Frame to transform poses into before saving.'))
         self.declare_parameter('odom_topic', 'odometry/local')
         self.declare_parameter('pose_topic', 'pose')
@@ -65,6 +68,11 @@ class WaypointRecorderNode(Node):
                                                                'waypoints. 0.0 (default) disables the check. '
                                                                'Note: a non-zero value suppresses dwell time at '
                                                                'intentional stops (stop signs, pickups).'))
+        self.declare_parameter('log_duration', 4.0,
+                               ParameterDescriptor(description='Logging at high frequencies can flood the console.'
+                                                               'Set this parameter to a value <= 0.0 and the logs '
+                                                               'only be displayed once. Positive values will be used '
+                                                               'to throttle the logging duration.'))
 
         # get parameters
         self.file_path = str(self.get_parameter('file_path').value)
@@ -79,6 +87,8 @@ class WaypointRecorderNode(Node):
         self.save_if_transform_fails = self.get_parameter('save_if_transform_fails').value
         self.stale_odom_timeout = self.get_parameter('stale_odom_timeout').value
         self.min_distance = self.get_parameter('min_distance').value
+        self.log_duration = self.get_parameter('log_duration').value
+        self.log_kwarg = {'once': True} if self.log_duration <= 0.0 else {'throttle_duration_sec': self.log_duration}
 
         # vehicle state (updated by odom_callback after successful TF)
         self.x, self.y, self.z = 0.0, 0.0, 0.0
@@ -91,10 +101,15 @@ class WaypointRecorderNode(Node):
 
         # timing state
         self._start_time = None           # rclpy.time.Time of first successful odom+TF update
-        self._last_odom_wall_time = None  # wall-clock time of latest odom callback arrival
-        self._last_write_time = None      # wall-clock time of last successful write
+        self._last_odom_wall_time = None  # STEADY_TIME of latest odom callback arrival
+        self._last_write_time = None      # node-clock time of last successful write
         self._last_recorded_x = None     # position at last write, for min_distance check
         self._last_recorded_y = None
+        self._last_msg_time = None        # msg timestamp of last processed odom, for reversal detection
+        self._row_count = 0               # total rows written to CSV
+        self._is_stale = False            # True while odom is stale (edge-triggered logging)
+        self._new_odom_since_last_write = False  # cleared after each write; prevents duplicate rows
+        self._steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
 
         # buffering=1: line-buffered — each line ending with '\n' is flushed to disk immediately
         header = 'frame_id, total_time_elapsed, dt, x, y, z, yaw, qx, qy, qz, qw, vx, vy, speed, omega\n'
@@ -128,8 +143,10 @@ class WaypointRecorderNode(Node):
         self.get_logger().info('waypoint_recorder started. ')
 
     def odom_callback(self, data):
-        # Stamp wall-clock arrival before TF lookup so staleness check works even on TF failure
-        self._last_odom_wall_time = self.get_clock().now()
+        self.get_logger().info("Odom message received", **self.log_kwarg)
+        # Stamp STEADY_TIME arrival before TF lookup — staleness check must use wall clock
+        # because sim clock stops advancing when the bag pauses (get_clock() would never age out).
+        self._last_odom_wall_time = self._steady_clock.now()
 
         msg_time = data.header.stamp
         frame_id = data.header.frame_id
@@ -140,26 +157,46 @@ class WaypointRecorderNode(Node):
 
         source_frame = frame_id
         target_frame = self.target_frame_id
-        try:
-            # timeout=0: non-blocking, uses the latest available transform
-            trans = self.tf_buffer.lookup_transform(
-                    target_frame, source_frame,
-                    rclpy.time.Time(),
-                    timeout=Duration(seconds=0))
-            self.global_frame = target_frame
-            new_pose = tf2_geometry_msgs.do_transform_pose(pose, trans)
-            position = new_pose.position
-            orientation = new_pose.orientation
-        except (TransformException, LookupException) as e:
-            self.get_logger().info(f"Could not transform {source_frame} → {target_frame}: {e}")
-            if self.save_if_transform_fails:
-                self.global_frame = source_frame
-            else:
-                self.global_frame = source_frame
-                return
+        self.global_frame = source_frame
+        # Only transform when a target frame is requested; otherwise record in the message's own frame.
+        if target_frame:
+            try:
+                # timeout=0: non-blocking, uses the latest available transform
+                trans = self.tf_buffer.lookup_transform(
+                        target_frame, source_frame,
+                        rclpy.time.Time(),
+                        timeout=Duration(seconds=0))
+                self.global_frame = target_frame
+                new_pose = tf2_geometry_msgs.do_transform_pose(pose, trans)
+                position = new_pose.position
+                orientation = new_pose.orientation
+            except (TransformException, LookupException) as e:
+                self.get_logger().info(f"Could not transform {source_frame} → {target_frame}: {e}")
+                if not self.save_if_transform_fails:
+                    return
 
         # Update state — only reached on successful transform or save_if_transform_fails=True
         msg_time_obj = rclpy.time.Time.from_msg(msg_time)
+
+        # Time reversal detection: bag restarted or looped — timestamps jump backward.
+        # Reset all session state so the new playback writes a clean, monotonic sequence.
+        if self._last_msg_time is not None:
+            dt_msg = (msg_time_obj - self._last_msg_time).nanoseconds / 1e9
+            if dt_msg < -1.0:
+                self.get_logger().warning(
+                    f'Time reversal detected ({dt_msg:.1f}s jump) — bag restarted or looped. '
+                    f'Resetting recording state.')
+                self._start_time = None
+                self._last_write_time = None
+                self._last_recorded_x = None
+                self._last_recorded_y = None
+                self._is_stale = False
+                self._new_odom_since_last_write = False
+                # Clear stale TF data so the buffer accepts the rewound timestamps
+                # from the restarted bag without TF_OLD_DATA warnings.
+                self.tf_buffer.clear()
+        self._last_msg_time = msg_time_obj
+
         if self._start_time is None:
             self._start_time = msg_time_obj
         self.total_time_elapsed = (msg_time_obj - self._start_time).nanoseconds / 1e9
@@ -175,6 +212,7 @@ class WaypointRecorderNode(Node):
         self.omega = twist.angular.z
         self.speed = np.linalg.norm([self.vx, self.vy, self.vz])
 
+        self._new_odom_since_last_write = True
         self.publish_marker(position, orientation, self.speed)
 
     def pose_callback(self, data):
@@ -187,14 +225,22 @@ class WaypointRecorderNode(Node):
         if self._start_time is None:
             return  # no valid odom+TF received yet
 
-        now = self.get_clock().now()
-
-        # Staleness check: skip if odom topic has gone silent (topic loss, node crash, etc.).
+        # Staleness check: uses STEADY_TIME so it fires even when sim clock stops advancing.
         # A genuinely stopped vehicle still publishes odom, so this does NOT suppress dwell time.
-        odom_age = (now - self._last_odom_wall_time).nanoseconds / 1e9
+        now_wall = self._steady_clock.now()
+        odom_age = (now_wall - self._last_odom_wall_time).nanoseconds / 1e9
         if odom_age > self.stale_odom_timeout:
-            self.get_logger().warning(
-                    f'Odom stale ({odom_age:.2f}s > {self.stale_odom_timeout}s), skipping write.')
+            if not self._is_stale:
+                self.get_logger().warning(
+                    f'Odom stale ({odom_age:.2f}s > {self.stale_odom_timeout}s threshold), '
+                    f'pausing recording.')
+                self._is_stale = True
+            return
+        if self._is_stale:
+            self.get_logger().info('Odom resumed, recording continues.')
+            self._is_stale = False
+
+        if not self._new_odom_since_last_write:
             return
 
         # Optional distance threshold (disabled by default: min_distance=0.0).
@@ -204,8 +250,12 @@ class WaypointRecorderNode(Node):
             if dist < self.min_distance:
                 return
 
-        # dt = time since last write (≈ save_interval); 0.0 on the first row
+        now = self.get_clock().now()
+        # dt = time since last write (≈ save_interval); 0.0 on the first row of each session
         dt = 0.0 if self._last_write_time is None else (now - self._last_write_time).nanoseconds / 1e9
+
+        if self._last_write_time is None:
+            self.get_logger().info(f'Recording started — saving to {self.file_path}')
 
         self.waypoint_file.write(
                 f"{self.global_frame}, {self.total_time_elapsed:.6f}, {dt:.6f}, "
@@ -214,10 +264,16 @@ class WaypointRecorderNode(Node):
                 f"{self.vx}, {self.vy}, "
                 f"{self.speed}, {self.omega}\n")
 
+        self._new_odom_since_last_write = False
+        self._row_count += 1
         self._last_write_time = now
         self._last_recorded_x = self.x
         self._last_recorded_y = self.y
         self.publish_path()
+
+        self.get_logger().info(
+            f'Recording: {self._row_count} rows written ({self.total_time_elapsed:.1f}s elapsed)',
+            **self.log_kwarg)
 
     def publish_path(self):
         pose_msg = PoseStamped()
@@ -273,11 +329,19 @@ class WaypointRecorderNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    wr_node = WaypointRecorderNode()
-    rclpy.spin(wr_node)
-    wr_node.waypoint_file.close()
-    wr_node.destroy_node()
-    rclpy.shutdown()
+    try:
+        wr_node = WaypointRecorderNode()
+        try:
+            rclpy.spin(wr_node)
+        finally:
+            wr_node.waypoint_file.close()
+            wr_node.destroy_node()
+    except KeyboardInterrupt:
+        pass
+    except ExternalShutdownException:
+        sys.exit(1)
+    finally:
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':

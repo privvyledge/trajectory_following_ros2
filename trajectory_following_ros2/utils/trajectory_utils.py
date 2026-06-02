@@ -10,12 +10,10 @@ Todo:
     * integrate functions from Autowares https://gitlab.com/autowarefoundation/autoware.ai/core_planning/-/blob/a056c3908676e3bf8f39daadb1699ab946dd55ca/mpc_follower/src/mpc_utils.cpp. See autoware_mpc_utils.py
     * implement lateral, longitudinal and angular error threshold to substitute the goal tolerance
 """
-from copy import deepcopy
 import math
 
-import matplotlib.pyplot as plt
 import numpy as np
-from scipy import interpolate, signal, fft, ndimage
+from scipy import interpolate
 from scipy.spatial import KDTree
 from scipy.spatial.transform import Rotation
 from scipy.spatial.distance import cdist
@@ -68,21 +66,28 @@ def find_closest_waypoints(waypoints, position, num_neighbours=10,
     #     # indices = indices[indices >= current_index]
     #     # distances = distances[indices >= current_index]
 
-    # find the indices with the shortest distance
-    indices = indices[(indices >= current_index) & (min_search_radius <= distances) & (distances <= max_search_radius)]
-    # distances = distances[indices]
+    # find eligible indices: ahead of current_index and within the distance band
+    eligible_mask = (indices >= current_index) & (min_search_radius <= distances) & (distances <= max_search_radius)
+    eligible_indices = indices[eligible_mask]
+    eligible_distances = distances[eligible_mask]
 
-    # restrict to num_neighbours
-    try:
-        indices = indices[:num_neighbours]
-        distances = distances[indices]
-        # distances = distances[:num_neighbours]
-    except IndexError:
-        # distances = distances
-        # indices = indices
-        pass
+    if len(eligible_indices) == 0:
+        return eligible_indices, eligible_distances
 
-    return indices, distances
+    # Keep ascending index order and take the first num_neighbours, so ind[0] is the
+    # *next* eligible waypoint ahead of current_index — not the globally nearest one.
+    # Sorting by Euclidean distance instead is wrong for dense or self-returning paths
+    # (closed loops, figure-eights): the spatially nearest waypoint that is also
+    # > min_search_radius away can sit at a far-higher index where the path loops back
+    # near itself, causing target_index (and self.current_idx) to leap forward and the
+    # `index >= current_index` search window to collapse to empty mid-trajectory.
+    # Because eligibility is gated on distance from the *vehicle* (not from
+    # current_index), the lowest eligible index naturally tracks physical progress and
+    # does not race ahead while the vehicle is stationary.
+    eligible_indices = eligible_indices[:num_neighbours]
+    eligible_distances = eligible_distances[:num_neighbours]
+
+    return eligible_indices, eligible_distances
 
 
 def find_closest_waypoints_kdtree(waypoints_kd_tree, position, num_neighbours=1,
@@ -327,7 +332,7 @@ def calculate_current_arc_length(current_speed, normalized_yaw_diff, dt):
 
 
 def predict_state_rk4(x0, u, delay, wheelbase):
-    """Propagate kinematic bicycle state forward by `delay` seconds (RK4, constant u). 
+    """Propagate kinematic bicycle state forward by `delay` seconds (RK4, constant u).
     Todo: in future could handle different models, e.g dynamics
 
     State: [x, y, v, psi].  Inputs: [a, delta] (rad).  Rear-axle reference point.
@@ -631,7 +636,7 @@ def convert_error_to_frenet_frame(pose, goal, psi_current, psi_desired, cdists, 
     s = cdists[index]
     e_s = error_frenet[0]  # longitudinal deviation
     e_y = error_frenet[1]  # lateral deviation
-    psi_error = psi_current - psi_desired  #  pose[3] - goal[3]
+    psi_error = psi_current - psi_desired  # pose[3] - goal[3]
     psi_error = normalize_angle(psi_error, minus_pi_to_pi=True, pi_is_negative=True, degrees=True)
     return s, e_s, e_y, psi_error
 
@@ -693,7 +698,8 @@ def interpolate_trajectory(waypoints, num_points=100, weight_smooth=0.5, polynom
     """
     # Extract x and y coordinates
     if remove_duplicates:
-        waypoints, indices = np.unique(waypoints[:, :2], axis=0, return_index=True)
+        _, indices = np.unique(waypoints[:, :2], axis=0, return_index=True)
+        waypoints = waypoints[np.sort(indices)]
         x = waypoints[:, 0]
         y = waypoints[:, 1]
 
@@ -726,7 +732,11 @@ def interpolate_path(pts, arc_lengths_arr, smooth_value=0.1, scale=2, derivative
 
     # BSpline interpolation only works for unique values of x
     if remove_duplicates:
-        pts, indices = np.unique(pts, axis=0, return_index=True)
+        _, indices = np.unique(pts, axis=0, return_index=True)
+        sorted_indices = np.sort(indices)
+        pts = pts[sorted_indices]
+        if arc_lengths_arr is not None:
+            arc_lengths_arr = arc_lengths_arr[sorted_indices]
 
     tck, u = splprep(pts.T, u=arc_lengths_arr, s=smooth_value, per=1)
 
@@ -908,7 +918,9 @@ def s_curve_velocity_profile(distance, max_vel, accel, decel, jerk):
 
 
 def generate_reference_trajectory_by_interpolation(trajectory, init_pose, closest_index, waypoint_keys_to_columns,
-                                                   horizon, v_target=None, dt=0.02):
+                                                   horizon, v_target=None, dt=0.02,
+                                                   a_lat_max=0.0, use_speed_profile=False,
+                                                   v_min=0.0, v_max=None):
     # (3) Find the reference trajectory using distance or time interpolation.
     #     WARNING: this function does not correctly handle cases where the car is far from the recorded path!
     #     Ill-defined behavior/speed.
@@ -918,6 +930,57 @@ def generate_reference_trajectory_by_interpolation(trajectory, init_pose, closes
     #     dt = dts[closest_index]
 
     yaw_init = init_pose[:, 3].item()
+
+    # Hybrid speed reference: instead of a single constant v_target over the horizon,
+    # build a speed-varying reference that follows the recorded speed profile and/or a
+    # curvature-based lateral-acceleration limit. Active only when a profile or a
+    # positive a_lat_max is requested (otherwise the legacy constant/timestamp paths
+    # below run unchanged for backward compatibility).
+    #
+    # Because horizon-point spacing depends on speed and the curvature limit depends on
+    # the curvature at that spacing, the two are coupled — so march arc length forward
+    # one step at a time:
+    #     v[h]   = clip( min( profile[h], sqrt(a_lat_max / |kappa[h]|) ), v_floor, v_cap )
+    #     s[h+1] = s[h] + march * dt * v[h]
+    # v_target supplies the upper cap and the travel direction (sign); v_min lifts the
+    # noisy near-zero recorded start so the vehicle pulls away (the controller's
+    # end-of-path/goal terminator handles the actual stop, so the floor never traps it).
+    _curv_limit = a_lat_max is not None and a_lat_max > 0.0
+    if v_target is not None and (_curv_limit or use_speed_profile):
+        cols = waypoint_keys_to_columns
+        cum_dist = trajectory[:, cols['cum_dist']]
+        march = 1.0 if v_target >= 0.0 else -1.0
+        cap = abs(v_target) if v_max is None else min(abs(v_target), abs(v_max))
+        floor = min(max(0.0, v_min), cap)  # floor cannot exceed the cap
+        kappa_col = np.abs(trajectory[:, cols['curvature']])
+        speed_col = np.abs(trajectory[:, cols['speed']])
+        eps = 1e-3  # avoids divide-by-zero on straight segments (kappa ~ 0)
+
+        s = trajectory[closest_index, cols['cum_dist']]
+        s_samples = [s]
+        v_samples = []
+        for _ in range(horizon):
+            v_h = cap
+            if use_speed_profile:
+                v_h = min(v_h, float(np.interp(s, cum_dist, speed_col)))
+            if _curv_limit:
+                kappa = float(np.interp(s, cum_dist, kappa_col))
+                v_h = min(v_h, float(np.sqrt(a_lat_max / max(kappa, eps))))
+            v_h = min(max(v_h, floor), cap)
+            v_samples.append(v_h)
+            s = s + march * dt * v_h
+            s_samples.append(s)
+        v_samples.append(v_samples[-1])  # v_N = v_{N-1}; matches the horizon+1 length
+
+        interp_to_fit = np.asarray(s_samples)
+        waypoint_dict = {}
+        for waypoint_key in ['x', 'y', 'yaw', 'cum_dist', 'curvature']:
+            waypoint_dict[waypoint_key + '_ref'] = np.interp(
+                interp_to_fit, cum_dist, trajectory[:, cols[waypoint_key]])
+        waypoint_dict['yaw_ref'] = fix_angle_reference(waypoint_dict['yaw_ref'], yaw_init)
+        waypoint_dict['vel_ref'] = march * np.asarray(v_samples)
+        return waypoint_dict
+
     if v_target is not None:
         # Given a velocity reference, use the cumulative distance for interpolation.
         start_dist = trajectory[closest_index, waypoint_keys_to_columns['cum_dist']]
@@ -1002,8 +1065,8 @@ if __name__ == '__main__':
     estimated_angle_list = get_angle_from_position(current_state_list[:2])
     estimated_angle = get_angle_from_position(current_state[:, :2])
     estimated_angles = get_angle_from_position(waypoints[:, :2])
-    estimated_angles_normalized = normalize_angle(estimated_angles, minus_pi_to_pi=True, pi_is_negative=True,
-                                                  degrees=True)
+    estimated_angles_normalized = normalize_angle(
+        estimated_angles, minus_pi_to_pi=True, pi_is_negative=True, degrees=True)
 
     # get arc lengths. Note: arc_lengths and cumulative_distance_along_path are the same
     arc_lengths = get_arc_lengths(waypoints[:, :2])
@@ -1011,9 +1074,10 @@ if __name__ == '__main__':
     cdists = cumulative_distance_along_path(waypoints[:, :2])
 
     # interpolate/filter the path
-    smooth_path = interpolate_trajectory(waypoints[20:70, :], num_points=100, weight_smooth=0.5, polynomial_order=3)  # todo: test
-    interpolated_paths, tck = interpolate_path(waypoints[20:70, :2], None, smooth_value=0.1, scale=2,
-                                               derivative_order=0)
+    smooth_path = interpolate_trajectory(  # todo: test
+        waypoints[20:70, :], num_points=100, weight_smooth=0.5, polynomial_order=3)
+    interpolated_paths, tck = interpolate_path(
+        waypoints[20:70, :2], None, smooth_value=0.1, scale=2, derivative_order=0)
 
     rgds_path = filters.smooth_and_interpolate_coordinates(coordinates=waypoints[:, :2],
                                                            method='rgds', weight_data=0.5,
@@ -1029,9 +1093,9 @@ if __name__ == '__main__':
     mvavg_box_path = filters.smooth_and_interpolate_coordinates(coordinates=waypoints[:, :2],
                                                                 method='moving_average',
                                                                 window_length=9, kernel_type='box')
-    mvavg_hann_path = filters.smooth_and_interpolate_coordinates(coordinates=waypoints[:, :2],
-                                                                 method='moving_average',
-                                                                 window_length=9, kernel_type='hann')
+    mvavg_hann_path = filters.smooth_and_interpolate_coordinates(
+        coordinates=waypoints[:, :2], method='moving_average',
+        window_length=9, kernel_type='hann')
 
     # plt.plot(waypoints[:, 0], waypoints[:, 1], 'r*', label='Waypoints')
     # plt.plot(smooth_path[:, 0], smooth_path[:, 1], 'bo')
@@ -1049,20 +1113,20 @@ if __name__ == '__main__':
     curvature_at_index = calculate_curvature_single(waypoints[:, :2], goal_index=current_index)
 
     # plot the estimated dt against the actual timestamps
-    plt.plot(range(len(waypoints)), interpolated_times, 'r*', label='Interpolated times')
+    # plt.plot(range(len(waypoints)), interpolated_times, 'r*', label='Interpolated times')
     # plt.plot(range(len(waypoints)), relative_times, 'bo', label='Estimated times')
-    plt.plot(range(len(waypoints)), waypoints[:, 6], 'g*', label='Actual times')
-    plt.legend()
-    plt.show()
+    # plt.plot(range(len(waypoints)), waypoints[:, 6], 'g*', label='Actual times')
+    # plt.legend()
+    # plt.show()
 
     # plot the estimated dt against the actual dt
-    plt.plot(range(len(waypoints)), interpolated_dts, 'r*', label='Interpolated dt')
+    # plt.plot(range(len(waypoints)), interpolated_dts, 'r*', label='Interpolated dt')
     # plt.plot(range(len(waypoints)), relative_dts, 'bo', label='Estimated dt')
-    plt.plot(range(len(waypoints)), waypoints[:, 5], 'g*', label='Actual dt')
-    plt.legend()
-    plt.show()
+    # plt.plot(range(len(waypoints)), waypoints[:, 5], 'g*', label='Actual dt')
+    # plt.legend()
+    # plt.show()
 
-    # update trajectory array. ['x', 'y', 'speed', 'yaw', 'omega', 'curvature', 'cum_dist', 'dt', 'total_time_elapsed']
+    # update trajectory array: x, y, speed, yaw, omega, curvature, cum_dist, dt, total_time_elapsed
     # todo: update with smooth/interpolated values using a flag
     # trajectory[:, :5] = waypoints[:, :5]  # x, y, speed, yaw, omega
     # trajectory[:, [7, 8]] = waypoints[:, [5, 6]]  # dt, total_time_elapsed
@@ -1080,15 +1144,16 @@ if __name__ == '__main__':
     waypoints_kdtree = KDTree(waypoints[:, :2])
 
     # find closest waypoint using euclidean distance
-    ii, dd = find_closest_waypoints(waypoints[:, :2], current_state[:, :2], current_index=current_index,
-                                    num_neighbours=50, min_search_radius=0.0, max_search_radius=30.0,
-                                    use_euclidean_distance=True,
-                                    workers=1)
+    ii, dd = find_closest_waypoints(
+        waypoints[:, :2], current_state[:, :2], current_index=current_index,
+        num_neighbours=50, min_search_radius=0.0, max_search_radius=30.0,
+        use_euclidean_distance=True, workers=1)
 
     # find the closest waypoint using kdtree nearest neighbour search
-    ii2, dd2 = find_closest_waypoints_kdtree(waypoints_kdtree, current_state[:, :2], current_index=current_index,
-                                             num_neighbours=50, min_search_radius=0.0, max_search_radius=30.0,
-                                             use_euclidean_distance=True, workers=1)
+    ii2, dd2 = find_closest_waypoints_kdtree(
+        waypoints_kdtree, current_state[:, :2], current_index=current_index,
+        num_neighbours=50, min_search_radius=0.0, max_search_radius=30.0,
+        use_euclidean_distance=True, workers=1)
 
     # get circle line intersection
     # first transform point to the robots frame so it's centered around the rear axle, e.g (0, 0)
@@ -1097,13 +1162,14 @@ if __name__ == '__main__':
     pt1 = current_state[:, :2] - current_state[:, :2]
     pt2 = waypoints[ii[1], :2] - current_state[:, :2]
     full_line = True
-    intersections = circle_line_segment_intersection((0, 0), lookahead,
-                                                     pt1.flatten().tolist(), pt2.flatten().tolist(),
-                                                     full_line=full_line)
-    intersections2 = circle_line_segment_intersection2((0, 0), lookahead,
-                                                       pt1.flatten().tolist(), pt2.flatten().tolist(),
-                                                       full_line=full_line)
-    intersections3 = circleSegmentIntersection(pt1.flatten().tolist(), pt2.flatten().tolist(), lookahead)
+    intersections = circle_line_segment_intersection(
+        (0, 0), lookahead,
+        pt1.flatten().tolist(), pt2.flatten().tolist(), full_line=full_line)
+    intersections2 = circle_line_segment_intersection2(
+        (0, 0), lookahead,
+        pt1.flatten().tolist(), pt2.flatten().tolist(), full_line=full_line)
+    intersections3 = circleSegmentIntersection(
+        pt1.flatten().tolist(), pt2.flatten().tolist(), lookahead)
 
     # same for method1 and method2
     if len(intersections3) == 0:
@@ -1114,15 +1180,18 @@ if __name__ == '__main__':
         intersections3 = np.array(intersections3) + current_state[:, :2]
 
     # get target point using circle line intersection
-    target_point = get_target_point(lookahead=lookahead, polyline=waypoints[:, :2], method=1, full_line=full_line)
-    target_point2 = get_target_point(lookahead=lookahead, polyline=waypoints[:, :2], method=2, full_line=full_line)
+    target_point = get_target_point(
+        lookahead=lookahead, polyline=waypoints[:, :2], method=1, full_line=full_line)
+    target_point2 = get_target_point(
+        lookahead=lookahead, polyline=waypoints[:, :2], method=2, full_line=full_line)
 
     # calculate errors
     psi_desired = waypoints[ii[0], 3]
-    crosstrack_err, psi_error, lat_error, long_error = get_errors(current_state[:, :2],
-                                                                  waypoints[ii[0], :2].reshape(1, -1),
-                                                                  psi_current,
-                                                                  psi_desired)
+    crosstrack_err, psi_error, lat_error, long_error = get_errors(
+        current_state[:, :2],
+        waypoints[ii[0], :2].reshape(1, -1),
+        psi_current,
+        psi_desired)
 
     # get errors in Frenet frame. psi_rotates from the frenet to the global frame
     rot_frenet_to_global_object = Rotation.from_euler('z', psi_desired).as_matrix()
@@ -1130,16 +1199,17 @@ if __name__ == '__main__':
     #                                  [-np.sin(psi_desired), np.cos(psi_desired)]])
     rot_global_to_frenet = Rotation.from_matrix(rot_frenet_to_global_object).inv().as_matrix()
 
-    s, e_y, e_s, psi_error2 = convert_error_to_frenet_frame(current_state[:, :2], waypoints[ii[1], :2],
-                                                            psi_current, psi_desired, cdists, current_index,
-                                                            rot_global_to_frenet[:2, :2])
+    s, e_y, e_s, psi_error2 = convert_error_to_frenet_frame(
+        current_state[:, :2], waypoints[ii[1], :2],
+        psi_current, psi_desired, cdists, current_index,
+        rot_global_to_frenet[:2, :2])
 
     # generate reference trajectory
-    reference_trajectory = generate_reference_trajectory_by_interpolation(trajectory, current_state, current_index,
-                                                                          trajectory_key_to_column, horizon=20,
-                                                                          v_target=None, dt=0.02)
-    reference_trajectory2 = generate_reference_trajectory_by_interpolation(trajectory, current_state, current_index,
-                                                                           trajectory_key_to_column, horizon=20,
-                                                                           v_target=8.9, dt=0.02)
+    reference_trajectory = generate_reference_trajectory_by_interpolation(
+        trajectory, current_state, current_index,
+        trajectory_key_to_column, horizon=20, v_target=None, dt=0.02)
+    reference_trajectory2 = generate_reference_trajectory_by_interpolation(
+        trajectory, current_state, current_index,
+        trajectory_key_to_column, horizon=20, v_target=8.9, dt=0.02)
 
-    print("Done")
+    print('Done')

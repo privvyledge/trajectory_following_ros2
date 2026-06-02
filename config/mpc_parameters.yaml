@@ -4,6 +4,8 @@
 
     wheelbase: 0.256
 
+    distance_tolerance: 0.2
+
     horizon: 25
     sample_time: 0.05
     prediction_time: 1.5
@@ -15,17 +17,46 @@
     min_speed: -1.5
     max_accel: 3.0
     max_decel: -3.0
+
+    # Reference speed policy (per-horizon reference fed to the MPC).
+    #   v_ref[h] = clip( min( recorded_profile[h], sqrt(max_lateral_accel/|κ[h]|) ),
+    #                    min_reference_speed, min(desired_speed_or_profile_cap, max_speed) )
+    # use_speed_profile: track the recorded/loaded speed column over the horizon (was
+    #   previously ignored — the reference held constant). False = constant cap only.
+    # max_lateral_accel: curvature speed cap (m/s²). 0.0 disables curvature limiting.
+    #   ~3.0 (≈0.3g) is conservative for an F1/10; raise after calibrating tire grip.
+    # min_reference_speed: forward creep floor (m/s) that lifts a noisy near-zero start so
+    #   the vehicle pulls away. The end-of-path/goal terminator handles the actual stop,
+    #   so this floor never traps the vehicle at the goal.
+    use_speed_profile: True
+    max_lateral_accel: 3.0
+    min_reference_speed: 0.3
     max_steer: 27.0
     min_steer: -27.0
     max_steer_rate: 352.9411764706
 
-    max_iter: 15
+    # max_iter: solver iteration budget. Meaning depends on solver_type/solver:
+    #   solver_type=quad, solver=qrqp  (DEFAULT): outer SQP iterations in sqpmethod.
+    #       Warm-started RTI typically converges in 1-5 outer iters. 15-30 is safe.
+    #       Original backend default: 200.
+    #   solver_type=nlp,  solver=ipopt: IPOPT interior-point barrier iterations.
+    #       Without warm-start: 50-300+ typical. With warm-start: 5-30.
+    #       Original backend default: 2000 (continuous), 100 (discrete).
+    #       WARNING: max_iter=15 is too low for cold-start IPOPT and will fail silently.
+    #   solver_type=quad, solver=ipopt (via nlpsol): inner IPOPT iterations per QP.
+    #       Same scale as nlp/ipopt above. Original default: 100.
+    #   Opti/OSQP: first-order ADMM steps. Scale: O(100-4000). Original default: 2000.
+    #       WARNING: max_iter=15 will almost certainly not converge with OSQP.
+    max_iter: 200
     termination_condition: 0.1
 
+    solver_type: quad
+    solver: qrqp
+
     R: [0.01, 0.01]
-    Rd: [10., 100.]
-    Q: [1.0, 1.0, 1.0, 0.01]
-    Qf: [0.04, 0.04, 0.1, 0.01]
+    Rd: [10., 10.]
+    Q: [1.0, 1.0, 1.0, 0.5]
+    Qf: [0.04, 0.04, 0.1, 0.5]
 
     generate_mpc_model: True
     build_with_cython: True
@@ -41,6 +72,9 @@
     max_error_psi: 0.1    # rad   → Q_psi = 100.0
     bryson_max_accel: 3.0 # m/s²  → R_a   ≈ 0.11
     bryson_max_steer: 0.4 # rad   → R_d   = 6.25  (NOT degrees)
+
+    # Trajectory looping: 0 = stop at goal, -1 = loop indefinitely, N > 0 = run N laps then stop.
+    loop: 0
 
     # MPC computation delay compensation (Method A: forward simulation with RK4)
     # Set estimated_delay to sensor_lag + expected_solve_time + actuator_deadtime (seconds).

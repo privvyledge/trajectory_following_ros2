@@ -7,12 +7,13 @@ from typing import Optional
 import numpy as np
 from scipy import interpolate
 
-import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.time import Time
+from rclpy.duration import Duration
+from rclpy.clock import JumpThreshold, TimeJump
 from rcl_interfaces.msg import ParameterDescriptor, SetParametersResult, ParameterType
 
 from tf2_ros.transform_listener import TransformListener
@@ -128,7 +129,19 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('publish_twist_topic', True)
         self.declare_parameter('twist_topic', 'cmd_vel')
         self.declare_parameter('desired_speed', 0.0)
-        self.declare_parameter('loop', False)
+        # Reference speed policy (see _apply_speed_policy / generate_reference_trajectory_by_interpolation)
+        self.declare_parameter('use_speed_profile', True)    # track the recorded speed profile over the horizon
+        self.declare_parameter('max_lateral_accel', 3.0)     # m/s²; curvature speed cap v ≤ sqrt(a_lat/|κ|). 0 disables
+        self.declare_parameter('min_reference_speed', 0.3)   # m/s; forward creep floor to lift a noisy near-zero start
+        self.declare_parameter(
+            'loop', 0,
+            ParameterDescriptor(
+                type=ParameterType.PARAMETER_INTEGER,
+                description=(
+                    'Trajectory repetition mode. '
+                    '0 = stop at goal (default). '
+                    '-1 = loop indefinitely. '
+                    'N > 0 = run the trajectory N times total then stop.')))
         self.declare_parameter('n_ind_search', 10)
         self.declare_parameter('smooth_yaw', False)
         self.declare_parameter('debug', False)
@@ -157,55 +170,66 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('bryson_max_accel', 3.0)   # m/s²
         self.declare_parameter('bryson_max_steer', 0.4)   # rads
 
+    def _gp(self, name):
+        return self.get_parameter(name).value
+
     def _read_parameters(self):
-        self.robot_frame = self.get_parameter('robot_frame').value
-        self.global_frame = self.get_parameter('global_frame').value
-        self.control_rate = self.get_parameter('control_rate').value
-        self.debug_frequency = self.get_parameter('debug_frequency').value
-        self.distance_tolerance = self.get_parameter('distance_tolerance').value
-        self.speed_tolerance = self.get_parameter('speed_tolerance').value
-        self.WHEELBASE = self.get_parameter('wheelbase').value
-        self.MAX_STEER_ANGLE = math.radians(self.get_parameter('max_steer').value)
-        self.MIN_STEER_ANGLE = math.radians(self.get_parameter('min_steer').value)
-        if abs(self.MAX_STEER_ANGLE) > math.pi:
+        self.robot_frame = self._gp('robot_frame')
+        self.global_frame = self._gp('global_frame')
+        self.control_rate = self._gp('control_rate')
+        self.debug_frequency = self._gp('debug_frequency')
+        self.distance_tolerance = self._gp('distance_tolerance')
+        self.speed_tolerance = self._gp('speed_tolerance')
+        self.WHEELBASE = self._gp('wheelbase')
+        self.MAX_STEER_ANGLE = math.radians(self._gp('max_steer'))
+        self.MIN_STEER_ANGLE = math.radians(self._gp('min_steer'))
+        _max_steer_deg = self._gp('max_steer')
+        if _max_steer_deg > 180.0:
             self.get_logger().warn(
-                f'max_steer={self.get_parameter("max_steer").value} deg converts to '
-                f'{self.MAX_STEER_ANGLE:.3f} rad — value > π rad; '
-                'did you declare it in radians instead of degrees?')
-        self.MIN_JERK = self.get_parameter('min_jerk').value
-        self.MAX_JERK = self.get_parameter('max_jerk').value
-        self.MAX_STEER_RATE = math.radians(self.get_parameter('max_steer_rate').value)
-        self.MAX_SPEED = self.get_parameter('max_speed').value
-        self.MIN_SPEED = self.get_parameter('min_speed').value
-        self.MAX_ACCEL = self.get_parameter('max_accel').value
-        self.MAX_DECEL = self.get_parameter('max_decel').value
-        self.saturate_input = self.get_parameter('saturate_input').value
-        self.allow_reversing = self.get_parameter('allow_reversing').value
+                f'max_steer={_max_steer_deg} deg exceeds 180° — physically impossible; '
+                f'clamping will apply. Check your config.')
+        elif 0 < _max_steer_deg < 5.0:
+            self.get_logger().warn(
+                f'max_steer={_max_steer_deg} deg is suspiciously small. '
+                f'This parameter expects degrees — did you accidentally enter radians? '
+                f'({_max_steer_deg} rad ≈ {math.degrees(_max_steer_deg):.1f}°)')
+        self.MIN_JERK = self._gp('min_jerk')
+        self.MAX_JERK = self._gp('max_jerk')
+        self.MAX_STEER_RATE = math.radians(self._gp('max_steer_rate'))
+        self.MAX_SPEED = self._gp('max_speed')
+        self.MIN_SPEED = self._gp('min_speed')
+        self.MAX_ACCEL = self._gp('max_accel')
+        self.MAX_DECEL = self._gp('max_decel')
+        self.saturate_input = self._gp('saturate_input')
+        self.allow_reversing = self._gp('allow_reversing')
         if not self.allow_reversing:
             self.MIN_SPEED = 0.0
-        self.NX = self.get_parameter('n_states').value
-        self.NU = self.get_parameter('n_inputs').value
-        self.horizon = int(self.get_parameter('horizon').value)
-        self.prediction_time = self.get_parameter('prediction_time').value
+        self.NX = self._gp('n_states')
+        self.NU = self._gp('n_inputs')
+        self.horizon = int(self._gp('horizon'))
+        self.prediction_time = self._gp('prediction_time')
         self._recompute_weights()
-        self.path_topic = self.get_parameter('path_topic').value
-        self.path_qos = self.get_parameter('path_qos').value
-        self.speed_topic = self.get_parameter('speed_topic').value
-        self.odom_topic = self.get_parameter('odom_topic').value
-        self.acceleration_topic = self.get_parameter('acceleration_topic').value
-        self.ackermann_cmd_topic = self.get_parameter('ackermann_cmd_topic').value
-        self.actuator_feedback_topic = self.get_parameter('actuator_feedback_topic').value
-        self.delay_compensation_enabled = self.get_parameter('delay_compensation_enabled').value
-        self.delay_compensation_method = self.get_parameter('delay_compensation_method').value
-        self.estimated_delay = self.get_parameter('estimated_delay').value
-        self.publish_twist_topic = self.get_parameter('publish_twist_topic').value
-        self.twist_topic = self.get_parameter('twist_topic').value
-        self.desired_speed = self.get_parameter('desired_speed').value
-        self.loop = self.get_parameter('loop').value
-        self.n_ind_search = self.get_parameter('n_ind_search').value
-        self.smooth_yaw = self.get_parameter('smooth_yaw').value
-        self.debug = self.get_parameter('debug').value
-        self._num_obstacles = self.get_parameter('num_obstacles').value
+        self.path_topic = self._gp('path_topic')
+        self.path_qos = self._gp('path_qos')
+        self.speed_topic = self._gp('speed_topic')
+        self.odom_topic = self._gp('odom_topic')
+        self.acceleration_topic = self._gp('acceleration_topic')
+        self.ackermann_cmd_topic = self._gp('ackermann_cmd_topic')
+        self.actuator_feedback_topic = self._gp('actuator_feedback_topic')
+        self.delay_compensation_enabled = self._gp('delay_compensation_enabled')
+        self.delay_compensation_method = self._gp('delay_compensation_method')
+        self.estimated_delay = self._gp('estimated_delay')
+        self.publish_twist_topic = self._gp('publish_twist_topic')
+        self.twist_topic = self._gp('twist_topic')
+        self.desired_speed = self._gp('desired_speed')
+        self.use_speed_profile = self._gp('use_speed_profile')
+        self.max_lateral_accel = self._gp('max_lateral_accel')
+        self.min_reference_speed = self._gp('min_reference_speed')
+        self.loop = int(self._gp('loop'))
+        self.n_ind_search = self._gp('n_ind_search')
+        self.smooth_yaw = self._gp('smooth_yaw')
+        self.debug = self._gp('debug')
+        self._num_obstacles = self._gp('num_obstacles')
         self.dt = self.sample_time = 1.0 / self.control_rate
         if not self.prediction_time:
             self.prediction_time = self.sample_time * self.horizon
@@ -247,6 +271,7 @@ class BaseTrajectoryTracker(Node, ABC):
         self.final_idx = None
         self.final_goal = None
         self.final_goal_reached = False
+        self._loop_count = 0
         self.state_frame_id = ''
 
         self.solution_time = 0.0
@@ -283,6 +308,48 @@ class BaseTrajectoryTracker(Node, ABC):
     def _setup_tf(self):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # Detect clock jumps (e.g. ROSBAG loop/seek or sim-time resets). A backward
+        # jump invalidates the TF buffer (holds "future" transforms), the stale-odom
+        # timestamp comparison, and the trajectory's notion of elapsed time. Trigger on
+        # any backward jump or a large forward jump, and on a clock-type change.
+        threshold = JumpThreshold(
+            min_forward=Duration(seconds=10.0),
+            min_backward=Duration(seconds=-0.001),
+            on_clock_change=True)
+        # Keep the handle alive — it is unregistered when garbage-collected.
+        self._jump_handle = self.get_clock().create_jump_callback(
+            threshold, pre_callback=None, post_callback=self._on_time_jump)
+
+    def _on_time_jump(self, time_jump: TimeJump):
+        """Recover from a clock discontinuity (ROSBAG loop/seek, sim-time reset).
+
+        Clears the TF buffer (its cached transforms are now stamped in the wrong
+        epoch) and resets timing-derived state so the stale-odom guard and warm
+        starts do not act on pre-jump data. Sensor callbacks re-populate state on
+        the next message after the jump.
+
+        On a backward jump (bag replay loop): if looping is enabled, the trajectory
+        index is also reset to the start because the bag's odometry is replaying from
+        the beginning. This does not count against the loop limit — the bag reset is
+        an external event, not a controller-driven lap completion.
+        """
+        delta_s = time_jump.delta.nanoseconds * 1e-9
+        self.get_logger().warn(
+            f'Time jump detected (delta={delta_s:.3f}s); clearing TF buffer and resetting timing state.')
+
+        self.tf_buffer.clear()
+        with self.mutex:
+            self._last_odom_stamp = None
+            self.u_prev[:, :] = 0.0
+            self._u_prev_from_echo = False
+        self._consecutive_failures = 0
+
+        if delta_s < 0 and self.loop != 0 and self.trajectory_initialized:
+            self._reset_lap_progress()
+            self.get_logger().info(
+                'Backward time jump with looping enabled — trajectory index reset to start '
+                '(loop count unchanged).')
 
     def _setup_pub_sub(self):
         self.subscription_group = ReentrantCallbackGroup()
@@ -330,9 +397,10 @@ class BaseTrajectoryTracker(Node, ABC):
         self.mpc_goal_pub = self.create_publisher(PointStamped, 'mpc/goal_point', 1)
         self.mpc_path_pub = self.create_publisher(Path, 'mpc/predicted_path', 1)
         self.mpc_reference_path_pub = self.create_publisher(Path, 'mpc/reference_path', 1)
+        self.solve_time_pub = self.create_publisher(Float32, 'mpc/solve_time', 1)
 
         if self._num_obstacles > 0 and OBSTACLES_AVAILABLE:
-            obstacle_topic = self.get_parameter('obstacle_topic').value
+            obstacle_topic = self._gp('obstacle_topic')
             self.obstacle_sub = self.create_subscription(
                 ObjectArray, obstacle_topic, self._obstacle_callback, 1,
                 callback_group=self.subscription_group)
@@ -580,11 +648,8 @@ class BaseTrajectoryTracker(Node, ABC):
         if not (self.mpc_initialized and self.trajectory_initialized):
             return
 
-        # 4. Goal check
-        if self.trajectory.check_goal(
-                self.x, self.y, self.speed, self.final_goal,
-                self.current_idx, self.path.shape[0]):
-            self.get_logger().info('Final goal reached.')
+        # 4. Final-goal latch: once the run is complete (and not looping), hold zero.
+        if self.final_goal_reached:
             self._publish_zero_command()
             return
 
@@ -602,8 +667,22 @@ class BaseTrajectoryTracker(Node, ABC):
             lookahead_time=1.0, lookahead=30.0,
             num_points_to_interpolate=self.horizon, target_speed=target_speed)
 
-        if ref_traj is None:
-            self.get_logger().info('No more waypoints, final goal reached.')
+        # Terminator (single path): the lap is finished if calc_ref_trajectory found no
+        # waypoints ahead (ref_traj is None — the usual case on dense/closed paths,
+        # where the stopped-at-goal test never fires) OR the vehicle has come to rest at
+        # the final goal (open paths). The grace distance gates the stopped-at-goal test
+        # so it cannot fire at the start, where start ≈ goal on a closed loop;
+        # cumulative_distance resets to 0 on every lap, so it doubles as a re-anchor
+        # cooldown after a reset.
+        end_of_path = ref_traj is None
+        past_grace = self.cumulative_distance >= 3.0 * self.distance_tolerance
+        at_goal = past_grace and self.trajectory.is_goal_reached(x, y, vel, self.final_goal)
+        if end_of_path or at_goal:
+            if self._advance_lap():
+                # Another lap: return and let the KD-tree re-anchor on the next tick.
+                # Solving now would hand the solver a large position error (vehicle at
+                # end of path, reference at start) and risk extreme commands.
+                return
             self._publish_zero_command()
             return
 
@@ -703,6 +782,55 @@ class BaseTrajectoryTracker(Node, ABC):
         age = (self.get_clock().now() - self._last_odom_stamp).nanoseconds * 1e-9
         return age <= _STALE_ODOM_THRESHOLD_S
 
+    def _apply_speed_policy(self):
+        """Push the reference-speed policy parameters onto the Trajectory.
+
+        Called once at trajectory init and again on every relevant runtime
+        parameter change (hot-reload). max_reference_speed mirrors MAX_SPEED so
+        the per-horizon reference is never commanded above the saturation bound.
+        """
+        self.trajectory.use_speed_profile = self.use_speed_profile
+        self.trajectory.a_lat_max = self.max_lateral_accel
+        self.trajectory.min_reference_speed = self.min_reference_speed
+        self.trajectory.max_reference_speed = self.MAX_SPEED
+
+    def _reset_lap_progress(self):
+        """Reset trajectory progress to the start of the path.
+
+        Shared by the lap-restart path (looping) and the bag-replay backward time
+        jump in _on_time_jump. Resets the node-side progress counters and the
+        Trajectory's traversal indices; the stored trajectory data is untouched.
+        """
+        self.current_idx = 0
+        self.cumulative_distance = 0.0
+        self.trajectory.reset_progress()
+
+    def _advance_lap(self) -> bool:
+        """Apply the loop policy on reaching the end of the trajectory.
+
+        `loop`: 0 = stop at the end, -1 = loop forever, N > 0 = run N laps.
+        Returns True when another lap should run (caller returns and lets the
+        KD-tree re-anchor next tick), False when the run is complete and
+        final_goal_reached has been latched (caller publishes a zero command).
+        """
+        if self.loop == 0:
+            self.get_logger().info('Final goal reached.')
+            self.final_goal_reached = True
+            return False
+
+        self._loop_count += 1
+        if self.loop == -1 or self._loop_count < self.loop:
+            self.get_logger().info(
+                f'Lap {self._loop_count}'
+                + (f'/{self.loop}' if self.loop > 0 else '')
+                + ' complete, restarting trajectory.')
+            self._reset_lap_progress()
+            return True
+
+        self.get_logger().info(f'All {self._loop_count} lap(s) complete.')
+        self.final_goal_reached = True
+        return False
+
     def _init_trajectory(self):
         tc = self.trajectory.trajectory_key_to_column
         if self.speeds is None:
@@ -726,7 +854,25 @@ class BaseTrajectoryTracker(Node, ABC):
         self.trajectory.trajectory[:, tc['dt']] = relative_dts
         self.trajectory.trajectory[:, tc['total_time_elapsed']] = relative_times
         self.trajectory.trajectory[:, tc['speed']] = self.speeds
+        self._apply_speed_policy()
         self.trajectory_initialized = True
+
+        # Trajectory.is_goal_reached reads goal[2] as the target speed at the endpoint.
+        # self.path only has (x, y) columns, so append the final waypoint's speed here
+        # once the speeds array is available.
+        if self.final_idx is not None:
+            self.final_goal = np.append(
+                self.path[self.final_idx, :], float(self.speeds[self.final_idx]))
+
+        if self.loop != 0:
+            start = self.path[0, :2]
+            end = self.path[-1, :2]
+            gap = float(np.linalg.norm(end - start))
+            if gap > 2.0 * self.distance_tolerance:
+                self.get_logger().warn(
+                    f'loop != 0 but path is not closed: first-to-last waypoint gap is {gap:.3f} m '
+                    f'(distance_tolerance={self.distance_tolerance:.3f} m). '
+                    'The KD-tree will jump to an incorrect index at lap transitions.')
 
     def _update_trajectory_state(self, x, y, vel, psi, omega):
         sc = self.trajectory.state_key_to_column
@@ -751,18 +897,26 @@ class BaseTrajectoryTracker(Node, ABC):
             return float(self.desired_speed)
         return None
 
+    # Tolerance for saturation warnings: suppress log noise when the solver
+    # returns a value infinitesimally outside the constraint boundary due to
+    # floating-point arithmetic (common when an NLP constraint is active).
+    _SAT_WARN_TOL = 1e-4  # rad / (m/s²) — ~0.006°, well below any real violation
+
     def _input_saturation(self):
-        if not (self.MAX_DECEL <= self.acc_cmd <= self.MAX_ACCEL):
+        if self.acc_cmd < self.MAX_DECEL - self._SAT_WARN_TOL \
+                or self.acc_cmd > self.MAX_ACCEL + self._SAT_WARN_TOL:
             self.get_logger().info(
                 f'Accel cmd {self.acc_cmd:.3f} out of bounds, saturating.')
         self.acc_cmd = float(np.clip(self.acc_cmd, self.MAX_DECEL, self.MAX_ACCEL))
 
-        if not (self.MIN_STEER_ANGLE <= self.delta_cmd <= self.MAX_STEER_ANGLE):
+        if self.delta_cmd < self.MIN_STEER_ANGLE - self._SAT_WARN_TOL \
+                or self.delta_cmd > self.MAX_STEER_ANGLE + self._SAT_WARN_TOL:
             self.get_logger().info(
                 f'Steer cmd {np.degrees(self.delta_cmd):.1f}° out of bounds, saturating.')
         self.delta_cmd = float(np.clip(self.delta_cmd, self.MIN_STEER_ANGLE, self.MAX_STEER_ANGLE))
 
-        if not (self.MIN_SPEED <= self.velocity_cmd <= self.MAX_SPEED):
+        if self.velocity_cmd < self.MIN_SPEED - self._SAT_WARN_TOL \
+                or self.velocity_cmd > self.MAX_SPEED + self._SAT_WARN_TOL:
             self.get_logger().info(
                 f'Vel cmd {self.velocity_cmd:.2f} out of bounds, saturating.')
         self.velocity_cmd = float(np.clip(self.velocity_cmd, self.MIN_SPEED, self.MAX_SPEED))
@@ -788,6 +942,7 @@ class BaseTrajectoryTracker(Node, ABC):
 
         self.steer_pub.publish(Float32(data=float(self.delta_cmd)))
         self.speed_pub.publish(Float32(data=float(self.velocity_cmd)))
+        self.solve_time_pub.publish(Float32(data=float(self.solution_time)))
 
     def _publish_twist(self, lateral_velocity: float = 0.0):
         msg = TwistStamped()
@@ -873,20 +1028,20 @@ class BaseTrajectoryTracker(Node, ABC):
 
     def _recompute_weights(self):
         """Read Q/R/Rd/Qf from current ROS parameters (or Bryson's rule) and update self."""
-        if self.get_parameter('use_bryson_weights').value:
+        if self._gp('use_bryson_weights'):
             self.Q, self.R, _Rd = bryson_weights(
                 max_state_errors={
-                    'x':   self.get_parameter('max_error_x').value,
-                    'y':   self.get_parameter('max_error_y').value,
-                    'v':   self.get_parameter('max_error_v').value,
-                    'psi': self.get_parameter('max_error_psi').value,
+                    'x':   self._gp('max_error_x'),
+                    'y':   self._gp('max_error_y'),
+                    'v':   self._gp('max_error_v'),
+                    'psi': self._gp('max_error_psi'),
                 },
                 max_inputs={
-                    'a':     self.get_parameter('bryson_max_accel').value,
-                    'delta': self.get_parameter('bryson_max_steer').value,
+                    'a':     self._gp('bryson_max_accel'),
+                    'delta': self._gp('bryson_max_steer'),
                 },
                 max_input_rates={
-                    'jerk':       abs(self.get_parameter('max_jerk').value),
+                    'jerk':       abs(self._gp('max_jerk')),
                     'steer_rate': self.MAX_STEER_RATE,
                 },
             )
@@ -914,6 +1069,16 @@ class BaseTrajectoryTracker(Node, ABC):
                 self.WHEELBASE = param.value
             elif param.name == 'max_speed':
                 self.MAX_SPEED = param.value
+                self._apply_speed_policy()
+            elif param.name == 'use_speed_profile':
+                self.use_speed_profile = param.value
+                self._apply_speed_policy()
+            elif param.name == 'max_lateral_accel':
+                self.max_lateral_accel = param.value
+                self._apply_speed_policy()
+            elif param.name == 'min_reference_speed':
+                self.min_reference_speed = param.value
+                self._apply_speed_policy()
             elif param.name == 'min_speed':
                 self.MIN_SPEED = param.value
             elif param.name == 'max_accel':
@@ -922,6 +1087,8 @@ class BaseTrajectoryTracker(Node, ABC):
                 self.MAX_DECEL = param.value
             elif param.name == 'desired_speed':
                 self.desired_speed = param.value
+            elif param.name == 'loop':
+                self.loop = int(param.value)
             elif param.name in ('Q', 'R', 'Rd', 'Qf', 'use_bryson_weights',
                                 'max_error_x', 'max_error_y', 'max_error_v', 'max_error_psi',
                                 'bryson_max_accel', 'bryson_max_steer'):
