@@ -30,6 +30,9 @@ def generate_launch_description():
     load_visualizer = LaunchConfiguration('load_visualizer', default=False)
     viz_spawn_viewer = LaunchConfiguration('viz_spawn_viewer', default=True)
     viz_recording_path = LaunchConfiguration('viz_recording_path', default='')
+    viz_serve_web = LaunchConfiguration('viz_serve_web', default=False)
+    viz_web_port = LaunchConfiguration('viz_web_port', default=9090)
+    viz_web_open_browser = LaunchConfiguration('viz_web_open_browser', default=True)
     viz_actuator_feedback_topic = LaunchConfiguration('viz_actuator_feedback_topic', default='')
     viz_reference_cmd_topic = LaunchConfiguration('viz_reference_cmd_topic', default='')
     params_file = LaunchConfiguration('params_file')
@@ -422,6 +425,24 @@ def generate_launch_description():
             default_value='',
             description='Path to save a .rrd Rerun recording file. Empty = no file saved.'
     )
+    viz_serve_web_la = DeclareLaunchArgument(
+            'viz_serve_web',
+            default_value='False',
+            description='Serve the Rerun web viewer (WebGPU in the browser) instead of the '
+                        'native viewer. Renders in-browser, bypassing the native Vulkan path '
+                        'broken on WSL2. Open http://localhost:<viz_web_port> in a browser. '
+                        'Single-sink on rerun <0.23, so mutually exclusive with viz_recording_path.'
+    )
+    viz_web_port_la = DeclareLaunchArgument(
+            'viz_web_port',
+            default_value='9090',
+            description='HTTP port for the Rerun web viewer (used when viz_serve_web:=true).'
+    )
+    viz_web_open_browser_la = DeclareLaunchArgument(
+            'viz_web_open_browser',
+            default_value='True',
+            description='Auto-open the system browser at the web viewer URL (used when viz_serve_web:=true).'
+    )
     viz_actuator_feedback_topic_la = DeclareLaunchArgument(
             'viz_actuator_feedback_topic',
             default_value='',
@@ -454,6 +475,7 @@ def generate_launch_description():
              odom_topic_la, ackermann_cmd_topic_la, twist_topic_la, acceleration_topic_la, path_topic_la,
              speed_topic_la, debug_frequency_la,
              load_visualizer_la, viz_spawn_viewer_la, viz_recording_path_la,
+             viz_serve_web_la, viz_web_port_la, viz_web_open_browser_la,
              viz_actuator_feedback_topic_la, viz_reference_cmd_topic_la]
     )
 
@@ -677,6 +699,9 @@ def generate_launch_description():
                 # Visualizer parameters (only affect trajectory_visualizer_node)
                 SetParameter(name='spawn_viewer', value=viz_spawn_viewer, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='recording_path', value=viz_recording_path, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='serve_web', value=viz_serve_web, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='web_port', value=viz_web_port, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='web_open_browser', value=viz_web_open_browser, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='actuator_feedback_topic', value=viz_actuator_feedback_topic, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='reference_cmd_topic', value=viz_reference_cmd_topic, condition=IfCondition(load_params_from_args)),
 

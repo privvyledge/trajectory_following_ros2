@@ -64,9 +64,17 @@ class VisualizerNode(Node):
         self.declare_parameter('spawn_viewer',    True)
         self.declare_parameter('connect_addr',    '')
         self.declare_parameter('recording_path',  '')
+        # Browser web viewer (WebGPU) — bypasses native Vulkan (broken on WSL2).
+        self.declare_parameter('serve_web',        False)
+        self.declare_parameter('web_port',         9090)
+        self.declare_parameter('web_open_browser', True)
         # Backend selection
         self.declare_parameter('viz_backend',     'both')   # 'rerun'|'native'|'both'
         self.declare_parameter('plot_buffer_size', 300)
+        # Native (matplotlib) video recording. Empty = off. .gif uses Pillow,
+        # any other extension (.mp4/.mkv/...) uses ffmpeg.
+        self.declare_parameter('native_video_path', '')
+        self.declare_parameter('native_video_fps',  10)
 
     def _read_parameters(self):
         gp = lambda n: self.get_parameter(n).value  # noqa: E731
@@ -85,6 +93,9 @@ class VisualizerNode(Node):
         self.spawn_viewer            = gp('spawn_viewer')
         self.connect_addr            = gp('connect_addr')
         self.recording_path          = gp('recording_path')
+        self.serve_web               = gp('serve_web')
+        self.web_port                = gp('web_port')
+        self.web_open_browser        = gp('web_open_browser')
 
     def _init_backends(self):
         backend_choice = self.get_parameter('viz_backend').value
@@ -102,22 +113,29 @@ class VisualizerNode(Node):
                     connect_addr   = self.connect_addr,
                     recording_path = self.recording_path,
                     stamp_fn       = lambda: self.get_clock().now().to_msg(),
+                    serve_web      = self.serve_web,
+                    web_port       = self.web_port,
+                    open_browser   = self.web_open_browser,
                 )
                 self._backends.append(rb)
                 self.get_logger().info('Rerun backend active.')
-            except ImportError:
-                self.get_logger().warn('rerun-sdk not installed — Rerun backend skipped.')
+            except ImportError as e:
+                self.get_logger().warn(f'Rerun backend skipped (import failed): {e}')
             except Exception as e:
                 self.get_logger().error(f'Rerun backend failed to initialize: {e}')
 
         if use_native:
             try:
                 from trajectory_following_ros2.viz.matplotlib_backend import MatplotlibBackend
-                mb = MatplotlibBackend(buffer_size=buf_size)
+                mb = MatplotlibBackend(
+                    buffer_size=buf_size,
+                    video_path=self.get_parameter('native_video_path').value,
+                    video_fps=self.get_parameter('native_video_fps').value,
+                )
                 self._backends.append(mb)
                 self.get_logger().info('Matplotlib backend active.')
-            except ImportError:
-                self.get_logger().warn('matplotlib not installed — native backend skipped.')
+            except ImportError as e:
+                self.get_logger().warn(f'Matplotlib (native) backend skipped (import failed): {e}')
             except Exception as e:
                 self.get_logger().error(f'Matplotlib backend failed to initialize: {e}')
 

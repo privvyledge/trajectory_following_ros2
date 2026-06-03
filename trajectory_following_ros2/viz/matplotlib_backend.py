@@ -28,8 +28,18 @@ from trajectory_following_ros2.viz.base_viz_backend import BaseVizBackend
 class MatplotlibBackend(BaseVizBackend):
     """Daemon-thread matplotlib figure with 2-D map + 4 time-series panels."""
 
-    def __init__(self, buffer_size: int = 300):
+    def __init__(self, buffer_size: int = 300,
+                 video_path: str = '', video_fps: int = 10):
         self._lock = threading.Lock()
+        # Video recording (optional). When video_path is non-empty the daemon
+        # thread sets up a MovieWriter and grabs every animation frame; the
+        # writer is finalized in shutdown(). Guarded by its own lock because
+        # grab_frame() (daemon thread) and finish() (main thread) both write
+        # to the same ffmpeg subprocess pipe.
+        self._video_path = video_path
+        self._video_fps = max(1, int(video_fps))
+        self._writer = None
+        self._writer_lock = threading.Lock()
         self._buf = {
             'speed_actual':    collections.deque(maxlen=buffer_size),
             'speed_cmd':       collections.deque(maxlen=buffer_size),
@@ -212,6 +222,18 @@ class MatplotlibBackend(BaseVizBackend):
             ax_diag.relim(); ax_diag.autoscale_view()
             ax_diag2.relim(); ax_diag2.autoscale_view()
 
+            # --- video frame grab (last, after the canvas is updated) ---
+            if self._writer is not None:
+                with self._writer_lock:
+                    if self._writer is not None:
+                        try:
+                            self._writer.grab_frame()
+                        except Exception:
+                            # writer torn down (shutdown) or pipe closed; stop
+                            self._writer = None
+
+        self._setup_writer(fig)
+
         self._ani = animation.FuncAnimation(
             fig, _animate,
             interval=100,
@@ -219,6 +241,30 @@ class MatplotlibBackend(BaseVizBackend):
             cache_frame_data=False,
         )
         plt.show()  # blocks the daemon thread — intentional
+
+    def _setup_writer(self, fig):
+        """Open a MovieWriter for video_path. .gif → Pillow, else ffmpeg."""
+        if not self._video_path:
+            return
+        try:
+            is_gif = self._video_path.lower().endswith('.gif')
+            if is_gif:
+                writer = animation.PillowWriter(fps=self._video_fps)
+            else:
+                if not animation.FFMpegWriter.isAvailable():
+                    print('[MatplotlibBackend] ffmpeg not found on PATH; '
+                          'video recording disabled. Install ffmpeg or use a '
+                          '.gif video_path.')
+                    return
+                writer = animation.FFMpegWriter(fps=self._video_fps, bitrate=2400)
+            writer.setup(fig, self._video_path, dpi=100)
+            with self._writer_lock:
+                self._writer = writer
+            print(f'[MatplotlibBackend] recording video to {self._video_path} '
+                  f'@ {self._video_fps} fps')
+        except Exception as e:
+            print(f'[MatplotlibBackend] video recording disabled ({e}).')
+            self._writer = None
 
     # ------------------------------------------------------------------
     # BaseVizBackend implementation
@@ -288,6 +334,14 @@ class MatplotlibBackend(BaseVizBackend):
             self._buf['speed_ref'].append(speed)
 
     def shutdown(self) -> None:
+        with self._writer_lock:
+            if self._writer is not None:
+                try:
+                    self._writer.finish()
+                    print(f'[MatplotlibBackend] video saved to {self._video_path}')
+                except Exception as e:
+                    print(f'[MatplotlibBackend] failed to finalize video ({e}).')
+                self._writer = None
         try:
             plt.close('all')
         except Exception:

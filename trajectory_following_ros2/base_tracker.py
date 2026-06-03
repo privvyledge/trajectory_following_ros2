@@ -88,7 +88,12 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('global_frame', 'odom',
                                ParameterDescriptor(description='Global/world frame (odom or map).'))
         self.declare_parameter('control_rate', 20.0)
-        self.declare_parameter('debug_frequency', 4.0)
+        # Debug/viz publish rate. Runs on its own ReentrantCallbackGroup thread,
+        # independent of the MPC control timer, so raising it does not slow the
+        # control loop (only adds viz CPU). 10 Hz keeps the predicted path/goal
+        # point within ~100 ms of the live state; raise toward control_rate (20)
+        # for tighter viz, lower on resource-constrained hardware (Jetson).
+        self.declare_parameter('debug_frequency', 10.0)
         self.declare_parameter('distance_tolerance', 0.2)
         self.declare_parameter('speed_tolerance', 0.5)
         self.declare_parameter('wheelbase', 0.256)
@@ -297,7 +302,14 @@ class BaseTrajectoryTracker(Node, ABC):
         self._u_prev_from_echo = False
         self._warned_twist_frame = False
         self._warned_pose_frame = False
-        _q = 5
+        # These are latest-value holders, not history buffers: the control loop
+        # (control_rate Hz) pushes one frame per tick and the debug publisher
+        # (debug_frequency Hz) consumes the most recent one. With maxsize=1,
+        # update_queue() always overwrites with the newest frame and the
+        # consumer's get() returns it — so the viz never trails the live state.
+        # A larger buffer made get() (FIFO front) return stale frames, which
+        # showed up in RViz as the goal point / predicted path lagging the vehicle.
+        _q = 1
         self.location_queue = queue.Queue(maxsize=_q)
         self.mpc_reference_states_queue = queue.Queue(maxsize=_q)
         self.mpc_predicted_states_queue = queue.Queue(maxsize=_q)
