@@ -58,6 +58,47 @@ class RerunBackend(BaseVizBackend):
         if blueprint is not None:
             rr.send_blueprint(blueprint)
         self._stamp_fn = stamp_fn
+        self._log_world_axes()
+
+    # ------------------------------------------------------------------
+    # World frame
+    # ------------------------------------------------------------------
+    # Rerun's 2-D view uses the image convention (+X right, +Y *down*), while
+    # ROS REP-103 is +X forward, +Y left, +Z up. We reconcile the two by
+    # negating Y on every spatial log: a ROS point at +Y (left) is logged at
+    # -Y, which Rerun then renders *up*. The result is a ROS-aligned view
+    # (X right, Y up, yaw CCW), matching RViz. All spatial logs below go
+    # through _xy() / _strip() so the convention is applied in exactly one place.
+
+    @staticmethod
+    def _xy(x: float, y: float) -> List[float]:
+        """ROS (x, y) → Rerun 2-D screen coordinates (negate Y)."""
+        return [x, -y]
+
+    @staticmethod
+    def _strip(pts: List[Tuple[float, float]]) -> List[List[float]]:
+        """ROS polyline → Rerun 2-D screen coordinates (negate Y)."""
+        return [[px, -py] for px, py in pts]
+
+    def _log_world_axes(self) -> None:
+        """Static origin marker + X/Y axis arrows in the ROS frame.
+
+        Logged once as static data so the frame is visible at every point on
+        the timeline. Arrows are expressed directly in screen coordinates:
+        ROS +X (forward) points right, ROS +Y (left) points up.
+        """
+        axis_len = 1.0  # metres
+        rr.log(ENTITY['world_origin'],
+               rr.Points2D([[0.0, 0.0]], colors=[COLORS['origin']], radii=0.06),
+               static=True)
+        rr.log(ENTITY['world_axes'],
+               rr.Arrows2D(
+                   origins=[[0.0, 0.0], [0.0, 0.0]],
+                   # +X right, +Y up (screen). Y arrow is negated like all data.
+                   vectors=[[axis_len, 0.0], [0.0, -axis_len]],
+                   colors=[COLORS['axis_x'], COLORS['axis_y']],
+                   labels=['x', 'y']),
+               static=True)
 
     # ------------------------------------------------------------------
     # Sink configuration
@@ -162,11 +203,12 @@ class RerunBackend(BaseVizBackend):
         if stamp is not None:
             self._set_time_from_stamp(stamp)
         rr.log(ENTITY['vehicle_pos'],
-               rr.Points2D([[x, y]], colors=[COLORS['vehicle']], radii=0.1))
+               rr.Points2D([self._xy(x, y)], colors=[COLORS['vehicle']], radii=0.1))
         arrow = 0.4
         rr.log(ENTITY['vehicle_heading'],
-               rr.Arrows2D(origins=[[x, y]],
-                           vectors=[[math.cos(yaw) * arrow, math.sin(yaw) * arrow]],
+               rr.Arrows2D(origins=[self._xy(x, y)],
+                           vectors=[self._xy(math.cos(yaw) * arrow,
+                                             math.sin(yaw) * arrow)],
                            colors=[COLORS['vehicle']]))
         rr.log(ENTITY['speed_actual'], rr.Scalar(speed))
         rr.log(ENTITY['heading_deg'],  rr.Scalar(math.degrees(yaw)))
@@ -175,25 +217,28 @@ class RerunBackend(BaseVizBackend):
         if stamp is not None:
             self._set_time_from_stamp(stamp)
         rr.log(ENTITY['full_path'],
-               rr.LineStrips2D([pts], colors=[COLORS['full_path']], radii=0.02))
+               rr.LineStrips2D([self._strip(pts)], colors=[COLORS['full_path']],
+                               radii=0.02))
 
     def log_predicted_path(self, pts: List[Tuple[float, float]], stamp=None) -> None:
         if stamp is not None:
             self._set_time_from_stamp(stamp)
         rr.log(ENTITY['predicted'],
-               rr.LineStrips2D([pts], colors=[COLORS['predicted']], radii=0.03))
+               rr.LineStrips2D([self._strip(pts)], colors=[COLORS['predicted']],
+                               radii=0.03))
 
     def log_ref_window(self, pts: List[Tuple[float, float]], stamp=None) -> None:
         if stamp is not None:
             self._set_time_from_stamp(stamp)
         rr.log(ENTITY['ref_window'],
-               rr.LineStrips2D([pts], colors=[COLORS['ref_window']], radii=0.03))
+               rr.LineStrips2D([self._strip(pts)], colors=[COLORS['ref_window']],
+                               radii=0.03))
 
     def log_goal(self, x: float, y: float, stamp=None) -> None:
         if stamp is not None:
             self._set_time_from_stamp(stamp)
         rr.log(ENTITY['goal'],
-               rr.Points2D([[x, y]], colors=[COLORS['goal']], radii=0.12))
+               rr.Points2D([self._xy(x, y)], colors=[COLORS['goal']], radii=0.12))
 
     # ------------------------------------------------------------------
     # Time-series — commanded actions

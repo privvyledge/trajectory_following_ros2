@@ -6,6 +6,8 @@
 # ---------------------------------------------------------------------------
 ENTITY = {
     # Spatial
+    'world_origin':      'world/frame/origin',
+    'world_axes':        'world/frame/axes',
     'vehicle_pos':       'world/vehicle/position',
     'vehicle_heading':   'world/vehicle/heading',
     'full_path':         'world/paths/full_reference',
@@ -41,6 +43,9 @@ ENTITY = {
 # Colors — RGBA uint8
 # ---------------------------------------------------------------------------
 COLORS = {
+    'origin':     [230, 230, 230, 255],   # white-ish
+    'axis_x':     [230,  40,  40, 255],   # red   — ROS +X (forward)
+    'axis_y':     [40,  220,  40, 255],   # green — ROS +Y (left)
     'vehicle':    [0,   200, 255, 255],   # cyan
     'full_path':  [120, 120, 120, 160],   # dim grey
     'ref_window': [255, 200,   0, 255],   # amber
