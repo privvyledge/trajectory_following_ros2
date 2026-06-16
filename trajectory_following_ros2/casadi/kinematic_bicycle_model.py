@@ -9,6 +9,8 @@ import types
 import numpy as np
 import casadi
 
+from trajectory_following_ros2.utils.integrators import make_discrete_dynamics
+
 
 class KinematicBicycleModel(object):
     """docstring for ClassName"""
@@ -18,13 +20,24 @@ class KinematicBicycleModel(object):
                  jerk_bound=(-1.5, 1.5), delta_rate_bound=(-np.radians(352.9411764706), np.radians(352.9411764706)),
                  vehicle_parameters=None, sample_time=0.001, symbol_type='MX',
                  model_type='kinematic', model_name='vehicle_kinematic_model', discretization_method='cvodes',
-                 discrete=False):
+                 discrete=False, discrete_model_type='nonlinear', discrete_integration_method='rk4'):
         """Constructor for KinematicBicycleModel"""
         # model info
         self.model_name = model_name
         self.model_type = model_type
         self.symbol_type = symbol_type
         self.discrete = discrete
+        # discrete model form (discrete=True): 'nonlinear' (default; full ODE
+        # discretized by discrete_integration_method) or 'ltv' (forward-Jacobian
+        # / Taylor linearization, classic LTV-QP form, forward-Euler only).
+        self.discrete_model_type = discrete_model_type
+        # discretization scheme for the 'nonlinear' discrete one-step map.
+        # Only the explicit schemes 'euler' | 'rk4' (default) are valid here:
+        # the MPC NLP is SX-expanded, which the black-box casadi.integrator
+        # schemes ('cvodes'/'rk'/'collocation') do not support. Those remain
+        # available via utils.integrators.make_discrete_dynamics for the
+        # simulator / acados (MX, non-expanded) contexts.
+        self.discrete_integration_method = discrete_integration_method
 
         # vehicle parameters
         if vehicle_parameters is None:
@@ -48,7 +61,7 @@ class KinematicBicycleModel(object):
         self.delta_rate_bound = acc_bound
 
         if self.discrete:
-            self.model, self.constraints = self.setup_discrete_ltv_model(symbol_type=self.symbol_type)
+            self.model, self.constraints = self.setup_discrete_model(symbol_type=self.symbol_type)
             self.linear_model = self.model
         else:
             self.model, self.constraints = self.setup_model(symbol_type=self.symbol_type)
@@ -242,9 +255,18 @@ class KinematicBicycleModel(object):
 
         return model, constraint
 
-    def setup_discrete_ltv_model(self, symbol_type='MX',
+    def setup_discrete_model(self, symbol_type='MX',
                     z0=None, u0=(0., 0.),
                     vel_bound=None, delta_bound=None, acc_bound=None, jerk_bound=None, delta_rate_bound=None):
+        """Discrete-time kinematic bicycle model: x_{k+1} = F(x_k, u_k).
+
+        Builds the continuous nonlinear ODE, then discretizes it via
+        ``utils.integrators.make_discrete_dynamics`` using
+        ``self.discrete_integration_method`` ('euler' | 'rk4' | 'cvodes' | ...).
+        'rk4' (default) replaces the previous hand-rolled forward-Euler LTV
+        step. ``wheelbase`` and ``dt`` stay symbolic (model parameters) so the
+        consumer can substitute numeric values, matching the continuous model.
+        """
         # todo: remove constraints from model since that isn't from the kinematics
         # todo: create new models class
         # initialize structs
@@ -318,25 +340,73 @@ class KinematicBicycleModel(object):
             dt
     )
 
-        A = casadi.blockcat([
-            [1, 0, casadi.cos(psi) * dt, -vel * casadi.sin(psi) * dt],
-            [0, 1, casadi.sin(psi) * dt, vel * casadi.cos(psi) * dt],
-            [0, 0, 1, 0],
-            [0, 0, dt * casadi.tan(delta) / self.wheelbase, 1],
-        ])
-        B = casadi.blockcat([
-            [0, 0],
-            [0, 0],
-            [dt, 0],  #
-            [0, dt * vel / (self.wheelbase * casadi.cos(delta) ** 2)],
-        ])
-        G = casadi.vertcat(vel * casadi.sin(psi) * psi * dt,
-                           -vel * casadi.cos(psi) * psi * dt,
-                           0,
-                           -(vel * delta) * dt / (self.wheelbase * casadi.cos(delta) ** 2))
-
-        # dynamics (discrete linear model)
-        f_expl = A @ z + B @ u + G  # discrete linear model
+        # Two selectable discrete model forms (self.discrete_model_type):
+        #   'ltv'       : forward-Jacobian (1st-order Taylor) linearization,
+        #                 x_{k+1} = A x_k + B u_k + G with A = I + dt*A_c,
+        #                 B = dt*B_c and the affine offset G = dt*g_c. Linear in
+        #                 the matrices; this is the classic LTV/QP form.
+        #   'nonlinear' : the full nonlinear ODE discretized by an integration
+        #                 scheme ('euler' | 'rk4' | 'cvodes' | ...).
+        # Both keep `wheelbase` and `dt` symbolic so the consumer can substitute
+        # numeric values.
+        model_type = self.discrete_model_type
+        if model_type == 'ltv':
+            # forward-Euler Jacobian (Taylor) discretization. The hand-built
+            # matrices below ARE the Euler discretization (A = I + dt*A_c), so
+            # the integration-scheme selector does not apply to this form.
+            if self.discrete_integration_method != 'euler':
+                import warnings
+                warnings.warn(
+                    f"discrete_model_type='ltv' uses a forward-Euler Jacobian "
+                    f"(Taylor) discretization; discrete_integration_method="
+                    f"'{self.discrete_integration_method}' is ignored. Use "
+                    f"discrete_model_type='nonlinear' for higher-order schemes.")
+            A = casadi.blockcat([
+                [1, 0, casadi.cos(psi) * dt, -vel * casadi.sin(psi) * dt],
+                [0, 1, casadi.sin(psi) * dt, vel * casadi.cos(psi) * dt],
+                [0, 0, 1, 0],
+                [0, 0, dt * casadi.tan(delta) / wheelbase, 1],
+            ])
+            B = casadi.blockcat([
+                [0, 0],
+                [0, 0],
+                [dt, 0],
+                [0, dt * vel / (wheelbase * casadi.cos(delta) ** 2)],
+            ])
+            G = casadi.vertcat(vel * casadi.sin(psi) * psi * dt,
+                               -vel * casadi.cos(psi) * psi * dt,
+                               0,
+                               -(vel * delta) * dt / (wheelbase * casadi.cos(delta) ** 2))
+            f_expl = A @ z + B @ u + G
+        elif model_type == 'nonlinear':
+            # The MPC NLP is SX-expanded at solve setup, which requires the
+            # discrete map to be an explicit symbolic expression. The
+            # integrator-backed schemes ('cvodes'/'rk'/'collocation'/'idas')
+            # build black-box casadi.integrator Function nodes that cannot be
+            # SX-expanded ('eval_sx' not defined) -- they are usable for the
+            # simulator/acados but not as the MPC prediction model here.
+            if self.discrete_integration_method not in ('euler', 'rk4'):
+                raise ValueError(
+                    f"discrete_integration_method="
+                    f"'{self.discrete_integration_method}' is not supported for "
+                    f"the MPC discrete model (casadi.integrator nodes cannot be "
+                    f"SX-expanded inside the NLP). Use 'euler' or 'rk4'.")
+            # continuous nonlinear ODE (symbolic wheelbase, same as setup_model)
+            f_expl_cont = casadi.vertcat(
+                    vel * casadi.cos(psi),
+                    vel * casadi.sin(psi),
+                    acc,
+                    (vel / wheelbase) * casadi.tan(delta)
+            )
+            # 'euler'/'rk4' keep dt symbolic so the consumer can substitute it.
+            f_expl = make_discrete_dynamics(
+                    f_expl_cont, z, u, dt, p=wheelbase,
+                    method=self.discrete_integration_method,
+                    function_name='discrete_kinematic')
+        else:
+            raise ValueError(
+                f"Unknown discrete_model_type '{model_type}'. "
+                f"Expected 'ltv' or 'nonlinear'.")
 
         '''Constraints/bounds'''
         if delta_bound is None:

@@ -82,6 +82,16 @@ class BaseSimulator(Node, ABC):
         self.declare_parameter('noise_std_y', 0.0)
         self.declare_parameter('noise_std_v', 0.0)
         self.declare_parameter('noise_std_psi', 0.0)
+        # Lockstep mode: advance physics by one dt only when a fresh command
+        # arrives, instead of free-running the timer with zero-order hold. Lets a
+        # slow controller drive the sim without the integrator running ahead on
+        # stale inputs. Odometry is still republished every tick so the
+        # controller's stale-odom guard does not trip.
+        self.declare_parameter(
+            'step_on_command', False,
+            pd(description='If True, advance the simulation only when a new '
+                           'Ackermann command is received (lockstep with the '
+                           'controller).'))
 
     def _read_parameters(self):
         def gp(name):
@@ -112,6 +122,7 @@ class BaseSimulator(Node, ABC):
         self._noise_std_y = gp('noise_std_y')
         self._noise_std_v = gp('noise_std_v')
         self._noise_std_psi = gp('noise_std_psi')
+        self.step_on_command = gp('step_on_command')
 
     def _init_state(self):
         def gp(name):
@@ -141,6 +152,9 @@ class BaseSimulator(Node, ABC):
         # Item 7a: lag filter state (tracks actual applied actuator value)
         self._delta_actual = 0.0
         self._accel_actual = 0.0
+
+        # Lockstep mode: set by the command callback, consumed by the timer.
+        self._new_command = False
 
     def _setup_pub_sub(self):
         self.br = TransformBroadcaster(self)
@@ -179,8 +193,19 @@ class BaseSimulator(Node, ABC):
             self.acc_cmd = (self.velocity_cmd - self.speed) / self.sample_time
         self.uk[0, 0] = self.acc_cmd
         self.uk[1, 0] = self.delta_cmd
+        self._new_command = True
 
     def update_timer_callback(self):
+        # Lockstep mode: freeze physics until a fresh command arrives, but keep
+        # republishing odom/accel/TF so the controller's stale-odom guard does
+        # not trip and it keeps producing commands.
+        if self.step_on_command and not self._new_command:
+            self.publish_transform()
+            self.publish_odometry()
+            self.publish_acceleration()
+            return
+        self._new_command = False
+
         # Zero-order hold: reuses last uk if no new command arrived.
         uk = self.uk.copy()
 

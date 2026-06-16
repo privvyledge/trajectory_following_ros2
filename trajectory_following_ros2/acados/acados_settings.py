@@ -196,6 +196,12 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     Options: "LINEAR_LS", "NONLINEAR_LS", "EXTERNAL"
     '''
     if cost_module.lower() == "LINEAR_LS".lower():
+        # NOTE: the psi residual here is the linear psi - psi_ref. LINEAR_LS is
+        # linear by construction (y = Vx@x + Vu@u), so the +/-pi wrap CANNOT be
+        # applied in-solver as it is for NONLINEAR_LS/EXTERNAL. Instead the
+        # adapter (AcadosSolverAdapter.solve) unwraps the psi reference trajectory
+        # and aligns it to the current heading before cost_set('yref', ...), so
+        # psi - psi_ref already lies in [-pi, pi]. See coupled_kinematic_acados.py.
         ocp.cost.cost_type = "LINEAR_LS"
 
         y = Vx @ model.x + Vu @ model.u
@@ -210,9 +216,16 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     elif cost_module.lower() == "NONLINEAR_LS".lower():
         ocp.cost.cost_type = "NONLINEAR_LS"
 
-        # could be an expression involving terms other than x, u
+        # The psi entry is expressed as the already-wrapped heading error
+        # atan2(sin(psi - psi_ref), cos(psi - psi_ref)) using the psi_ref carried
+        # in the zref parameter, so acados' internal y - yref does NOT re-subtract
+        # a raw psi. The adapter therefore must set the psi entry of yref to 0
+        # (the position/velocity/input entries keep the normal yref reference).
+        # Without this the heading error would jump to ~2*pi at +/-pi crossings.
+        psi_err = casadi.atan2(casadi.sin(model.x[3] - zref[3]),
+                               casadi.cos(model.x[3] - zref[3]))
         y = casadi.vertcat(
-                model.x,
+                model.x[0], model.x[1], model.x[2], psi_err,
                 model.u
         )
         ocp.model.cost_y_expr = y
@@ -224,6 +237,15 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     elif cost_module.lower() == "EXTERNAL".lower():
         ocp.cost.cost_type = "EXTERNAL"
         z_err = model.x - zref
+        # Wrap the heading error (state index 3) to [-pi, pi] via atan2(sin, cos).
+        # acados forms this residual by plain subtraction, so without wrapping the
+        # psi term jumps to ~2*pi whenever psi - psi_ref crosses +/-pi (vehicle
+        # traveling in -x), sending the solver the long-way-around gradient and
+        # saturating steering. atan2(sin, cos) is correct everywhere and C1-smooth.
+        z_err = casadi.vertcat(
+            z_err[0], z_err[1], z_err[2],
+            casadi.atan2(casadi.sin(z_err[3]), casadi.cos(z_err[3])),
+        )
         u_err = model.u - uref
         u_rate_err = model.u - u_prev  # casadi.vertcat(u_rate, casadi.diff(u_dv))  # to pack with horizon
         ocp.model.cost_expr_ext_cost = (
@@ -250,9 +272,12 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     elif cost_module_e.lower() == "NONLINEAR_LS".lower():
         ocp.cost.cost_type_e = "NONLINEAR_LS"
 
-        # could be an expression involving terms other than x
+        # Terminal psi entry is the wrapped heading error (see stage cost above);
+        # the adapter zeros the psi entry of yref_e to match.
+        psi_err_e = casadi.atan2(casadi.sin(model.x[3] - zref[3]),
+                                 casadi.cos(model.x[3] - zref[3]))
         y_e = casadi.vertcat(
-                model.x,
+                model.x[0], model.x[1], model.x[2], psi_err_e,
         )
         ocp.model.cost_y_expr_e = y_e
 
@@ -264,6 +289,11 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         ocp.cost.cost_type_e = "EXTERNAL"
         yref_e = yref[:nx]
         z_err_e = model.x - yref_e
+        # Wrap the terminal heading error (index 3) to [-pi, pi]; see stage cost above.
+        z_err_e = casadi.vertcat(
+            z_err_e[0], z_err_e[1], z_err_e[2],
+            casadi.atan2(casadi.sin(z_err_e[3]), casadi.cos(z_err_e[3])),
+        )
         ocp.model.cost_expr_ext_cost_e = 0.5 / unscale * casadi.dot(_Qe_sym * z_err_e, z_err_e)
 
     else:

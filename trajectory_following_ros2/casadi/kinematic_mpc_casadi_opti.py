@@ -27,9 +27,12 @@ Todo:
     * replace model with kinematic_bicycle_model
     * Setup warmstarting and codegen (https://github.com/casadi/casadi/discussions/3434#discussioncomment-7404877)
 """
+import logging
 import time
 import numpy as np
 import casadi
+
+logger = logging.getLogger(__name__)
 
 
 class KinematicMPCCasadiOpti(object):
@@ -372,8 +375,8 @@ class KinematicMPCCasadiOpti(object):
         for i in range(self.horizon):
             if self.normalize_yaw_error:
                 cost += self._quad_form(self.z_dv[i + 1, 0:3] - self.z_ref[i, 0:3], self.Q[0:3, 0:3])
-                cost += self._quad_form(casadi.fmod(self.z_dv[i + 1, 3] - self.z_ref[i, 3] + np.pi, 2 * np.pi) - np.pi,
-                                        self.Q[3, 3])  # normalizes the angle in the range [-pi, pi)
+                cost += self._quad_form(self._wrap_angle(self.z_dv[i + 1, 3] - self.z_ref[i, 3]),
+                                        self.Q[3, 3])  # wrap heading error to [-pi, pi]
             else:
                 cost += self._quad_form(self.z_dv[i + 1, :] - self.z_ref[i, :], self.Q)
 
@@ -395,7 +398,11 @@ class KinematicMPCCasadiOpti(object):
                 slack_weights = casadi.diag(self.P_u_rate)  # to convert to a column vector
                 cost += slack_weights[0] * casadi.sum1(self.sl_acc_dv) + slack_weights[1] * casadi.sum1(self.sl_delta_dv)  # slack cost
 
-        cost += self._quad_form(self.z_dv[self.horizon, :] - self.z_ref[self.horizon - 1, :], self.Qf)  # terminal state
+        if self.normalize_yaw_error:  # terminal state
+            cost += self._quad_form(self.z_dv[self.horizon, 0:3] - self.z_ref[self.horizon - 1, 0:3], self.Qf[0:3, 0:3])
+            cost += self._quad_form(self._wrap_angle(self.z_dv[self.horizon, 3] - self.z_ref[self.horizon - 1, 3]), self.Qf[3, 3])
+        else:
+            cost += self._quad_form(self.z_dv[self.horizon, :] - self.z_ref[self.horizon - 1, :], self.Qf)
 
         cost *= 0.5
         return cost
@@ -416,6 +423,13 @@ class KinematicMPCCasadiOpti(object):
                     'ipopt.sb': 'yes',
                     # Opti/IPOPT path. Original default: 2000.
                     'ipopt.max_iter': self.max_iter,
+                    # Hard wall-clock budget so one tough solve cannot blow past the control
+                    # period and stall the loop. IPOPT returns its current iterate flagged
+                    # non-optimal on timeout; base_tracker then holds the last good command.
+                    # Capped at 150% of the sample time: now that the yaw-wrap bug is fixed the
+# 395 ms spikes are gone, so a tighter cap only truncates solves that would
+# converge and forces an unnecessary hold-last-good; the safety nets bound runaways.
+                    'ipopt.max_cpu_time': max(0.01, 1.5 * self.Ts),
                     'ipopt.acceptable_tol': 1e-8,
                     'ipopt.acceptable_obj_change_tol': 1e-6,
                 }
@@ -486,6 +500,7 @@ class KinematicMPCCasadiOpti(object):
         st = time.process_time()
 
         sl_mpc = np.zeros((self.horizon, self.nu))  # or return None
+        error_message = None
         try:
             sol = self.solver()  # todo: make this an attribute
 
@@ -545,7 +560,10 @@ class KinematicMPCCasadiOpti(object):
             # # See (https://github.com/casadi/casadi/wiki/FAQ:-How-to-specify-a-custom-Hessian-approximation%3F | https://groups.google.com/g/casadi-users/c/XnDBUWrPTlQ)
             # hess_l = self.mpc.debug.casadi_solver.get_function('nlp_hess_l')
         except Exception as e:
-            # Suboptimal solution (e.g. timed out).
+            # Suboptimal solution (e.g. timed out). Recovers last debug values,
+            # so this is a handled fallback rather than a hard failure — warn, no traceback.
+            error_message = repr(e)
+            logger.warning('Opti solve() fell back to debug values: %s', error_message)
             u_mpc = self.mpc.debug.value(self.u_dv)
             z_mpc = self.mpc.debug.value(self.z_dv)
             if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
@@ -577,6 +595,7 @@ class KinematicMPCCasadiOpti(object):
                     'lam_g': lam_g,
                     'lam_p': lam_p,
                     'solver_stats': sol.stats(),
+                    'error': error_message,
                     }
         return sol_dict
 

@@ -7,8 +7,8 @@
     distance_tolerance: 0.2
 
     horizon: 25
-    sample_time: 0.05
-    prediction_time: 1.5
+    sample_time: 0.05  # not used. Modify control_rate instead
+    prediction_time: 1.25  # = sample_time(0.05) * horizon(25); 1/control_rate == 0.05
     control_rate: 20.0
     saturate_input: True
     allow_reversing: True
@@ -33,7 +33,10 @@
     min_reference_speed: 0.3
     max_steer: 27.0
     min_steer: -27.0
-    max_steer_rate: 352.9411764706
+    # deg/s at the road wheel (converted to rad/s internally). Derated from the
+    # stock Traxxas 2075 servo's no-load 0.17 s/60deg (=352.94 deg/s) to account for the
+    # steering linkage ratio and load. Refine with a measured lock-to-lock sweep.
+    max_steer_rate: 183.346494
 
     # max_iter: solver iteration budget. Meaning depends on solver_type/solver:
     #   solver_type=quad, solver=qrqp  (DEFAULT): outer SQP iterations in sqpmethod.
@@ -53,10 +56,22 @@
     solver_type: quad
     solver: qrqp
 
+    # CasADi discrete-formulation model (used when ode_type is a discrete kind):
+    #   discrete_model_type: 'nonlinear' (full ODE) | 'ltv' (forward-Jacobian/
+    #       Taylor linearization). NOTE: as consumed, 'ltv' is evaluated at the
+    #       decision variables, so it is mathematically identical to
+    #       'nonlinear' + 'euler' (it is NOT yet a true frozen-operating-point
+    #       LTV/QP model).
+    #   discrete_integration_method: 'rk4' (default) | 'euler'. Only these
+    #       explicit schemes work for the MPC NLP; 'cvodes'/'rk'/'collocation'
+    #       cannot be SX-expanded inside the NLP. Ignored when type='ltv'.
+    discrete_model_type: nonlinear
+    discrete_integration_method: rk4
+
     R: [0.01, 0.01]
-    Rd: [10., 10.]
-    Q: [1.0, 1.0, 1.0, 0.5]
-    Qf: [0.04, 0.04, 0.1, 0.5]
+    Rd: [5., 5.]
+    Q: [50.0, 50.0, 20.0, 8.0]
+    Qf: [100.0, 100.0, 50.0, 40.0]
 
     generate_mpc_model: True
     build_with_cython: True

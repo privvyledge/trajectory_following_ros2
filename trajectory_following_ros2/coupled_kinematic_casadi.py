@@ -117,6 +117,16 @@ class CasAdiSolverAdapter(BaseSolver):
         jerk = float(u_rate[0, 0]) if u_rate is not None else None
         delta_rate = float(u_rate[1, 0]) if u_rate is not None else None
 
+        # A budget-limited solve still returns a usable, warm-started, near-converged
+        # iterate — accept it (real-time-iteration style) rather than discarding it and
+        # holding a stale command. At the +/-pi heading zones IPOPT can't prove optimality
+        # within the cpu-time cap, but its iterate keeps cte ~0.2 (on track); treating that
+        # as a hard failure tripped the 5-consecutive zero-command safety and stopped the
+        # vehicle. Only genuine failures (infeasible/restoration, in _DEGENERATE) stay
+        # non-optimal so the safety net still protects against real divergence.
+        _USABLE_INCOMPLETE = ('Maximum_CpuTime_Exceeded', 'Maximum_Iterations_Exceeded')
+        _solver_ok = bool(sol['solver_status']) or return_status in _USABLE_INCOMPLETE
+
         return SolverResult(
             accel_cmd=acc_cmd,
             steering_cmd=delta_cmd,
@@ -126,9 +136,10 @@ class CasAdiSolverAdapter(BaseSolver):
             u_sequence=u_sequence,
             x_sequence=x_sequence,
             u_prev=np.array([acc_cmd, delta_cmd]),
-            is_optimal=bool(sol['solver_status']),
+            is_optimal=_solver_ok,
             solve_time=float(sol.get('solve_time', 0.0)),
-            status=str(sol.get('solver_stats', {}).get('return_status', '')),
+            status=str(return_status),
+            error=sol.get('error'),
         )
 
     @property
@@ -149,6 +160,17 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
     def _declare_backend_parameters(self):
         self.declare_parameter('ode_type', 'discrete_kinematic_coupled')
         self.declare_parameter('use_opti', False)
+        # Discrete-formulation model form and discretization scheme (only used
+        # when ode_type selects a discrete formulation):
+        #   discrete_model_type: 'nonlinear' (full ODE, default) | 'ltv'
+        #                        (forward-Jacobian/Taylor linearization).
+        #   discrete_integration_method: 'rk4' (default) | 'euler'. Only these
+        #     explicit schemes are valid for the MPC model -- the black-box
+        #     casadi.integrator schemes ('cvodes'/'rk'/'collocation') cannot be
+        #     SX-expanded inside the NLP. Ignored when discrete_model_type='ltv'
+        #     (the LTV Jacobian form is forward-Euler by construction).
+        self.declare_parameter('discrete_model_type', 'nonlinear')
+        self.declare_parameter('discrete_integration_method', 'rk4')
         # Iteration budget — meaning depends on solver/solver_type.
         # Node default (15) is appropriate for qrqp/sqpmethod. Raise to >=100 for IPOPT.
         self.declare_parameter('max_iter', 15)
@@ -164,6 +186,8 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
     def _init_solver(self) -> Optional[BaseSolver]:
         ode_type = self.get_parameter('ode_type').value
         use_opti = self.get_parameter('use_opti').value
+        discrete_model_type = self.get_parameter('discrete_model_type').value
+        discrete_integration_method = self.get_parameter('discrete_integration_method').value
         max_iter = int(self.get_parameter('max_iter').value)
         normalize_yaw_error = self.get_parameter('normalize_yaw_error').value
         solver_type = self.get_parameter('solver_type').value
@@ -227,12 +251,20 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
         else:
             controller = DiscreteKinematicMPCCasadi(
                 symbol_type='MX', warmstart=True,
+                discrete_model_type=discrete_model_type,
+                discrete_integration_method=discrete_integration_method,
                 num_obstacles=num_obstacles,
                 collision_avoidance_scheme=collision_method,
                 ego_radius=ego_radius,
                 **common_kwargs)
 
-        self.get_logger().info(f'CasADi MPC built (ode={ode_type}, opti={use_opti}).')
+        if model_type == 'discrete' and not use_opti:
+            self.get_logger().info(
+                f'CasADi MPC built (ode={ode_type}, opti={use_opti}, '
+                f'discrete_model={discrete_model_type}, '
+                f'discretization={discrete_integration_method}).')
+        else:
+            self.get_logger().info(f'CasADi MPC built (ode={ode_type}, opti={use_opti}).')
 
         return CasAdiSolverAdapter(
             controller, use_opti=use_opti,

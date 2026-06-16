@@ -293,6 +293,21 @@ class KinematicMPCBase(ABC):
                           jerk_bound, delta_rate_bound, reset):
         pass
 
+    @staticmethod
+    def _wrap_angle(angle):
+        """Wrap an angle (difference) to [-pi, pi]; smooth and differentiable.
+
+        Uses atan2(sin, cos) rather than fmod. CasADi's fmod follows C semantics —
+        the result takes the sign of the dividend, range (-2*pi, 2*pi) — so the
+        common ``fmod(x + pi, 2*pi) - pi`` trick is WRONG whenever x < -pi: it
+        returns the long-way-around error and sends the solver's gradient the wrong
+        direction. That mishandling manifested as steering saturation and IPOPT
+        timeouts whenever the reference heading crossed +/-pi (vehicle travelling
+        in -x). atan2(sin, cos) is correct everywhere and C1-smooth, which also
+        conditions the NLP/SQP better than the piecewise fmod.
+        """
+        return casadi.atan2(casadi.sin(angle), casadi.cos(angle))
+
     def objective_function_setup(self):
         cost = 0
         u_prev = self.u_prev
@@ -301,7 +316,7 @@ class KinematicMPCBase(ABC):
                 cost += self._quad_form(self.z_dv[0:3, k] - self.z_ref[0:3, k],
                                         self.Q[0:3, 0:3])
                 cost += self._quad_form(
-                    casadi.fmod(self.z_dv[3, k] - self.z_ref[3, k] + np.pi, 2 * np.pi) - np.pi,
+                    self._wrap_angle(self.z_dv[3, k] - self.z_ref[3, k]),
                     self.Q[3, 3])
             else:
                 cost += self._quad_form(self.z_dv[:, k] - self.z_ref[:, k], self.Q)
@@ -327,8 +342,16 @@ class KinematicMPCBase(ABC):
                         cost += casadi.mtimes(
                             casadi.diag(self.P_obstacle_avoidance).T, self.sl_obs_dv[:, k])
 
-        cost += self._quad_form(
-            self.z_dv[:, self.horizon] - self.z_ref[:, self.horizon], self.Qf)
+        if self.normalize_yaw_error:
+            cost += self._quad_form(
+                self.z_dv[0:3, self.horizon] - self.z_ref[0:3, self.horizon],
+                self.Qf[0:3, 0:3])
+            cost += self._quad_form(
+                self._wrap_angle(self.z_dv[3, self.horizon] - self.z_ref[3, self.horizon]),
+                self.Qf[3, 3])
+        else:
+            cost += self._quad_form(
+                self.z_dv[:, self.horizon] - self.z_ref[:, self.horizon], self.Qf)
         cost *= 0.5
         return cost
 

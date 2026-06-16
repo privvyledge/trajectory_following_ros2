@@ -2,9 +2,8 @@
 Sets up the vehicle model.
 """
 
-import numpy as np
 import casadi
-from casadi import cos, sin, tan, fmod
+from casadi import cos, sin, tan, atan2
 import do_mpc
 
 
@@ -72,7 +71,12 @@ class BicycleKinematicModel(object):
         Rd_1 = model.set_variable(var_type="_tvp", var_name="Rd_1")
 
         # tracking errors (optimization variables):
-        psi_diff = (fmod(psi - psi_ref + np.pi, 2 * np.pi) - np.pi)  # [-pi, pi)
+        # Wrap to [-pi, pi] via atan2(sin, cos): CasADi's fmod follows C
+        # semantics (result takes the sign of the dividend), so the common
+        # fmod(x + pi, 2*pi) - pi trick returns the long-way-around error when
+        # x < -pi. atan2(sin, cos) is correct everywhere and C1-smooth.
+        psi_err = psi - psi_ref
+        psi_diff = atan2(sin(psi_err), cos(psi_err))  # [-pi, pi]
         model.set_expression('psi_diff', psi_diff)
 
         model.set_rhs("pos_x", vel * cos(psi))
@@ -129,7 +133,10 @@ class BicycleKinematicModel(object):
         Rd_1 = model.set_variable(var_type="_tvp", var_name="Rd_1")
 
         # tracking errors (optimization variables):
-        psi_diff = (fmod(psi - psi_ref + np.pi, 2 * np.pi) - np.pi)
+        # Wrap to [-pi, pi] via atan2(sin, cos); see model_setup() for why
+        # fmod is wrong under CasADi's C-style sign semantics.
+        psi_err = psi - psi_ref
+        psi_diff = atan2(sin(psi_err), cos(psi_err))  # [-pi, pi]
         model.set_expression('psi_diff', psi_diff)
 
         # A = casadi.blockcat([

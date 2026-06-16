@@ -7,12 +7,15 @@ See:
 Notes:
     * QP solvers work when slack is added to rate inputs. Fails without slack or RD
 """
+import logging
 import time
 import numpy as np
 import casadi
 
 from trajectory_following_ros2.casadi.kinematic_bicycle_model import KinematicBicycleModel
 from trajectory_following_ros2.casadi._casadi_base import KinematicMPCBase
+
+logger = logging.getLogger(__name__)
 
 
 class DiscreteKinematicMPCCasadi(KinematicMPCBase):
@@ -32,10 +35,14 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
                  slack_upper_bound_u_rate=None,
                  slack_objective_is_quadratic=False,
                  code_gen_mode='jit',
+                 discrete_model_type='nonlinear', discrete_integration_method='rk4',
                  num_obstacles=1, collision_avoidance_scheme='cbf',
                  ego_radius=None,
                  slack_weights_obstacle_avoidance=None,
                  slack_upper_bound_obstacle_avoidance=None):
+        # consumed by _build_vehicle_model (called inside super().__init__)
+        self.discrete_model_type = discrete_model_type
+        self.discrete_integration_method = discrete_integration_method
         super().__init__(
             vehicle=vehicle, horizon=horizon, sample_time=sample_time, wheelbase=wheelbase,
             nx=nx, nu=nu, x0=x0, u0=u0,
@@ -71,7 +78,9 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
                 vehicle_parameters={"wheelbase": self.wheelbase}, sample_time=self.Ts,
                 model_type='kinematic', model_name='vehicle_kinematic_model',
                 symbol_type=self.symbol_type,
-                discretization_method='cvodes', discrete=True)
+                discrete=True,
+                discrete_model_type=self.discrete_model_type,
+                discrete_integration_method=self.discrete_integration_method)
             self.model = self.vehicle.model
 
         self.ode = self.model.f_expl_expr
@@ -325,6 +334,13 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
                         # Discrete NLP via IPOPT. Original default: 100 (lower than continuous
                         # because discrete LTV + warm-start converges in fewer barrier iterations).
                         'ipopt.max_iter': self.max_iter,
+                        # Hard wall-clock budget so one tough solve cannot blow past the control
+                        # period and stall the loop. IPOPT returns its current iterate flagged
+                        # non-optimal on timeout; base_tracker then holds the last good command.
+                        # Capped at 150% of the sample time: now that the yaw-wrap bug is fixed the
+                        # 395 ms spikes are gone, so a tighter cap only truncates solves that would
+                        # converge and forces an unnecessary hold-last-good; the safety nets bound runaways.
+                        'ipopt.max_cpu_time': max(0.01, 1.5 * self.Ts),
                         'ipopt.acceptable_tol': 1e-8,
                         'ipopt.acceptable_obj_change_tol': 1e-6,
                         'error_on_fail': False,  # to raise an exception if the solver fails to find a solution
@@ -365,6 +381,9 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
                         ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.sb'] = 'yes'
                         # IPOPT used as inner QP solver via nlpsol. Original default: 100.
                         ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.max_iter'] = self.max_iter
+                        # Per-inner-solve wall-clock cap (IPOPT is the inner QP solver here, so the
+                        # outer SQP may call it several times — this bounds each call, not the tick).
+                        ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.max_cpu_time'] = max(0.01, 1.5 * self.Ts)
                         ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.acceptable_tol'] = 1e-8
                         ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.acceptable_obj_change_tol'] = 1e-6
                         ipopt_quad_settings['qpsol_options']['nlpsol_options']['ipopt.print_level'] = 0
@@ -550,6 +569,7 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
 
         sl_mpc = np.zeros((self.horizon, self.nu))
         sl_obs_mpc = np.zeros((self.horizon, self.n_obstacles))
+        error_message = None
         try:
             opt_variables = casadi.vertcat(
                 casadi.reshape(self.z_dv_value, self.nx * (self.horizon + 1), 1),
@@ -736,7 +756,8 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
             # #     print(expression)
             # # print("\n")
         except Exception as e:
-            print(f"Encountered: {e}")
+            error_message = repr(e)
+            logger.exception('solve() post-solve processing failed; zeroing commands')
             u_mpc = np.zeros((self.nu, self.horizon))
             z_mpc = np.zeros((self.nx, self.horizon + 1))
             u_rate = np.zeros((self.nu, self.horizon))
@@ -773,7 +794,8 @@ class DiscreteKinematicMPCCasadi(KinematicMPCBase):
                     'lam_x': lam_x,
                     'lam_g': lam_g,
                     'lam_p': lam_p,
-                    'solver_stats': self.solver.stats()
+                    'solver_stats': self.solver.stats(),
+                    'error': error_message
                     }
 
         self.solution_dict = sol_dict

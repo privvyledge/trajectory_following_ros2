@@ -77,11 +77,30 @@ class AcadosSolverAdapter(BaseSolver):
             [*self._Q_diag, *self._R_diag, *self._Qe_diag, *self._Rd_diag]
             if self._has_weight_params else []
         )
+
+        # Heading-error wrapping at +/-pi crossings differs by cost type:
+        #   EXTERNAL / NONLINEAR_LS -> wrapped in-solver via atan2 in the cost
+        #     expression (using the psi_ref carried in the zref parameter), so the
+        #     psi entry of yref must be ZERO here to avoid double-subtraction.
+        #   LINEAR_LS -> cannot wrap in-solver (linear residual), so we pre-unwrap
+        #     the psi reference trajectory and align it to the current heading;
+        #     then psi - psi_ref already lies in [-pi, pi].
+        # The p-vector (zref) always carries the true psi_ref for the in-solver wrap.
+        psi_ref_lin = None
+        if 'LINEAR_LS' in (self._stage_cost_type, self._terminal_cost_type):
+            psi_ref_lin = np.unwrap(xref[3, :])
+            psi_ref_lin = psi_ref_lin + np.round(
+                (x0[3] - psi_ref_lin[0]) / (2.0 * np.pi)) * 2.0 * np.pi
+
         for j in range(self._horizon):
             yref = xref[:, j]
-            if self._stage_cost_type in ('LINEAR_LS', 'NONLINEAR_LS'):
-                self._controller.cost_set(j, 'yref',
-                                          np.hstack([yref, np.zeros(2)]))
+            if self._stage_cost_type == 'NONLINEAR_LS':
+                self._controller.cost_set(
+                    j, 'yref', np.array([yref[0], yref[1], yref[2], 0.0, 0.0, 0.0]))
+            elif self._stage_cost_type == 'LINEAR_LS':
+                self._controller.cost_set(
+                    j, 'yref',
+                    np.array([yref[0], yref[1], yref[2], psi_ref_lin[j], 0.0, 0.0]))
             p = [self._wheelbase, *yref, *np.zeros(2), *x0, *u_prev]
             if self._num_obstacles > 0:
                 p = [*p, *self._obs_params(j)]
@@ -90,8 +109,14 @@ class AcadosSolverAdapter(BaseSolver):
             self._controller.set(j, 'p', np.array(p))
 
         yref_N = xref[:, self._horizon]
-        if self._terminal_cost_type in ('LINEAR_LS', 'NONLINEAR_LS'):
-            self._controller.set(self._horizon, 'yref', yref_N)
+        if self._terminal_cost_type == 'NONLINEAR_LS':
+            self._controller.set(
+                self._horizon, 'yref',
+                np.array([yref_N[0], yref_N[1], yref_N[2], 0.0]))
+        elif self._terminal_cost_type == 'LINEAR_LS':
+            self._controller.set(
+                self._horizon, 'yref',
+                np.array([yref_N[0], yref_N[1], yref_N[2], psi_ref_lin[self._horizon]]))
         p_N = [self._wheelbase, *yref_N, *np.zeros(2), *x0, *u_prev]
         if self._num_obstacles > 0:
             p_N = [*p_N, *self._obs_params(self._horizon)]

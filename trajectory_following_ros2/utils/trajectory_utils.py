@@ -159,6 +159,21 @@ def get_angle_from_position(position):
     return np.arctan2(position[:, 1], position[:, 0])
 
 
+def interpolate_angles(query_points, xp, angles):
+    """Linearly interpolate an angle series across the +/-pi wrap.
+
+    ``np.interp`` on a raw angle column produces garbage wherever the column jumps
+    across +/-pi: interpolating between +179deg and -179deg sweeps through 0deg, so a
+    reference heading pointing in -x is reported as pointing in +x. Interpolating sin
+    and cos independently and recombining with atan2 is wrap-correct everywhere and
+    C1-smooth. Result is in [-pi, pi]; pass through ``fix_angle_reference`` afterwards
+    to align it to the vehicle's current heading and unwrap it across the horizon.
+    """
+    s = np.interp(query_points, xp, np.sin(angles))
+    c = np.interp(query_points, xp, np.cos(angles))
+    return np.arctan2(s, c)
+
+
 def fix_angle_reference(angle_ref, angle_init):
     # similar to smooth yaw. todo: test and compare
     # This function returns a "smoothened" angle_ref wrt angle_init so there are no jumps.
@@ -974,10 +989,15 @@ def generate_reference_trajectory_by_interpolation(trajectory, init_pose, closes
 
         interp_to_fit = np.asarray(s_samples)
         waypoint_dict = {}
-        for waypoint_key in ['x', 'y', 'yaw', 'cum_dist', 'curvature']:
+        for waypoint_key in ['x', 'y', 'cum_dist', 'curvature']:
             waypoint_dict[waypoint_key + '_ref'] = np.interp(
                 interp_to_fit, cum_dist, trajectory[:, cols[waypoint_key]])
-        waypoint_dict['yaw_ref'] = fix_angle_reference(waypoint_dict['yaw_ref'], yaw_init)
+        # Interpolate yaw via sin/cos so the +/-pi wrap on the recorded yaw column
+        # does not produce a reference heading that is ~180deg wrong (see
+        # interpolate_angles). fix_angle_reference then aligns/unwraps it for the solver.
+        waypoint_dict['yaw_ref'] = fix_angle_reference(
+            interpolate_angles(interp_to_fit, cum_dist, trajectory[:, cols['yaw']]),
+            yaw_init)
         waypoint_dict['vel_ref'] = march * np.asarray(v_samples)
         return waypoint_dict
 
@@ -995,12 +1015,17 @@ def generate_reference_trajectory_by_interpolation(trajectory, init_pose, closes
         interp_to_fit = [h * dt + start_tm for h in range(0, horizon + 1)]  # or range(1, horizon + 2)
 
     waypoint_dict = {}
-    for waypoint_key in ['x', 'y', 'yaw', 'cum_dist', 'curvature']:
+    for waypoint_key in ['x', 'y', 'cum_dist', 'curvature']:
         waypoint_dict[waypoint_key + '_ref'] = np.interp(interp_to_fit,
                                                          trajectory[:, waypoint_keys_to_columns[interp_by_key]],
                                                          trajectory[:, waypoint_keys_to_columns[waypoint_key]])
-        if waypoint_key == 'yaw':
-            waypoint_dict['yaw_ref'] = fix_angle_reference(waypoint_dict['yaw_ref'], yaw_init)
+    # Interpolate yaw via sin/cos so the +/-pi wrap on the recorded yaw column does not
+    # produce a reference heading that is ~180deg wrong (see interpolate_angles).
+    waypoint_dict['yaw_ref'] = fix_angle_reference(
+        interpolate_angles(interp_to_fit,
+                           trajectory[:, waypoint_keys_to_columns[interp_by_key]],
+                           trajectory[:, waypoint_keys_to_columns['yaw']]),
+        yaw_init)
 
     # Reference velocity found by approximation using ds/dt finite differencing.
     waypoint_dict['vel_ref'] = np.diff(waypoint_dict['cum_dist_ref']) / dt

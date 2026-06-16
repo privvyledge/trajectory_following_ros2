@@ -23,6 +23,7 @@ class SolverResult:
     is_optimal: bool = False
     solve_time: float = 0.0
     status: str = 'uninitialized'
+    error: Optional[str] = None     # post-solve exception message (None when no error)
 
 
 class BaseSolver(ABC):

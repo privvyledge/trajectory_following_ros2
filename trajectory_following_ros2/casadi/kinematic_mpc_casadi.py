@@ -4,12 +4,15 @@ See:
         * https://web.casadi.org/docs/#for-loop-equivalents
         * https://github.com/nirajbasnet/Nonlinear_MPCC_for_autonomous_racing/blob/master/nonlinear_mpc_casadi/scripts/Nonlinear_MPC.py#L157
 """
+import logging
 import time
 import numpy as np
 import casadi
 
 from trajectory_following_ros2.casadi.kinematic_bicycle_model import KinematicBicycleModel
 from trajectory_following_ros2.casadi._casadi_base import KinematicMPCBase
+
+logger = logging.getLogger(__name__)
 
 
 class KinematicMPCCasadi(KinematicMPCBase):
@@ -240,6 +243,12 @@ class KinematicMPCCasadi(KinematicMPCBase):
                     # Continuous NLP via IPOPT. Original default: 2000 (full barrier-method
                     # iterations). For RTI-style use, lower to match control rate budget.
                     'ipopt.max_iter': self.max_iter,
+                    # Hard wall-clock budget so a single tough solve can never blow past the
+                    # control period and stall the loop (observed 395 ms spike → stale command
+                    # → drift → reverse). IPOPT returns its current iterate flagged non-optimal
+                    # when this fires; base_tracker then holds the last good command. Capped at
+                    # 80% of the sample time to leave headroom for the rest of the tick.
+                    'ipopt.max_cpu_time': max(0.01, 1.5 * self.Ts),
                     'ipopt.acceptable_tol': 1e-8,
                     'ipopt.acceptable_obj_change_tol': 1e-6,
                     'error_on_fail': 0,  # to raise an exception if the solver fails to find a solution
@@ -326,6 +335,7 @@ class KinematicMPCCasadi(KinematicMPCBase):
         st = time.process_time()
 
         sl_mpc = np.zeros((self.horizon, self.nu))
+        error_message = None
         try:
             opt_variables = casadi.vertcat(
                 casadi.reshape(self.z_dv_value, self.nx * (self.horizon + 1), 1),
@@ -391,8 +401,9 @@ class KinematicMPCCasadi(KinematicMPCBase):
             z_k_value = casadi.reshape(
                 opt_parameters[self.nx * (self.horizon + 1):self.nx * (self.horizon + 1) + self.nx],
                 self.nx, 1).full()
+            _up_start = self.nx * (self.horizon + 1) + self.nx
             u_prev_value = casadi.reshape(
-                opt_parameters[self.nx * (self.horizon + 1) + self.nx:],
+                opt_parameters[_up_start:_up_start + self.nu],
                 self.nu, 1).full()
             iteration_count = self.solver.stats()['iter_count']
             is_opt = True
@@ -461,6 +472,8 @@ class KinematicMPCCasadi(KinematicMPCBase):
             # #     print(expression)
             # # print("\n")
         except Exception as e:
+            error_message = repr(e)
+            logger.exception('solve() post-solve processing failed; zeroing commands')
             u_mpc = np.zeros((self.nu, self.horizon))
             z_mpc = np.zeros((self.nx, self.horizon + 1))
             u_rate = np.zeros((self.nu, self.horizon))
@@ -497,7 +510,8 @@ class KinematicMPCCasadi(KinematicMPCBase):
                     'lam_x': lam_x,
                     'lam_g': lam_g,
                     'lam_p': lam_p,
-                    'solver_stats': self.solver.stats()
+                    'solver_stats': self.solver.stats(),
+                    'error': error_message
                     }
 
         self.solution_dict = sol_dict

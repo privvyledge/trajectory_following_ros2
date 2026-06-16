@@ -45,6 +45,11 @@ class MPC(object):
 
         nlpsol_opts = {
             'ipopt.max_iter': max_iterations,
+            # Hard wall-clock budget so one tough solve cannot blow past the control period
+            # and stall the loop. IPOPT returns its current iterate flagged non-optimal on
+            # timeout; base_tracker then holds the last good command. Capped at 80% of the
+            # sample time to leave headroom for the rest of the tick.
+            'ipopt.max_cpu_time': max(0.01, 1.5 * self.Ts),
             'record_time': True,
             'ipopt.acceptable_obj_change_tol': tolerance,
             # 'ipopt.linear_solver': 'MA27'

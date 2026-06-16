@@ -44,6 +44,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.conditions import LaunchConfigurationEquals
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -77,6 +78,8 @@ def generate_launch_description():
     initial_y = LaunchConfiguration('initial_y')
     initial_yaw = LaunchConfiguration('initial_yaw')
     initial_speed = LaunchConfiguration('initial_speed')
+    step_on_command = LaunchConfiguration('step_on_command')
+    simulator = LaunchConfiguration('simulator')
 
     # ---- Declare launch arguments -------------------------------------------
     declare_args = [
@@ -153,6 +156,16 @@ def generate_launch_description():
                               description='Simulator initial yaw (rad).'),
         DeclareLaunchArgument('initial_speed', default_value='0.0',
                               description='Simulator initial speed (m/s).'),
+        DeclareLaunchArgument(
+            'step_on_command', default_value='false',
+            description='Lockstep the simulator to the controller: advance physics '
+                        'one dt only when a new drive command arrives, instead of '
+                        'free-running with zero-order hold. Use to reproduce '
+                        'fixed-step MATLAB/Simulink runs or to test a slow controller.'),
+        DeclareLaunchArgument(
+            'simulator', default_value='do_mpc',
+            description='Simulator backend: do_mpc | acados. Selects which simulator '
+                        'node closes the loop.'),
     ]
 
     # ---- 1. Static transform: map -> odom (identity) ------------------------
@@ -185,20 +198,32 @@ def generate_launch_description():
     )
 
     # ---- 3. Simulator (do-mpc) ----------------------------------------------
-    simulator_node = Node(
+    # Both backends take the same parameters; `simulator` picks which one runs.
+    simulator_params = [{
+        'odom_topic': odom_topic,
+        'global_frame': global_frame,
+        'robot_frame': robot_frame,
+        'initial_x': initial_x,
+        'initial_y': initial_y,
+        'initial_yaw': initial_yaw,
+        'initial_speed': initial_speed,
+        'step_on_command': step_on_command,
+    }]
+    dompc_simulator_node = Node(
+        condition=LaunchConfigurationEquals('simulator', 'do_mpc'),
         package='trajectory_following_ros2',
         executable='kinematic_dompc_simulator',
         name='kinematic_dompc_simulator',
         output='screen',
-        parameters=[{
-            'odom_topic': odom_topic,
-            'global_frame': global_frame,
-            'robot_frame': robot_frame,
-            'initial_x': initial_x,
-            'initial_y': initial_y,
-            'initial_yaw': initial_yaw,
-            'initial_speed': initial_speed,
-        }],
+        parameters=simulator_params,
+    )
+    acados_simulator_node = Node(
+        condition=LaunchConfigurationEquals('simulator', 'acados'),
+        package='trajectory_following_ros2',
+        executable='kinematic_acados_simulator',
+        name='kinematic_acados_simulator',
+        output='screen',
+        parameters=simulator_params,
     )
 
     # ---- 4. Controller: coupled_kinematic_casadi (NLP + IPOPT) --------------
@@ -253,7 +278,8 @@ def generate_launch_description():
     return LaunchDescription(declare_args + [
         static_tf_node,
         waypoint_loader_node,
-        simulator_node,
+        dompc_simulator_node,
+        acados_simulator_node,
         controller_node,
         OpaqueFunction(function=_make_visualizer_node),
     ])

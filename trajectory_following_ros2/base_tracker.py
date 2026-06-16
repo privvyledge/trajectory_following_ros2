@@ -1,3 +1,4 @@
+import logging
 import math
 import queue
 import threading
@@ -621,6 +622,7 @@ class BaseTrajectoryTracker(Node, ABC):
             else:
                 continue
 
+            # todo: acquire the thread lock to prevent race conditions
             dist = np.linalg.norm(np.array(pos[:2]) - np.array([self.x, self.y]))
             obstacles.append({'state': [pos[0], pos[1], radius], 'distance': dist})
 
@@ -723,17 +725,36 @@ class BaseTrajectoryTracker(Node, ABC):
 
         result: SolverResult = self._solver.solve(x0, xref, u_prev_snapshot.flatten())
 
-        # 11. Track consecutive failures; zero-command safety after N=5.
+        # 11. Track consecutive failures. On an isolated suboptimal solve, hold the
+        #     last good command instead of applying the (possibly saturated/garbage)
+        #     iterate; zero-command safety after N=5.
         if result.is_optimal:
             self._consecutive_failures = 0
             if not self._u_prev_from_echo:
                 with self.mutex:
                     self.u_prev[:, 0] = result.u_prev
+
+            # Unpack result (only the optimal solve updates the applied command).
+            self.acc_cmd = result.accel_cmd
+            self.delta_cmd = result.steering_cmd
+            self.velocity_cmd = result.velocity_cmd
+            self.jerk_cmd = result.jerk_cmd
+            self.delta_rate_cmd = result.steering_rate_cmd
+
+            self.uk[0, 0] = self.acc_cmd
+            self.uk[1, 0] = self.delta_cmd
+
+            try:
+                self.mpc_predicted_states[:, :] = result.x_sequence.T  # (N+1, nx)
+                self.mpc_predicted_inputs[:, :] = result.u_sequence.T  # (N, nu)
+            except ValueError:
+                pass  # shape mismatch on first call if horizon changed
         else:
             self._consecutive_failures += 1
+            err_suffix = f', error={result.error}' if result.error else ''
             self.get_logger().warn(
                 f'Solver suboptimal (status={result.status}, '
-                f'consecutive={self._consecutive_failures})',
+                f'consecutive={self._consecutive_failures}{err_suffix})',
                 throttle_duration_sec=1.0)
             if self._consecutive_failures >= 5:
                 self.get_logger().error(
@@ -741,24 +762,12 @@ class BaseTrajectoryTracker(Node, ABC):
                     throttle_duration_sec=1.0)
                 self._publish_zero_command()
                 return
+            # Hold last good command: fall through to re-publish self.{acc,delta,velocity}_cmd
+            # unchanged. A single 395 ms IPOPT spike once emitted delta=27° + hard brake here,
+            # poisoning the loop into a reverse; bridging the spike avoids that cascade.
 
-        # Unpack result
-        self.acc_cmd = result.accel_cmd
-        self.delta_cmd = result.steering_cmd
-        self.velocity_cmd = result.velocity_cmd
-        self.jerk_cmd = result.jerk_cmd
-        self.delta_rate_cmd = result.steering_rate_cmd
         self.solution_time = result.solve_time
         self.solution_status = result.is_optimal
-
-        self.uk[0, 0] = self.acc_cmd
-        self.uk[1, 0] = self.delta_cmd
-
-        try:
-            self.mpc_predicted_states[:, :] = result.x_sequence.T  # (N+1, nx)
-            self.mpc_predicted_inputs[:, :] = result.u_sequence.T  # (N, nu)
-        except ValueError:
-            pass  # shape mismatch on first call if horizon changed
 
         # 12. Saturation + publish
         if self.saturate_input:
@@ -768,7 +777,7 @@ class BaseTrajectoryTracker(Node, ABC):
 
         if self.publish_twist_topic:
             lat_vel = 0.0
-            if result.x_sequence.shape[1] > 1:
+            if result.is_optimal and result.x_sequence.shape[1] > 1:
                 lat_vel = float(result.x_sequence[1, 1])
             self._publish_twist(lateral_velocity=lat_vel)
 
@@ -779,10 +788,20 @@ class BaseTrajectoryTracker(Node, ABC):
         self.update_queue(self.mpc_reference_states_queue, self.xref.copy())
         self.update_queue(self.mpc_predicted_states_queue, self.mpc_predicted_states.copy())
 
+        # DEBUG (CTE investigation, uncommitted): idx + CTE proxy to disambiguate the
+        # "missed waypoint -> reverse" failure. cte = distance from rear axle to the
+        # tracked path point at current_idx. Watch for idx leap/stall and t_solve spikes
+        # at the moment vel_cmd goes negative.
+        try:
+            _cte = float(np.hypot(x - self.path[self.current_idx, 0],
+                                  y - self.path[self.current_idx, 1]))
+        except (IndexError, AttributeError, TypeError):
+            _cte = float('nan')
         self.get_logger().info(
             f'acc={self.acc_cmd:.3f} delta={np.degrees(self.delta_cmd):.1f}deg '
             f'vel_cmd={self.velocity_cmd:.2f} status={self.solution_status} '
-            f't_solve={self.solution_time * 1e3:.1f}ms run={self.run_count}')
+            f't_solve={self.solution_time * 1e3:.1f}ms idx={self.current_idx} '
+            f'cte={_cte:.3f} run={self.run_count}')
 
     # ------------------------------------------------------------------
     # Helpers
@@ -912,7 +931,7 @@ class BaseTrajectoryTracker(Node, ABC):
     # Tolerance for saturation warnings: suppress log noise when the solver
     # returns a value infinitesimally outside the constraint boundary due to
     # floating-point arithmetic (common when an NLP constraint is active).
-    _SAT_WARN_TOL = 1e-4  # rad / (m/s²) — ~0.006°, well below any real violation
+    _SAT_WARN_TOL = 1e-4  # rad / (m/s²) — ~0.006°, well below any real violation. Todo: move to the top
 
     def _input_saturation(self):
         if self.acc_cmd < self.MAX_DECEL - self._SAT_WARN_TOL \
@@ -1146,6 +1165,12 @@ def _make_executor(node: BaseTrajectoryTracker) -> MultiThreadedExecutor:
     (``ReentrantCallbackGroup``).  Values below the minimum are clamped with a
     logged warning.  The node is added to the executor before returning.
     """
+    # ROS path: base_tracker re-emits solver errors via get_logger().warn() (see the
+    # suboptimal branch in _control_timer_callback), so silence the pure-Python module
+    # loggers in the CasADi backends to avoid duplicate stderr tracebacks. Standalone
+    # pure-Python use never runs this, so those loggers stay active there.
+    logging.getLogger('trajectory_following_ros2.casadi').setLevel(logging.CRITICAL + 1)
+
     requested = node.get_parameter('executor_threads').value
     if requested < _EXECUTOR_THREADS_MIN:
         node.get_logger().warn(

@@ -45,6 +45,8 @@ def generate_launch_description():
     publish_twist_topic = LaunchConfiguration('publish_twist_topic')
     wheelbase = LaunchConfiguration('wheelbase')
     ode_type = LaunchConfiguration('ode_type')
+    discrete_model_type = LaunchConfiguration('discrete_model_type')
+    discrete_integration_method = LaunchConfiguration('discrete_integration_method')
     load_waypoints = LaunchConfiguration('load_waypoints')
     waypoints_csv = LaunchConfiguration('waypoints_csv')
 
@@ -190,6 +192,22 @@ def generate_launch_description():
                         '   discrete_kinematic_coupled, discrete_kinematic_coupled_augmented, '
                         '   discrete_dynamic_decoupled '
                         'Options: continuous/discrete, kinematic/dynamic, coupled/decoupled, augmented.'
+    )
+    discrete_model_type_la = DeclareLaunchArgument(
+            'discrete_model_type',
+            default_value='nonlinear',
+            description='CasADi discrete formulation model form: '
+                        "'nonlinear' (full ODE, default) or 'ltv' "
+                        '(forward-Jacobian/Taylor linearization). '
+                        'Only used for discrete ode_type values.'
+    )
+    discrete_integration_method_la = DeclareLaunchArgument(
+            'discrete_integration_method',
+            default_value='rk4',
+            description='CasADi discrete-model discretization scheme: '
+                        "'rk4' (default) or 'euler'. Only these explicit "
+                        "schemes work for the MPC NLP. Ignored when "
+                        "discrete_model_type='ltv'."
     )
     load_waypoints_la = DeclareLaunchArgument(
             'load_waypoints',
@@ -460,6 +478,7 @@ def generate_launch_description():
              load_params_from_file_la, load_params_from_args_la,
              robot_frame_la, global_frame_la,
              frequency_la, publish_twist_topic_la, wheelbase_la, ode_type_la,
+             discrete_model_type_la, discrete_integration_method_la,
              load_waypoints_la, waypoints_csv_la,
              saturate_input_la, allow_reversing_la, max_speed_la, min_speed_la, max_accel_la, max_decel_la,
              max_steer_la, min_steer_la, max_steer_rate_la, desired_speed_la,
@@ -631,6 +650,8 @@ def generate_launch_description():
                 SetParameter(name='publish_twist_topic', value=publish_twist_topic, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='wheelbase', value=wheelbase, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='ode_type', value=ode_type, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='discrete_model_type', value=discrete_model_type, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='discrete_integration_method', value=discrete_integration_method, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='max_speed', value=max_speed, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='min_speed', value=min_speed, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='max_accel', value=max_accel, condition=IfCondition(load_params_from_args)),
