@@ -37,6 +37,17 @@ Example:
 
   ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py \
       solver_type:=quad solver:=qrqp max_iter:=30 viz_backend:=rerun
+
+  # Discrete-model matrix (gate-2 6a/6b): exercise each form/discretization.
+  ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py \
+      discrete_model_type:=nonlinear discrete_integration_method:=rk4   # default
+  ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py \
+      discrete_model_type:=nonlinear discrete_integration_method:=euler
+  ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py \
+      discrete_model_type:=ltv   # collapses to nonlinear+euler (Jacobian at decision vars)
+
+  # Verify JIT artifacts land in code_gen_directory, not the launch cwd.
+  ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py code_gen_directory:=/tmp/cg
 """
 
 import os
@@ -61,9 +72,12 @@ def generate_launch_description():
     odom_topic = LaunchConfiguration('odom_topic')
 
     ode_type = LaunchConfiguration('ode_type')
+    discrete_model_type = LaunchConfiguration('discrete_model_type')
+    discrete_integration_method = LaunchConfiguration('discrete_integration_method')
     solver_type = LaunchConfiguration('solver_type')
     solver = LaunchConfiguration('solver')
     max_iter = LaunchConfiguration('max_iter')
+    code_gen_directory = LaunchConfiguration('code_gen_directory')
 
     viz_backend = LaunchConfiguration('viz_backend')
     viz_spawn_viewer = LaunchConfiguration('viz_spawn_viewer')
@@ -102,6 +116,14 @@ def generate_launch_description():
             'ode_type', default_value='discrete_kinematic_coupled',
             description='CasADi formulation: discrete_kinematic_coupled | continuous_kinematic_coupled | ...'),
         DeclareLaunchArgument(
+            'discrete_model_type', default_value='nonlinear',
+            description='CasADi discrete model form (ode_type=discrete_*): nonlinear | ltv. '
+                        'Restart-only param; ignored by the continuous formulation.'),
+        DeclareLaunchArgument(
+            'discrete_integration_method', default_value='rk4',
+            description='CasADi discretization for discrete_model_type=nonlinear: rk4 | euler. '
+                        'Ignored when discrete_model_type=ltv (Euler by construction).'),
+        DeclareLaunchArgument(
             'solver_type', default_value='nlp',
             description='CasADi solver_type: nlp | quad | conic.'),
         DeclareLaunchArgument(
@@ -110,6 +132,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'max_iter', default_value='200',
             description='Iteration budget. >=100 for IPOPT (node default 15 is too low for IPOPT).'),
+        DeclareLaunchArgument(
+            'code_gen_directory',
+            default_value=os.path.join(pkg_prefix, 'data', 'casadi_codegen'),
+            description='Directory for CasADi JIT artifacts (jit_tmp.c, tmp_*.o/.so). '
+                        'Keeps generated code out of the launch cwd; empty string = cwd (legacy).'),
         DeclareLaunchArgument(
             'viz_backend', default_value='native',
             description="Visualization backend: native | rerun | both."),
@@ -243,9 +270,12 @@ def generate_launch_description():
                 'robot_frame': robot_frame,
                 'odom_topic': odom_topic,
                 'ode_type': ode_type,
+                'discrete_model_type': discrete_model_type,
+                'discrete_integration_method': discrete_integration_method,
                 'solver_type': solver_type,
                 'solver': solver,
                 'max_iter': max_iter,
+                'code_gen_directory': code_gen_directory,
             },
         ],
     )
