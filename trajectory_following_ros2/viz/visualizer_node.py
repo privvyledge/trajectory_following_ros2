@@ -108,14 +108,14 @@ class VisualizerNode(Node):
             try:
                 from trajectory_following_ros2.viz.rerun_backend import RerunBackend
                 rb = RerunBackend(
-                    app_name       = self.app_name,
-                    spawn_viewer   = self.spawn_viewer,
-                    connect_addr   = self.connect_addr,
-                    recording_path = self.recording_path,
-                    stamp_fn       = lambda: self.get_clock().now().to_msg(),
-                    serve_web      = self.serve_web,
-                    web_port       = self.web_port,
-                    open_browser   = self.web_open_browser,
+                    app_name=self.app_name,
+                    spawn_viewer=self.spawn_viewer,
+                    connect_addr=self.connect_addr,
+                    recording_path=self.recording_path,
+                    stamp_fn=lambda: self.get_clock().now().to_msg(),
+                    serve_web=self.serve_web,
+                    web_port=self.web_port,
+                    open_browser=self.web_open_browser,
                 )
                 self._backends.append(rb)
                 self.get_logger().info('Rerun backend active.')

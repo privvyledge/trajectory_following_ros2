@@ -14,7 +14,6 @@ Todo:
     Move to a separate package
 """
 import sys
-import time
 
 import pandas as pd
 import numpy as np

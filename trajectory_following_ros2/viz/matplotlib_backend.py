@@ -204,23 +204,29 @@ class MatplotlibBackend(BaseVizBackend):
             # --- speed ---
             line_spd_act.set_data(_xs(spd_act), spd_act)
             line_spd_cmd.set_data(_xs(spd_cmd), spd_cmd)
-            ax_speed.relim(); ax_speed.autoscale_view()
+            ax_speed.relim()
+            ax_speed.autoscale_view()
 
             # --- steer ---
             line_steer.set_data(_xs(steer), steer)
-            ax_steer.relim(); ax_steer.autoscale_view()
+            ax_steer.relim()
+            ax_steer.autoscale_view()
 
             # --- errors ---
             line_cte.set_data(_xs(cte), cte)
             line_hdg_err.set_data(_xs(hdg_err), hdg_err)
-            ax_errors.relim(); ax_errors.autoscale_view()
-            ax_err2.relim(); ax_err2.autoscale_view()
+            ax_errors.relim()
+            ax_errors.autoscale_view()
+            ax_err2.relim()
+            ax_err2.autoscale_view()
 
             # --- diag ---
             line_accel_cmd.set_data(_xs(accel), accel)
             line_solve_time.set_data(_xs(solve), solve)
-            ax_diag.relim(); ax_diag.autoscale_view()
-            ax_diag2.relim(); ax_diag2.autoscale_view()
+            ax_diag.relim()
+            ax_diag.autoscale_view()
+            ax_diag2.relim()
+            ax_diag2.autoscale_view()
 
             # --- video frame grab (last, after the canvas is updated) ---
             if self._writer is not None:
