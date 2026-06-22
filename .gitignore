@@ -19,5 +19,13 @@ c_generated_code*/
 acados_ocp_*.json
 kinematic_bicycle_acados_integrator.json
 
+# CasADi JIT / external code-gen artifacts
+data/casadi_codegen/
+jit_tmp.c
+casadi_nlp.c
+casadi_nlp.so
+nlp.c
+nlp.so
+
 # Rerun recordings
 *.rrd

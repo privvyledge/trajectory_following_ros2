@@ -82,7 +82,7 @@ def generate_launch_description():
     terminal_cost_type = LaunchConfiguration('terminal_cost_type')
     generate_mpc_model = LaunchConfiguration('generate_mpc_model')
     build_with_cython = LaunchConfiguration('build_with_cython')
-    model_directory = LaunchConfiguration('model_directory')
+    code_gen_directory = LaunchConfiguration('code_gen_directory')
     debug_frequency = LaunchConfiguration('debug_frequency')
 
     # # Trajectory/goal parameters
@@ -373,10 +373,11 @@ def generate_launch_description():
             default_value='True',
             description='Whether to build the model with cython (faster) or ctypes.'
     )
-    model_directory_la = DeclareLaunchArgument(
-            'model_directory',
+    code_gen_directory_la = DeclareLaunchArgument(
+            'code_gen_directory',
             default_value=mpc_model_path,
-            description='Path to the built/generated model.'
+            description='Directory for generated/compiled solver code: acados C-code + '
+                        'compiled model, or CasADi JIT artifacts. Unified across backends.'
     )
     distance_tolerance_la = DeclareLaunchArgument(
             'distance_tolerance',
@@ -488,7 +489,7 @@ def generate_launch_description():
              scale_cost_la,
              max_iterations_la, termination_condition_la,
              stage_cost_type_la, terminal_cost_type_la,
-             generate_mpc_model_la, build_with_cython_la, model_directory_la,
+             generate_mpc_model_la, build_with_cython_la, code_gen_directory_la,
              distance_tolerance_la, speed_tolerance_la,
              declare_log_level_cmd,
              odom_topic_la, ackermann_cmd_topic_la, twist_topic_la, acceleration_topic_la, path_topic_la,
@@ -531,7 +532,7 @@ def generate_launch_description():
         # 'termination_condition': termination_condition,
         # 'generate_mpc_model': generate_mpc_model,
         # 'build_with_cython': build_with_cython,
-        # 'model_directory': model_directory,
+        # 'code_gen_directory': code_gen_directory,
         # 'stage_cost_type': stage_cost_type,
         # 'terminal_cost_type': terminal_cost_type,
         # 'distance_tolerance': distance_tolerance,
@@ -682,7 +683,7 @@ def generate_launch_description():
                 SetParameter(name='termination_condition', value=termination_condition, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='generate_mpc_model', value=generate_mpc_model, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='build_with_cython', value=build_with_cython, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='model_directory', value=model_directory, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='code_gen_directory', value=code_gen_directory, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='stage_cost_type', value=stage_cost_type, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='terminal_cost_type', value=terminal_cost_type, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='distance_tolerance', value=distance_tolerance, condition=IfCondition(load_params_from_args)),

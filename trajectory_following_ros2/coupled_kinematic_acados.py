@@ -177,7 +177,9 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         self.declare_parameter('build_with_cython', True)
         self.declare_parameter('qp_solver', 'PARTIAL_CONDENSING_HPIPM')
         self.declare_parameter('nlp_solver_type', 'SQP_RTI')
-        self.declare_parameter('model_directory',
+        # Unified name across backends (CasADi controller uses the same param). Holds
+        # the generated acados C-code + compiled model here.
+        self.declare_parameter('code_gen_directory',
                                os.path.join(
                                    get_package_share_directory('trajectory_following_ros2'),
                                    'data', 'model'))
@@ -193,7 +195,7 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         with_cython = self.get_parameter('build_with_cython').value
         qp_solver = self.get_parameter('qp_solver').value
         nlp_solver_type = self.get_parameter('nlp_solver_type').value
-        model_dir = self.get_parameter('model_directory').value
+        model_dir = self.get_parameter('code_gen_directory').value
         num_obstacles = self.get_parameter('num_obstacles').value
         collision_method = self.get_parameter('obstacle_collision_avoidance_method').value
         ego_radius = self.get_parameter('ego_radius').value

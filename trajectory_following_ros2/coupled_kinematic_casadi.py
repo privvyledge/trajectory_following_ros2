@@ -1,3 +1,4 @@
+import os
 import sys
 from typing import Optional
 
@@ -5,13 +6,35 @@ import numpy as np
 
 import rclpy
 from rclpy.executors import ExternalShutdownException
+from ament_index_python.packages import get_package_share_directory
 
 from trajectory_following_ros2.base_tracker import BaseTrajectoryTracker, _make_executor
 from trajectory_following_ros2.backends.base_solver import BaseSolver, SolverResult
 
 from trajectory_following_ros2.casadi.kinematic_mpc_casadi_opti import KinematicMPCCasadiOpti
 from trajectory_following_ros2.casadi.kinematic_mpc_casadi import KinematicMPCCasadi
-from trajectory_following_ros2.casadi.discrete_kinematic_mpc_casadi import DiscreteKinematicMPCCasadi
+
+
+# Supported (solver_type, solver) combinations for the merged KinematicMPCCasadi.
+# The continuous and discrete ode_type entry points share the same solver paths
+# after the merge; the prediction model differs (continuous == nonlinear+euler)
+# but the NLP/QP solver routing in setup_solver() is identical.
+#   ('nlp',  'ipopt')   -- interior-point NLP solver.
+#   ('quad', 'qrqp')    -- sqpmethod with QRQP inner QP (default).
+#   ('quad', 'osqp')    -- sqpmethod with OSQP inner QP.
+#   ('quad', 'qpoases') -- sqpmethod with qpOASES inner QP.
+#   ('quad', 'ipopt')   -- sqpmethod with IPOPT used as the inner QP solver (via nlpsol).
+# All 'quad' (SQP/QP) paths require Rd > 0 (a non-zero input-rate penalty) and the
+# input-rate slack so the QP stays feasible/convex. The old direct casadi.qpsol
+# path for the continuous formulation (broken, qrqp silently fell back to osqp) was
+# removed by the merge.
+_VALID_SOLVER_COMBOS = {
+    ('nlp', 'ipopt'),
+    ('quad', 'qrqp'),
+    ('quad', 'osqp'),
+    ('quad', 'qpoases'),
+    ('quad', 'ipopt'),
+}
 
 
 class CasAdiSolverAdapter(BaseSolver):
@@ -171,6 +194,14 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
         #     (the LTV Jacobian form is forward-Euler by construction).
         self.declare_parameter('discrete_model_type', 'nonlinear')
         self.declare_parameter('discrete_integration_method', 'rk4')
+        # Directory for CasADi JIT codegen artifacts (jit_tmp.c + tmp_*.o/.so) so they
+        # do not litter the working directory. Unified name with the acados node (which
+        # uses it for its generated C-code + compiled model). Empty string -> dump in the
+        # current working directory (legacy).
+        self.declare_parameter(
+            'code_gen_directory',
+            os.path.join(get_package_share_directory('trajectory_following_ros2'),
+                         'data', 'casadi_codegen'))
         # Iteration budget — meaning depends on solver/solver_type.
         # Node default (15) is appropriate for qrqp/sqpmethod. Raise to >=100 for IPOPT.
         self.declare_parameter('max_iter', 15)
@@ -188,6 +219,7 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
         use_opti = self.get_parameter('use_opti').value
         discrete_model_type = self.get_parameter('discrete_model_type').value
         discrete_integration_method = self.get_parameter('discrete_integration_method').value
+        code_gen_directory = self.get_parameter('code_gen_directory').value or None
         max_iter = int(self.get_parameter('max_iter').value)
         normalize_yaw_error = self.get_parameter('normalize_yaw_error').value
         solver_type = self.get_parameter('solver_type').value
@@ -221,6 +253,21 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
 
         model_type = 'continuous' if 'continuous' in ode_type else 'discrete'
 
+        # Validate the (solver_type, solver) combination against the matrix above.
+        # Opti uses its own solver setup, so it is exempt from this check.
+        if not use_opti and (solver_type, solver) not in _VALID_SOLVER_COMBOS:
+            matrix = '\n'.join(f'    {st} + {sv}' for st, sv in sorted(_VALID_SOLVER_COMBOS))
+            raise ValueError(
+                f"Unsupported solver combination (solver_type='{solver_type}', "
+                f"solver='{solver}') for ode_type='{ode_type}'. Supported combinations:\n"
+                f"{matrix}\nAll 'quad' paths require Rd > 0.")
+        # 'quad' (SQP/QP) paths need a non-zero input-rate penalty Rd to stay feasible.
+        if not use_opti and solver_type == 'quad' and not np.any(self.Rd.diagonal() > 0):
+            self.get_logger().warn(
+                f"solver_type='quad' (solver='{solver}') needs Rd > 0 for the input-rate "
+                f"slack to keep the QP feasible/convex, but Rd is all zeros. Expect "
+                f"infeasible/suboptimal solves; set a non-zero Rd.")
+
         common_kwargs = dict(
             horizon=self.horizon,
             sample_time=self.sample_time,
@@ -247,12 +294,22 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
         if use_opti:
             controller = KinematicMPCCasadiOpti(**common_kwargs)
         elif model_type == 'continuous':
-            controller = KinematicMPCCasadi(symbol_type='MX', warmstart=True, **common_kwargs)
+            # The continuous formulation is mathematically identical to the merged
+            # class with nonlinear dynamics + forward Euler. No obstacle avoidance on
+            # the continuous entry point (matches legacy behaviour).
+            controller = KinematicMPCCasadi(
+                symbol_type='MX', warmstart=True,
+                discrete_model_type='nonlinear',
+                discrete_integration_method='euler',
+                code_gen_directory=code_gen_directory,
+                num_obstacles=0,
+                **common_kwargs)
         else:
-            controller = DiscreteKinematicMPCCasadi(
+            controller = KinematicMPCCasadi(
                 symbol_type='MX', warmstart=True,
                 discrete_model_type=discrete_model_type,
                 discrete_integration_method=discrete_integration_method,
+                code_gen_directory=code_gen_directory,
                 num_obstacles=num_obstacles,
                 collision_avoidance_scheme=collision_method,
                 ego_radius=ego_radius,
