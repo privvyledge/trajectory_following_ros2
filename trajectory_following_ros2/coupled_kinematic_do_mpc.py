@@ -46,14 +46,22 @@ class DoMpcSolverAdapter(BaseSolver):
         x_seq = np.hstack([pred_x, pred_y, pred_vel, pred_psi]).T       # (4, N+1)
         u_seq = np.hstack([pred_acc, pred_delta]).T                       # (2, N)
 
-        N = self._controller.mpc.n_horizon
+        # do_mpc moved the horizon onto `.settings` in 4.6 (>= 4.6: mpc.settings.n_horizon;
+        # < 4.6: mpc.n_horizon). Support both so the node runs across machines with either.
+        mpc = self._controller.mpc
+        try:
+            N = mpc.settings.n_horizon          # do_mpc >= 4.6
+        except AttributeError:
+            N = mpc.n_horizon                   # do_mpc < 4.6
         k_next = min(1, N - 1)
         vel_next = float(pred_vel[k_next, 0])
 
         acc_cmd = float(u[0, 0])
         delta_cmd = float(u[1, 0])
 
-        stats = self._controller.mpc.solver_stats
+        # `solver_stats` is set as an instance attribute after each solve in both old and
+        # new do_mpc; default to {} defensively in case a solve was skipped.
+        stats = getattr(mpc, 'solver_stats', {}) or {}
         is_optimal = bool(stats.get('success', False))
         solve_time = float(stats.get('t_wall_total', 0.0))
 

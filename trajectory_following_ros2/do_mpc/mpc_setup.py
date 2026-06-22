@@ -234,7 +234,13 @@ class MPC(object):
         # mterm = mtimes([x_packed.T, self.Q, x_packed])
 
         self.mpc.set_objective(lterm=lterm, mterm=mterm)
-        self.mpc.set_rterm(acc=self.model.tvp['Rd_0'], delta=self.model.tvp['Rd_1'])  # input penalty
+        # do-mpc's set_rterm only accepts numeric weights (int/float/ndarray) — it builds
+        # the input-rate penalty at setup time, so a symbolic tvp (self.model.tvp['Rd_*'])
+        # raises "Value for acc must be int, float or numpy.ndarray". Use the numeric Rd
+        # diagonal. (The tvp Rd_0/Rd_1 remain available for the objective but are unused
+        # here; Rd is therefore not hot-reloadable for the do-mpc backend.)
+        self.mpc.set_rterm(acc=float(self.Rd_diag_value[0]),
+                           delta=float(self.Rd_diag_value[1]))  # input penalty
 
     def constraints_setup(
             self, vel_bound=None, delta_bound=None, acc_bound=None, reset=False

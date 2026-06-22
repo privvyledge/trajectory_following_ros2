@@ -13,7 +13,10 @@ visualizer backends:
        remapped onto the controller's `trajectory/path` + `trajectory/speed`.
   3. do-mpc simulator            closes the loop: consumes `drive`, publishes
        odometry on `odometry/local` and broadcasts odom -> base_link.
-  4. coupled_kinematic_casadi    the controller (defaults to NLP + IPOPT).
+  4. controller                  selected by `control_type` (mpc | purepursuit)
+       and, for MPC, `mpc_toolbox` (casadi | acados | do_mpc). Defaults to the
+       casadi NLP + IPOPT controller. For Pure Pursuit set
+       `control_type:=purepursuit mpc_toolbox:=none`.
   5. trajectory_visualizer       native and/or rerun visualization backends.
 
 The controller loads config/mpc_parameters.yaml for the tuned cost weights and
@@ -48,6 +51,15 @@ Example:
 
   # Verify JIT artifacts land in code_gen_directory, not the launch cwd.
   ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py code_gen_directory:=/tmp/cg
+
+  # Select the controller backend (gate-2 6c/6d/6e/6f):
+  ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py use_opti:=true      # 6c CasADi Opti
+  ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py mpc_toolbox:=acados # 6d acados (ERK)
+  ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py \
+      mpc_toolbox:=acados integrator_type:=DISCRETE                                   # 6d-ext acados DISCRETE
+  ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py mpc_toolbox:=do_mpc # 6e do-mpc
+  ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py \
+      control_type:=purepursuit mpc_toolbox:=none                                     # 6f Pure Pursuit
 """
 
 import os
@@ -71,12 +83,17 @@ def generate_launch_description():
     map_frame = LaunchConfiguration('map_frame')
     odom_topic = LaunchConfiguration('odom_topic')
 
+    mpc_toolbox = LaunchConfiguration('mpc_toolbox')
+    control_type = LaunchConfiguration('control_type')
+
     ode_type = LaunchConfiguration('ode_type')
     discrete_model_type = LaunchConfiguration('discrete_model_type')
     discrete_integration_method = LaunchConfiguration('discrete_integration_method')
+    use_opti = LaunchConfiguration('use_opti')
     solver_type = LaunchConfiguration('solver_type')
     solver = LaunchConfiguration('solver')
     max_iter = LaunchConfiguration('max_iter')
+    integrator_type = LaunchConfiguration('integrator_type')
     code_gen_directory = LaunchConfiguration('code_gen_directory')
 
     viz_backend = LaunchConfiguration('viz_backend')
@@ -113,6 +130,17 @@ def generate_launch_description():
             'odom_topic', default_value='odometry/local',
             description='Odometry topic the simulator publishes and the controller/viz consume.'),
         DeclareLaunchArgument(
+            'mpc_toolbox', default_value='casadi',
+            choices=['acados', 'casadi', 'do_mpc', 'none'],
+            description='Which MPC controller node to launch (when control_type=mpc). '
+                        'Set to `none` (and control_type=purepursuit) to run Pure Pursuit only.'),
+        DeclareLaunchArgument(
+            'control_type', default_value='mpc',
+            choices=['mpc', 'purepursuit'],
+            description='Controller family: `mpc` launches the mpc_toolbox node; '
+                        '`purepursuit` launches the geometric Pure Pursuit node. To run '
+                        'purepursuit alone, also set mpc_toolbox:=none.'),
+        DeclareLaunchArgument(
             'ode_type', default_value='discrete_kinematic_coupled',
             description='CasADi formulation: discrete_kinematic_coupled | continuous_kinematic_coupled | ...'),
         DeclareLaunchArgument(
@@ -124,6 +152,10 @@ def generate_launch_description():
             description='CasADi discretization for discrete_model_type=nonlinear: rk4 | euler. '
                         'Ignored when discrete_model_type=ltv (Euler by construction).'),
         DeclareLaunchArgument(
+            'use_opti', default_value='false',
+            description='CasADi only: use the Opti-stack formulation (KinematicMPCCasadiOpti) '
+                        'instead of the function-based NLP. Restart-only.'),
+        DeclareLaunchArgument(
             'solver_type', default_value='nlp',
             description='CasADi solver_type: nlp | quad | conic.'),
         DeclareLaunchArgument(
@@ -132,6 +164,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'max_iter', default_value='200',
             description='Iteration budget. >=100 for IPOPT (node default 15 is too low for IPOPT).'),
+        DeclareLaunchArgument(
+            'integrator_type', default_value='ERK',
+            description='acados only: OCP integrator. ERK (default) | DISCRETE. '
+                        'Changing it regenerates the acados C-code.'),
         DeclareLaunchArgument(
             'code_gen_directory',
             default_value=os.path.join(pkg_prefix, 'data', 'casadi_codegen'),
@@ -253,30 +289,85 @@ def generate_launch_description():
         parameters=simulator_params,
     )
 
-    # ---- 4. Controller: coupled_kinematic_casadi (NLP + IPOPT) --------------
-    controller_node = Node(
+    # ---- 4. Controller -------------------------------------------------------
+    # Selected by `control_type` (mpc | purepursuit) and, for MPC, `mpc_toolbox`
+    # (casadi | acados | do_mpc). Each node loads config/mpc_parameters.yaml for the
+    # tuned cost weights + speed/curvature policy, then layers backend-specific
+    # overrides on top. Without the YAML the controller falls back to node-default
+    # weights (Rd=[10,100] over-penalizes steering rate), which can't follow curvature
+    # and diverges within ~10% of a lap.
+    params_file = os.path.join(pkg_prefix, 'config', 'mpc_parameters.yaml')
+
+    # Frame/topic overrides every controller needs (the YAML targets hardware topics).
+    common_controller_params = {
+        'global_frame': global_frame,
+        'robot_frame': robot_frame,
+        'odom_topic': odom_topic,
+    }
+
+    casadi_controller_node = Node(
+        condition=LaunchConfigurationEquals('mpc_toolbox', 'casadi'),
         package='trajectory_following_ros2',
         executable='coupled_kinematic_casadi',
         name='kinematic_coupled_casadi_controller',
         output='screen',
         parameters=[
-            # Load the tuned cost weights + speed/curvature policy. Without this the
-            # controller falls back to node-default weights (Rd=[10,100] over-penalizes
-            # steering rate), which can't follow curvature and diverges within ~10% of a
-            # lap. The dict below overrides the YAML where they overlap.
-            os.path.join(pkg_prefix, 'config', 'mpc_parameters.yaml'),
+            params_file,
             {
-                'global_frame': global_frame,
-                'robot_frame': robot_frame,
-                'odom_topic': odom_topic,
+                **common_controller_params,
                 'ode_type': ode_type,
                 'discrete_model_type': discrete_model_type,
                 'discrete_integration_method': discrete_integration_method,
+                'use_opti': use_opti,
                 'solver_type': solver_type,
                 'solver': solver,
                 'max_iter': max_iter,
                 'code_gen_directory': code_gen_directory,
             },
+        ],
+    )
+
+    acados_controller_node = Node(
+        condition=LaunchConfigurationEquals('mpc_toolbox', 'acados'),
+        package='trajectory_following_ros2',
+        executable='coupled_kinematic_acados',
+        name='kinematic_coupled_acados_controller',
+        output='screen',
+        parameters=[
+            params_file,
+            {
+                **common_controller_params,
+                'integrator_type': integrator_type,
+                'max_iter': max_iter,
+                'code_gen_directory': code_gen_directory,
+            },
+        ],
+    )
+
+    do_mpc_controller_node = Node(
+        condition=LaunchConfigurationEquals('mpc_toolbox', 'do_mpc'),
+        package='trajectory_following_ros2',
+        executable='coupled_kinematic_do_mpc',
+        name='kinematic_coupled_do_mpc_controller',
+        output='screen',
+        parameters=[
+            params_file,
+            {
+                **common_controller_params,
+                'max_iter': max_iter,
+            },
+        ],
+    )
+
+    purepursuit_controller_node = Node(
+        condition=LaunchConfigurationEquals('control_type', 'purepursuit'),
+        package='trajectory_following_ros2',
+        executable='purepursuit',
+        name='purepursuit_controller',
+        output='screen',
+        parameters=[
+            params_file,
+            common_controller_params,
         ],
     )
 
@@ -310,6 +401,9 @@ def generate_launch_description():
         waypoint_loader_node,
         dompc_simulator_node,
         acados_simulator_node,
-        controller_node,
+        casadi_controller_node,
+        acados_controller_node,
+        do_mpc_controller_node,
+        purepursuit_controller_node,
         OpaqueFunction(function=_make_visualizer_node),
     ])

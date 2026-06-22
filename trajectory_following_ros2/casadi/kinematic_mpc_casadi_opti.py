@@ -366,6 +366,18 @@ class KinematicMPCCasadiOpti(object):
     def _quad_form(self, z, Q):
         return casadi.mtimes(z, casadi.mtimes(Q, z.T))  # z.T @ Q @ z
 
+    @staticmethod
+    def _wrap_angle(angle):
+        """Wrap an angle (difference) to [-pi, pi]; smooth and differentiable.
+
+        Mirrors ``KinematicMPCBase._wrap_angle`` (this Opti class does not inherit
+        from that base). Uses atan2(sin, cos) rather than fmod: CasADi's fmod
+        follows C semantics (result takes the sign of the dividend), so the common
+        ``fmod(x + pi, 2*pi) - pi`` trick sends the solver's gradient the wrong way
+        whenever x < -pi. atan2(sin, cos) is correct everywhere and C1-smooth.
+        """
+        return casadi.atan2(casadi.sin(angle), casadi.cos(angle))
+
     def objective_function_setup(self):
         """
         path following
@@ -580,6 +592,14 @@ class KinematicMPCCasadiOpti(object):
 
         solve_time = time.process_time() - st
 
+        # Opti.stats() raises (Assertion "solved()") when the stack was never successfully
+        # solved — the cold warm-up solve in __init__ before parameters are set, or a solve
+        # that threw. Guard it so solve() always returns a dict instead of crashing.
+        try:
+            solver_stats = self.mpc.stats()
+        except Exception:
+            solver_stats = {}
+
         sol_dict = {'u_control': u_mpc[0, :],
                     'u_mpc': u_mpc,
                     'z_mpc': z_mpc,
@@ -594,7 +614,7 @@ class KinematicMPCCasadiOpti(object):
                     'lam_x': lam_x,
                     'lam_g': lam_g,
                     'lam_p': lam_p,
-                    'solver_stats': sol.stats(),
+                    'solver_stats': solver_stats,
                     'error': error_message,
                     }
         return sol_dict

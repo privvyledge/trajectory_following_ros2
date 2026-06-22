@@ -10,6 +10,7 @@ from std_msgs.msg import Float32
 
 from trajectory_following_ros2.base_tracker import BaseTrajectoryTracker, _make_executor
 from trajectory_following_ros2.backends.base_solver import BaseSolver
+from trajectory_following_ros2.utils import trajectory_utils
 
 
 class AckermannPurePursuit(BaseTrajectoryTracker):
@@ -85,10 +86,8 @@ class AckermannPurePursuit(BaseTrajectoryTracker):
         if not (self.initial_pose_received and self.path_received):
             return
 
-        # Goal check
-        if self.trajectory.is_goal_reached(
-                self.x, self.y, self.speed, self.final_goal):
-            self.get_logger().info('Final goal reached.')
+        # Final-goal latch: once the run is complete, hold zero (no spamming).
+        if self.final_goal_reached:
             self._publish_zero_command()
             return
 
@@ -106,10 +105,27 @@ class AckermannPurePursuit(BaseTrajectoryTracker):
             lookahead_time=1.0, lookahead=self.lookahead,
             num_points_to_interpolate=50)
 
-        if ref_traj is None:
-            self.get_logger().info('End of trajectory reached.')
+        # Terminator (mirrors base_tracker): finished if no waypoints remain ahead
+        # (end_of_path) OR the vehicle has come to rest at the final goal. The grace
+        # distance (3 x distance_tolerance travelled) gates the stopped-at-goal test so
+        # it cannot fire at the start, where start ~= goal on a closed loop — without it
+        # is_goal_reached fires immediately and spams "Final goal reached".
+        end_of_path = ref_traj is None
+        past_grace = self.cumulative_distance >= 3.0 * self.distance_tolerance
+        at_goal = past_grace and self.trajectory.is_goal_reached(
+            self.x, self.y, self.speed, self.final_goal)
+        if end_of_path or at_goal:
+            self.final_goal_reached = True
+            self.get_logger().info('Final goal reached.')
             self._publish_zero_command()
             return
+
+        # Accumulate travelled arc length so the grace gate above can release.
+        yaw_diff = trajectory_utils.normalize_angle(
+            self.yaw - ref_traj['yaw_ref'][0], minus_pi_to_pi=True,
+            pi_is_negative=True, degrees=False)
+        self.cumulative_distance += trajectory_utils.calculate_current_arc_length(
+            self.speed, yaw_diff, self.sample_time)
 
         self.goal = self.path[self.current_idx, :]
 
