@@ -227,8 +227,30 @@ class BaseSimulator(Node, ABC):
         else:
             self._accel_actual = uk[0, 0]
 
-        u_eff = np.array([self._accel_actual, self._delta_actual])
+        # Guard 1 — clamp the effective acceleration to a physical bound before
+        # integrating. A real plant cannot exceed this, and it neutralises the
+        # acc_cmd = (velocity_cmd - speed)/sample_time branch in ackermann_cmd_callback,
+        # which manufactures ~1e4 m/s^2 (gain 1/dt) whenever velocity_cmd and speed
+        # diverge — the source of the +/-750 m/s runaway.
+        _MAX_ABS_ACCEL = 50.0   # m/s^2 — beyond any kinematic test plant, catches blow-ups
+        _MAX_ABS_SPEED = 50.0   # m/s   — ~180 km/h; sane hard cap for an F1/10-scale sim
+        u_eff = np.array([float(np.clip(self._accel_actual, -_MAX_ABS_ACCEL, _MAX_ABS_ACCEL)),
+                          self._delta_actual])
         x_next = self._step(self.zk.flatten(), u_eff)
+
+        # Guard 2 — never propagate a diverged/NaN state. If the integrator ran away,
+        # the upstream command was pathological (e.g. a diverged solve); log it and
+        # clamp instead of flinging the vehicle hundreds of metres, so the failure
+        # stays diagnosable rather than exploding the whole run.
+        if not np.all(np.isfinite(x_next)) or abs(x_next[2]) > _MAX_ABS_SPEED:
+            self.get_logger().error(
+                f'Simulator state diverged (v={x_next[2]:.1f} m/s, '
+                f'finite={bool(np.all(np.isfinite(x_next)))}, u_eff={u_eff}) — clamping. '
+                f'Upstream command was pathological.',
+                throttle_duration_sec=1.0)
+            x_next = np.where(np.isfinite(x_next), x_next, self.zk.flatten())
+            x_next[2] = float(np.clip(x_next[2], -_MAX_ABS_SPEED, _MAX_ABS_SPEED))
+
         self.zk[:, 0] = x_next
 
         self.x = x_next[0]

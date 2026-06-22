@@ -31,6 +31,10 @@
     use_speed_profile: True
     max_lateral_accel: 3.0
     min_reference_speed: 0.3
+    # NOTE: 27 is a GUESS for the 4-Tec 2.0 VXL — measure the real lock-to-lock angle and
+    # set it here. A sim test at 35 confirmed tight corners want >27 (4.9% of ticks) but did
+    # NOT lower corner CTE, so steering authority is not the CTE bottleneck (the lookahead/
+    # over-speed geometry is). Raise once measured for margin at the tightest corners.
     max_steer: 27.0
     min_steer: -27.0
     # deg/s at the road wheel (converted to rad/s internally). Derated from the
@@ -69,9 +73,15 @@
     discrete_integration_method: rk4
 
     R: [0.01, 0.01]
-    Rd: [5., 5.]
-    Q: [50.0, 50.0, 20.0, 8.0]
-    Qf: [100.0, 100.0, 50.0, 40.0]
+    # EXPERIMENT 2 (speed-dominant): speed weight 100 > position 50 so the car HOLDS vref
+    # and stops over-speeding into tight corners (the ~0.14 m/s over-speed was eating the
+    # thin steering margin at idx~1282, R=0.73m / ~25deg of the 27deg limit). Position
+    # kept at 50 for low CTE; Rd=10 for steer-rate damping. Revert with
+    # `git checkout config/mpc_parameters.yaml`. History: [50,50,50,8]/Rd10 cleared
+    # hairpin-1 but still over-sped 0.72 vs 0.58 -> failed at the tighter idx~1282 corner.
+    Rd: [10., 10.]
+    Q: [50.0, 50.0, 100.0, 8.0]
+    Qf: [100.0, 100.0, 200.0, 40.0]
 
     generate_mpc_model: True
     build_with_cython: True

@@ -788,20 +788,34 @@ class BaseTrajectoryTracker(Node, ABC):
         self.update_queue(self.mpc_reference_states_queue, self.xref.copy())
         self.update_queue(self.mpc_predicted_states_queue, self.mpc_predicted_states.copy())
 
-        # DEBUG (CTE investigation, uncommitted): idx + CTE proxy to disambiguate the
-        # "missed waypoint -> reverse" failure. cte = distance from rear axle to the
-        # tracked path point at current_idx. Watch for idx leap/stall and t_solve spikes
-        # at the moment vel_cmd goes negative.
+        # Cross-track error: true perpendicular distance from the rear axle to the
+        # reference polyline, found by projecting onto the path segments in a small
+        # index window around the tracked index. NOTE: current_idx is the look-ahead
+        # target (~distance_tolerance ahead), so the distance to path[current_idx]
+        # would carry a ~distance_tolerance baseline offset — projecting onto the
+        # nearest segments removes that and reports the real lateral error.
         try:
-            _cte = float(np.hypot(x - self.path[self.current_idx, 0],
-                                  y - self.path[self.current_idx, 1]))
-        except (IndexError, AttributeError, TypeError):
+            _lo = max(0, self.current_idx - 10)
+            _hi = min(len(self.path) - 1, self.current_idx + 3)
+            _a = self.path[_lo:_hi, 0:2]
+            _b = self.path[_lo + 1:_hi + 1, 0:2]
+            _ab = _b - _a
+            _p = np.array([x, y])
+            _t = np.clip(np.sum((_p - _a) * _ab, axis=1)
+                         / np.maximum(np.sum(_ab * _ab, axis=1), 1e-12), 0.0, 1.0)
+            _proj = _a + _t[:, None] * _ab
+            _cte = float(np.min(np.hypot(_proj[:, 0] - x, _proj[:, 1] - y)))
+        except (IndexError, AttributeError, TypeError, ValueError):
             _cte = float('nan')
+        # Throttled to ~1 Hz: this runs every control tick (e.g. 20 Hz); throttling keeps
+        # the log readable while still surfacing live tracking state. cte is the true
+        # perpendicular cross-track error (see above), not a look-ahead proxy.
         self.get_logger().info(
             f'acc={self.acc_cmd:.3f} delta={np.degrees(self.delta_cmd):.1f}deg '
             f'vel_cmd={self.velocity_cmd:.2f} status={self.solution_status} '
             f't_solve={self.solution_time * 1e3:.1f}ms idx={self.current_idx} '
-            f'cte={_cte:.3f} run={self.run_count}')
+            f'cte={_cte:.3f} run={self.run_count}',
+            throttle_duration_sec=1.0)
 
     # ------------------------------------------------------------------
     # Helpers
