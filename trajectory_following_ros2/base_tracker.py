@@ -485,8 +485,36 @@ class BaseTrajectoryTracker(Node, ABC):
             _, _, yaw = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
             yaw_list.append(yaw + tf_yaw)
 
-        self.path = np.array(coordinate_list)
-        self.des_yaw_list = np.array(yaw_list)
+        new_path = np.array(coordinate_list)
+        new_yaw = np.array(yaw_list)
+
+        # Ignore identical re-delivery of the same path: transient-local/latched
+        # redelivery, or a planner republishing an unchanged plan. Nothing to rebuild.
+        if self.path_received and np.array_equal(new_path, self.path):
+            return
+
+        # A different path arriving after one is already active is a replan
+        # (e.g. Nav2 publishing a fresh /plan). The trajectory's speed/dt columns,
+        # final_goal speed, KD-tree and lap progress are all tied to the previous
+        # path, so force a lazy re-init via _init_trajectory. Drop the
+        # trajectory_initialized flag first so the control timer stops consuming the
+        # old trajectory while we rewrite it, and re-anchor progress to the new start.
+        is_replan = self.path_received
+        if is_replan:
+            self.trajectory_initialized = False
+            # Clear the goal latch so a fresh plan resumes tracking even if the
+            # previous one had already finished (final_goal_reached) or stacked up
+            # solver failures.
+            self.final_goal_reached = False
+            self._consecutive_failures = 0
+            self._reset_lap_progress()
+            if not self.desired_speed_received:
+                # Speed was synthesized from desired_speed for the previous length;
+                # clear it so _init_trajectory re-synthesizes it for the new path.
+                self.speeds = None
+
+        self.path = new_path
+        self.des_yaw_list = new_yaw
         self.path_received = True
         self.final_idx = self.path.shape[0] - 1
         self.final_goal = self.path[self.final_idx, :]
