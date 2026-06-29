@@ -1,0 +1,33 @@
+/**:
+  ros__parameters:
+    # ---------------------------------------------------------------------------
+    # F1/10 platform — vehicle physical params shared across ALL backends.
+    # Overlay on top of config/mpc_parameters.yaml (base). Cost weights + speed
+    # policy + horizon/solver config live in config/weights/f1tenth_<backend>.yaml.
+    # Stack order (highest wins): weights > platform > base.
+    # ---------------------------------------------------------------------------
+    use_sim_time: False
+
+    # 4-Tec 2.0 VXL / F1-10 car
+    wheelbase: 0.256
+    control_rate: 20.0
+
+    # Speed / accel limits
+    max_speed: 1.5
+    min_speed: -1.5
+    max_accel: 3.0
+    max_decel: -3.0
+
+    # Steering limits (deg at the road wheel; converted to rad internally).
+    # NOTE: 27 is a GUESS for the 4-Tec 2.0 VXL — measure real lock-to-lock and
+    # update. max_steer_rate derated from the stock Traxxas 2075 servo.
+    max_steer: 27.0
+    min_steer: -27.0
+    max_steer_rate: 183.346494
+
+    # Tolerances (vehicle-scale)
+    distance_tolerance: 0.2
+    speed_tolerance: 0.5
+
+    saturate_input: True
+    allow_reversing: True

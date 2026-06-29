@@ -16,7 +16,7 @@ from launch import LaunchDescription
 from ament_index_python.packages import get_package_share_directory
 from launch.actions import DeclareLaunchArgument, GroupAction
 from launch.conditions import IfCondition, LaunchConfigurationEquals
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node, PushRosNamespace, SetParametersFromFile, SetParameter
 
 
@@ -97,6 +97,14 @@ def generate_launch_description():
     path_topic = LaunchConfiguration('path_topic', default="trajectory/path")
     speed_topic = LaunchConfiguration('speed_topic', default="trajectory/speed")
 
+    # Per-platform / per-backend overlay config (stacked on top of the base file).
+    # Stack order (highest wins): weights > platform > base mpc_parameters.yaml.
+    # Empty (default) = skip the overlay (legacy single-file behaviour).
+    platform = LaunchConfiguration('platform', default='')
+    weights = LaunchConfiguration('weights', default='')
+    platforms_dir = os.path.join(trajectory_following_ros2_pkg_prefix, 'config', 'platforms')
+    weights_dir = os.path.join(trajectory_following_ros2_pkg_prefix, 'config', 'weights')
+
     # Declare default launch arguments
     config_file_path = os.path.join(trajectory_following_ros2_pkg_prefix, 'config/mpc_parameters.yaml')
     waypoints_csv_path = os.path.join(trajectory_following_ros2_pkg_prefix, 'data/carla_waypoints.csv')
@@ -126,6 +134,19 @@ def generate_launch_description():
             'load_params_from_args',
             default_value=load_params_from_args,
             description='Load params from command line arguments if True. CLIs override YAML.')
+    platform_la = DeclareLaunchArgument(
+            'platform',
+            default_value='',
+            description="Platform overlay name (e.g. 'f1tenth', 'carla') -> "
+                        'config/platforms/<platform>.yaml. Holds vehicle physical params '
+                        '(wheelbase, steer/speed limits, frames, topics). Empty = skip overlay. '
+                        'Applied AFTER individual launch args, so it overrides them.')
+    weights_la = DeclareLaunchArgument(
+            'weights',
+            default_value='',
+            description="Weight overlay name (e.g. 'f1tenth_casadi', 'carla_do_mpc') -> "
+                        'config/weights/<weights>.yaml. Holds Q/R/Rd/Qf + horizon + solver '
+                        'config + speed policy. Empty = skip overlay. Highest precedence.')
     robot_frame_la = DeclareLaunchArgument(
             'robot_frame',
             default_value='base_link',
@@ -477,6 +498,7 @@ def generate_launch_description():
     ld = LaunchDescription(
             [declare_use_sim_time_cmd, use_namespace_la, namespace_la, params_file_la,
              load_params_from_file_la, load_params_from_args_la,
+             platform_la, weights_la,
              robot_frame_la, global_frame_la,
              frequency_la, publish_twist_topic_la, wheelbase_la, ode_type_la,
              discrete_model_type_la, discrete_integration_method_la,
@@ -736,6 +758,16 @@ def generate_launch_description():
                 # SetRemap(src='cmd_vel', dst=twist_topic),
                 # SetRemap(src='fake_obstacles/object_array', dst='fake_obstacles/object_array'),
                 # SetRemap(src='mpc/des_steer', dst='mpc/des_steer'),
+
+                # Per-platform / per-backend overlays (applied LAST so they override the
+                # base file AND the individual launch-arg defaults above).
+                # Stack (highest wins): weights > platform > args > base.
+                SetParametersFromFile(
+                        [platforms_dir, '/', platform, '.yaml'],
+                        condition=IfCondition(PythonExpression(["'", platform, "' != ''"]))),
+                SetParametersFromFile(
+                        [weights_dir, '/', weights, '.yaml'],
+                        condition=IfCondition(PythonExpression(["'", weights, "' != ''"]))),
 
                 # Load nodes
                 waypoint_loader_node,

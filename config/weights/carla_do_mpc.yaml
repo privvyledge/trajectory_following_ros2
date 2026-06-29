@@ -1,0 +1,26 @@
+/**:
+  ros__parameters:
+    # ---------------------------------------------------------------------------
+    # CARLA × do-mpc — the user's known-good "Working DO_MPC" set (pre-refactor).
+    # Overlay (highest wins): weights > platforms/carla.yaml > base.
+    # NOTE: pre-refactor param names may have shifted (scale_cost may be gone) —
+    # verify on first launch. Tune against the NEW recorded CARLA waypoints.
+    # ---------------------------------------------------------------------------
+    horizon: 50
+    sample_time: 0.05
+    prediction_time: 2.5  # sample_time * horizon
+    max_iter: 30
+    termination_condition: 0.0001
+
+    Q:  [1.0, 1.0, 10.0, 0.01]
+    R:  [10.0, 100.0]
+    Rd: [100.0, 1000.0]
+    Qf: [0.002, 0.002, 0.0001, 0.00001]
+    use_bryson_weights: false
+
+    use_speed_profile: True
+    max_lateral_accel: 3.0
+    min_reference_speed: 0.3
+
+    generate_mpc_model: True
+    build_with_cython: True

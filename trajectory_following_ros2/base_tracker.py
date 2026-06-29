@@ -947,6 +947,23 @@ class BaseTrajectoryTracker(Node, ABC):
                     f'(distance_tolerance={self.distance_tolerance:.3f} m). '
                     'The KD-tree will jump to an incorrect index at lap transitions.')
 
+        # Goal tolerance vs path scale: if distance_tolerance is large relative to the
+        # whole path's spatial extent (bounding-box diagonal), the vehicle starts
+        # "within goal tolerance" of the entire path. calc_ref_trajectory then finds no
+        # waypoints ahead, the end_of_path terminator latches final_goal_reached, and the
+        # controller reports "Final goal reached." on tick 1 without ever moving. This is
+        # the classic platform/waypoint scale mismatch (e.g. CARLA's 5 m tolerance on the
+        # F1/10 ~3 m path). See buglog bug-042.
+        xy = self.path[:, :2]
+        extent = float(np.linalg.norm(xy.max(axis=0) - xy.min(axis=0)))
+        if self.distance_tolerance >= extent:
+            self.get_logger().warn(
+                f'distance_tolerance ({self.distance_tolerance:.3f} m) is >= the path extent '
+                f'({extent:.3f} m, bounding-box diagonal): the vehicle is within goal tolerance '
+                'of the entire path from the start, so the controller will report "Final goal '
+                'reached" on the first tick without moving. Check that the platform/waypoint '
+                'scales match (e.g. do not run a CARLA-scale tolerance against an F1/10 path).')
+
     def _update_trajectory_state(self, x, y, vel, psi, omega):
         sc = self.trajectory.state_key_to_column
         tc = self.trajectory.trajectory_key_to_column

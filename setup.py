@@ -9,6 +9,8 @@ data_files = [
     ('share/' + package_name, ['package.xml']),
     # (os.path.join('share', package_name, 'launch'), glob('launch/*.py')),
     (os.path.join('share', package_name, 'config'), glob('config/*.yaml')),
+    (os.path.join('share', package_name, 'config', 'platforms'), glob('config/platforms/*.yaml')),
+    (os.path.join('share', package_name, 'config', 'weights'), glob('config/weights/*.yaml')),
     (os.path.join('share', package_name, 'rviz'), glob('rviz/*.rviz'))
 ]
 

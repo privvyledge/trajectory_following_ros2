@@ -1,0 +1,37 @@
+/**:
+  ros__parameters:
+    # ---------------------------------------------------------------------------
+    # CARLA ego-vehicle platform — physical params shared across ALL backends.
+    # Overlay on top of config/mpc_parameters.yaml (base). Cost weights + speed
+    # policy + horizon/solver config live in config/weights/carla_<backend>.yaml.
+    # Stack order (highest wins): weights > platform > base.
+    # ---------------------------------------------------------------------------
+    use_sim_time: True
+
+    wheelbase: 2.87528
+    control_rate: 20.0
+
+    # Speed / accel limits (max_speed from the working DO_MPC set; accel limits
+    # are a sane guess — refine after calibration).
+    max_speed: 10.5
+    min_speed: -10.5
+    max_accel: 3.0
+    max_decel: -3.0
+
+    # Steering limits (deg). ~70 deg lock for the CARLA ego.
+    max_steer: 70.0
+    min_steer: -70.0
+    max_steer_rate: 360.0
+
+    # Tolerances (vehicle-scale — CARLA car is ~10x the F1/10).
+    distance_tolerance: 5.0
+    speed_tolerance: 5.0
+
+    saturate_input: True
+    allow_reversing: True
+
+    # Frames / topics — CARLA ros-bridge ego. Confirm against `ros2 topic list`.
+    global_frame: map
+    robot_frame: ego_vehicle
+    odom_topic: /carla/ego_vehicle/odometry
+    ackermann_cmd_topic: /drive

@@ -60,6 +60,16 @@ Example:
   ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py mpc_toolbox:=do_mpc # 6e do-mpc
   ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py \
       control_type:=purepursuit mpc_toolbox:=none                                     # 6f Pure Pursuit
+
+  # Per-platform / per-backend weight tuning (config/platforms + config/weights):
+  ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py \
+      platform:=f1tenth weights:=f1tenth_casadi
+  ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py \
+      mpc_toolbox:=do_mpc platform:=carla weights:=carla_do_mpc
+  # Overlay stack (highest wins): sim frames/topics > weights > platform >
+  # launch-arg solver config > base mpc_parameters.yaml. The sim re-applies its own
+  # frames/topics last, so a platform file's odom_topic/global_frame does NOT
+  # repoint the controller off the simulator.
 """
 
 import os
@@ -70,6 +80,22 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import LaunchConfigurationEquals
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+
+
+def _overlay_files(context, platforms_dir, weights_dir):
+    """Resolve platform/weights launch args to overlay YAML paths (skip empties).
+
+    Returns the list in stack order: [platform.yaml?, weights.yaml?]. Empty list
+    when neither is set (legacy single-file behaviour).
+    """
+    platform_name = LaunchConfiguration('platform').perform(context)
+    weights_name = LaunchConfiguration('weights').perform(context)
+    overlays = []
+    if platform_name:
+        overlays.append(os.path.join(platforms_dir, platform_name + '.yaml'))
+    if weights_name:
+        overlays.append(os.path.join(weights_dir, weights_name + '.yaml'))
+    return overlays
 
 
 def generate_launch_description():
@@ -85,6 +111,17 @@ def generate_launch_description():
 
     mpc_toolbox = LaunchConfiguration('mpc_toolbox')
     control_type = LaunchConfiguration('control_type')
+
+    # Per-platform / per-backend overlay config (stacked on top of mpc_parameters.yaml).
+    # Stack order (highest wins): sim frames/topics > weights > platform > launch-arg
+    # solver config > base mpc_parameters.yaml. Frames/topics win last because this is a
+    # sim harness — a platform file (e.g. carla.yaml sets odom_topic=/carla/...) must not
+    # repoint the controller off the simulator's odometry/local + odom/base_link frames.
+    # Empty (default) = skip the overlay (legacy single-file behaviour).
+    platform = LaunchConfiguration('platform')
+    weights = LaunchConfiguration('weights')
+    platforms_dir = os.path.join(pkg_prefix, 'config', 'platforms')
+    weights_dir = os.path.join(pkg_prefix, 'config', 'weights')
 
     ode_type = LaunchConfiguration('ode_type')
     discrete_model_type = LaunchConfiguration('discrete_model_type')
@@ -129,6 +166,19 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'odom_topic', default_value='odometry/local',
             description='Odometry topic the simulator publishes and the controller/viz consume.'),
+        DeclareLaunchArgument(
+            'platform', default_value='',
+            description="Platform overlay name (e.g. 'f1tenth', 'carla') -> "
+                        'config/platforms/<platform>.yaml. Vehicle physical params '
+                        '(wheelbase, steer/speed limits). Empty = skip overlay. NOTE: this '
+                        "sim harness re-applies its own frames/topics on top, so a platform's "
+                        'global_frame/robot_frame/odom_topic do NOT repoint the loop.'),
+        DeclareLaunchArgument(
+            'weights', default_value='',
+            description="Weight overlay name (e.g. 'f1tenth_casadi', 'carla_do_mpc') -> "
+                        'config/weights/<weights>.yaml. Q/R/Rd/Qf + horizon + solver config '
+                        '+ speed policy. Empty = skip overlay. Overrides the launch-arg solver '
+                        'config (solver_type/solver/max_iter/discrete_*) below.'),
         DeclareLaunchArgument(
             'mpc_toolbox', default_value='casadi',
             choices=['acados', 'casadi', 'do_mpc', 'none'],
@@ -299,77 +349,86 @@ def generate_launch_description():
     params_file = os.path.join(pkg_prefix, 'config', 'mpc_parameters.yaml')
 
     # Frame/topic overrides every controller needs (the YAML targets hardware topics).
-    common_controller_params = {
+    # These are applied AFTER the platform/weights overlays so a platform file cannot
+    # repoint the loop off the simulator (see the overlay note at the top). use_sim_time
+    # is forced False: this harness runs on wall clock with no /clock publisher, but
+    # platforms/carla.yaml sets use_sim_time:True (correct only for the real ros-bridge).
+    sim_controller_params = {
         'global_frame': global_frame,
         'robot_frame': robot_frame,
         'odom_topic': odom_topic,
+        'use_sim_time': False,
     }
 
-    casadi_controller_node = Node(
-        condition=LaunchConfigurationEquals('mpc_toolbox', 'casadi'),
-        package='trajectory_following_ros2',
-        executable='coupled_kinematic_casadi',
-        name='kinematic_coupled_casadi_controller',
-        output='screen',
-        parameters=[
-            params_file,
-            {
-                **common_controller_params,
-                'ode_type': ode_type,
-                'discrete_model_type': discrete_model_type,
-                'discrete_integration_method': discrete_integration_method,
-                'use_opti': use_opti,
-                'solver_type': solver_type,
-                'solver': solver,
-                'max_iter': max_iter,
-                'code_gen_directory': code_gen_directory,
-            },
-        ],
-    )
+    # Launch-arg solver/model config, applied BEFORE the overlays so a weights file
+    # (which sets solver_type/solver/max_iter/discrete_*) overrides these defaults.
+    casadi_solver_params = {
+        'ode_type': ode_type,
+        'discrete_model_type': discrete_model_type,
+        'discrete_integration_method': discrete_integration_method,
+        'use_opti': use_opti,
+        'solver_type': solver_type,
+        'solver': solver,
+        'max_iter': max_iter,
+    }
+    acados_solver_params = {
+        'integrator_type': integrator_type,
+        'max_iter': max_iter,
+    }
+    do_mpc_solver_params = {
+        'max_iter': max_iter,
+    }
 
-    acados_controller_node = Node(
-        condition=LaunchConfigurationEquals('mpc_toolbox', 'acados'),
-        package='trajectory_following_ros2',
-        executable='coupled_kinematic_acados',
-        name='kinematic_coupled_acados_controller',
-        output='screen',
-        parameters=[
-            params_file,
-            {
-                **common_controller_params,
-                'integrator_type': integrator_type,
-                'max_iter': max_iter,
-                'code_gen_directory': code_gen_directory,
-            },
-        ],
-    )
+    # Controllers are built inside an OpaqueFunction so the platform/weights overlay
+    # files can be resolved to paths and inserted into each node's `parameters` list
+    # at the right precedence. ROS 2 applies a parameters list left-to-right (later
+    # wins), so the stack is:
+    #   base mpc_parameters.yaml -> launch-arg solver config -> platform.yaml ->
+    #   weights.yaml -> sim frames/topics (+ code_gen_directory).
+    def _make_controller_nodes(context, *_args, **_kwargs):
+        overlays = _overlay_files(context, platforms_dir, weights_dir)
 
-    do_mpc_controller_node = Node(
-        condition=LaunchConfigurationEquals('mpc_toolbox', 'do_mpc'),
-        package='trajectory_following_ros2',
-        executable='coupled_kinematic_do_mpc',
-        name='kinematic_coupled_do_mpc_controller',
-        output='screen',
-        parameters=[
-            params_file,
-            {
-                **common_controller_params,
-                'max_iter': max_iter,
-            },
-        ],
-    )
+        def _params(solver_dict, tail_dict):
+            return [params_file, solver_dict] + overlays + [tail_dict]
 
-    purepursuit_controller_node = Node(
-        condition=LaunchConfigurationEquals('control_type', 'purepursuit'),
-        package='trajectory_following_ros2',
-        executable='purepursuit',
-        name='purepursuit_controller',
-        output='screen',
-        parameters=[
-            params_file,
-            common_controller_params,
-        ],
-    )
+        return [
+            Node(
+                condition=LaunchConfigurationEquals('mpc_toolbox', 'casadi'),
+                package='trajectory_following_ros2',
+                executable='coupled_kinematic_casadi',
+                name='kinematic_coupled_casadi_controller',
+                output='screen',
+                parameters=_params(
+                    casadi_solver_params,
+                    {**sim_controller_params, 'code_gen_directory': code_gen_directory}),
+            ),
+            Node(
+                condition=LaunchConfigurationEquals('mpc_toolbox', 'acados'),
+                package='trajectory_following_ros2',
+                executable='coupled_kinematic_acados',
+                name='kinematic_coupled_acados_controller',
+                output='screen',
+                parameters=_params(
+                    acados_solver_params,
+                    {**sim_controller_params, 'code_gen_directory': code_gen_directory}),
+            ),
+            Node(
+                condition=LaunchConfigurationEquals('mpc_toolbox', 'do_mpc'),
+                package='trajectory_following_ros2',
+                executable='coupled_kinematic_do_mpc',
+                name='kinematic_coupled_do_mpc_controller',
+                output='screen',
+                parameters=_params(do_mpc_solver_params, dict(sim_controller_params)),
+            ),
+            Node(
+                condition=LaunchConfigurationEquals('control_type', 'purepursuit'),
+                package='trajectory_following_ros2',
+                executable='purepursuit',
+                name='purepursuit_controller',
+                output='screen',
+                parameters=_params({}, dict(sim_controller_params)),
+            ),
+        ]
 
     # ---- 5. Visualizer ------------------------------------------------------
     # Built in an OpaqueFunction so vulkan_icd can be resolved to a string and
@@ -401,9 +460,6 @@ def generate_launch_description():
         waypoint_loader_node,
         dompc_simulator_node,
         acados_simulator_node,
-        casadi_controller_node,
-        acados_controller_node,
-        do_mpc_controller_node,
-        purepursuit_controller_node,
+        OpaqueFunction(function=_make_controller_nodes),
         OpaqueFunction(function=_make_visualizer_node),
     ])

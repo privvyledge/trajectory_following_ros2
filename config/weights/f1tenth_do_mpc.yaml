@@ -1,0 +1,26 @@
+/**:
+  ros__parameters:
+    # ---------------------------------------------------------------------------
+    # F1/10 × do-mpc — cost weights + horizon + speed policy.
+    # Overlay (highest wins): weights > platforms/f1tenth.yaml > base.
+    # SEED from the CasADi baseline (Q[50,50,100,8]/Rd[10,10]); RE-TUNE for do-mpc.
+    # ---------------------------------------------------------------------------
+    horizon: 25
+    sample_time: 0.05
+    prediction_time: 1.25
+    max_iter: 200
+    termination_condition: 0.1
+
+    Q:  [50.0, 50.0, 100.0, 8.0]
+    Qf: [100.0, 100.0, 200.0, 40.0]
+    R:  [0.01, 0.01]
+    Rd: [10.0, 10.0]
+    use_bryson_weights: false
+
+    use_speed_profile: True
+    max_lateral_accel: 3.0
+    min_reference_speed: 0.3
+
+    # do-mpc AOT model compile (collocation NLP)
+    generate_mpc_model: True
+    build_with_cython: True

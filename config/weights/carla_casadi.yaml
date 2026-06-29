@@ -1,0 +1,31 @@
+/**:
+  ros__parameters:
+    # ---------------------------------------------------------------------------
+    # CARLA × CasADi — UNTUNED. Seeded from the known-good carla_do_mpc set +
+    # CasADi solver/discrete-model config. Overlay (highest wins):
+    # weights > platforms/carla.yaml > base. RE-TUNE for CasADi.
+    # ---------------------------------------------------------------------------
+    horizon: 50
+    sample_time: 0.05
+    prediction_time: 2.5
+    max_iter: 200          # quad/qrqp outer iters
+    termination_condition: 0.0001
+
+    solver_type: quad
+    solver: qrqp
+    discrete_model_type: nonlinear
+    discrete_integration_method: rk4
+    use_opti: False
+
+    Q:  [1.0, 1.0, 10.0, 0.01]
+    R:  [10.0, 100.0]
+    Rd: [100.0, 1000.0]
+    Qf: [0.002, 0.002, 0.0001, 0.00001]
+    use_bryson_weights: false
+
+    use_speed_profile: True
+    max_lateral_accel: 3.0
+    min_reference_speed: 0.3
+
+    generate_mpc_model: True
+    build_with_cython: True

@@ -1,0 +1,35 @@
+/**:
+  ros__parameters:
+    # ---------------------------------------------------------------------------
+    # F1/10 × CasADi — cost weights + horizon + solver config + speed policy.
+    # Overlay (highest wins): weights > platforms/f1tenth.yaml > base.
+    # Baseline: 6a-rk4 passed with Q[50,50,100,8] / Rd[10,10].
+    # ---------------------------------------------------------------------------
+    horizon: 25
+    sample_time: 0.05
+    prediction_time: 1.25  # sample_time * horizon
+    max_iter: 200          # safe for quad/qrqp (sqpmethod outer iters)
+    termination_condition: 0.1
+
+    # CasADi solver + discrete model form
+    solver_type: quad
+    solver: qrqp
+    discrete_model_type: nonlinear
+    discrete_integration_method: rk4
+    use_opti: False
+
+    # Cost weights
+    Q:  [50.0, 50.0, 100.0, 8.0]
+    Qf: [100.0, 100.0, 200.0, 40.0]
+    R:  [0.01, 0.01]
+    Rd: [10.0, 10.0]
+    use_bryson_weights: false
+
+    # Reference speed / curvature policy
+    use_speed_profile: True
+    max_lateral_accel: 3.0
+    min_reference_speed: 0.3
+
+    # CasADi JIT codegen
+    generate_mpc_model: True
+    build_with_cython: True
