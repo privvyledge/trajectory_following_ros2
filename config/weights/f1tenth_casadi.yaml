@@ -31,5 +31,8 @@
     min_reference_speed: 0.3
 
     # CasADi JIT codegen
+    # Build once, then flip to False to skip the per-launch recompile
+    # (acados C-gen / do_mpc AOT ~min; casadi JIT ~secs). Re-True only if
+    # the model form / horizon / num_obstacles change.
     generate_mpc_model: True
     build_with_cython: True

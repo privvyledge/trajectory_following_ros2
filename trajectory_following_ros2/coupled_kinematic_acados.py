@@ -218,6 +218,15 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         config_path = os.path.join(model_dir, 'kinematic_bicycle_acados_ocp.json')
         os.makedirs(build_path, exist_ok=True)
 
+        if generate:
+            self.get_logger().info(
+                'Generating acados C-code and compiling the OCP solver'
+                + (' (+ Cython wrapper)' if with_cython else '')
+                + ' — first run can take ~30s-2min and the node will appear idle; '
+                'set generate_mpc_model=False to reuse the built model...')
+        else:
+            self.get_logger().info('Loading pre-built acados OCP solver...')
+
         cwd = os.getcwd()
         os.chdir(build_path)
 

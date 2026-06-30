@@ -614,6 +614,9 @@ class BaseTrajectoryTracker(Node, ABC):
 
         if not self.initial_pose_received:
             self.initial_pose_received = True
+            self.get_logger().info(
+                f'First odometry received (x={x:.2f}, y={y:.2f}, v={speed:.2f} m/s); '
+                'solver initializes on the next control tick.')
 
     def acceleration_callback(self, data: AccelWithCovarianceStamped):
         self.initial_accel_received = True
@@ -812,6 +815,10 @@ class BaseTrajectoryTracker(Node, ABC):
         # 13. Update debug state
         self.target_point = self.xref[0, :].tolist()
         self.run_count += 1
+        if self.run_count == 1:
+            self.get_logger().info(
+                f'First control solve complete (solve_time={result.solve_time * 1e3:.1f} ms, '
+                f'optimal={result.is_optimal}); controller is live.')
         self.update_queue(self.goal_queue, self.target_point[0:2])
         self.update_queue(self.mpc_reference_states_queue, self.xref.copy())
         self.update_queue(self.mpc_predicted_states_queue, self.mpc_predicted_states.copy())

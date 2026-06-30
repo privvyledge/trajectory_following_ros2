@@ -105,6 +105,15 @@ class KinematicCoupledDoMpc(BaseTrajectoryTracker):
         compile_model = self.get_parameter('generate_mpc_model').value
         model_type = 'continuous' if 'continuous' in ode_type else 'discrete'
 
+        if compile_model:
+            self.get_logger().info(
+                f'Building do_mpc OCP (model_type={model_type}) and AOT-compiling the '
+                'collocation NLP via gcc — first run can take ~1-3 min and the node will '
+                'appear idle; set generate_mpc_model=False to reuse the compiled model...')
+        else:
+            self.get_logger().info(
+                f'Building do_mpc OCP (model_type={model_type}) (no compile)...')
+
         _, controller, _ = initialize_mpc_problem(
             reference_path=None,
             horizon=self.horizon,

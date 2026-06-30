@@ -291,6 +291,11 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
             slack_objective_is_quadratic=slack_quad,
         )
 
+        self.get_logger().info(
+            f'Building CasADi NLP (ode={ode_type}, solver_type={solver_type}, '
+            f'solver={solver}); generated C may JIT-compile on first solve '
+            '(a few seconds, then cached)...')
+
         if use_opti:
             controller = KinematicMPCCasadiOpti(**common_kwargs)
         elif model_type == 'continuous':
