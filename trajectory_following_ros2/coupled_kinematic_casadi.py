@@ -34,6 +34,9 @@ _VALID_SOLVER_COMBOS = {
     ('quad', 'osqp'),
     ('quad', 'qpoases'),
     ('quad', 'ipopt'),
+    ('qp', 'qrqp'),
+    ('qp', 'osqp'),
+    ('qp', 'qpoases'),
 }
 
 
@@ -42,7 +45,7 @@ class CasAdiSolverAdapter(BaseSolver):
 
     def __init__(self, controller, use_opti: bool = False,
                  num_obstacles: int = 0, n_obstacle_states: int = 3,
-                 solver: str = 'ipopt'):
+                 solver: str = 'ipopt', vel_bound: Optional[tuple] = None):
         self._controller = controller
         self._use_opti = use_opti
         self._warmstart = {}
@@ -50,6 +53,10 @@ class CasAdiSolverAdapter(BaseSolver):
         self._obstacle_states: Optional[np.ndarray] = None
         self._n_obs_states = n_obstacle_states
         self._solver_name = solver
+        if vel_bound is not None:
+            self._v_min, self._v_max = vel_bound
+        else:
+            self._v_min, self._v_max = -np.inf, np.inf
 
     def initialize(self, x0: np.ndarray) -> None:
         pass  # CasADi is ready after construction
@@ -65,6 +72,25 @@ class CasAdiSolverAdapter(BaseSolver):
     def solve(self, x0: np.ndarray, xref: np.ndarray,
               u_prev: np.ndarray) -> SolverResult:
         # xref: (4, N+1); u_prev: (2,)
+        x0 = np.array(x0, dtype=float).copy()
+        if hasattr(self, '_v_min') and hasattr(self, '_v_max'):
+            x0[2] = np.clip(x0[2], self._v_min, self._v_max)
+
+        if not self._use_opti and not self._warmstart:
+            n = getattr(self._controller, 'horizon', xref.shape[1] - 1)
+            self._warmstart = {
+                'z_ws': np.asarray(xref, dtype=float).copy(),
+                'u_ws': np.tile(np.asarray(u_prev, dtype=float).reshape(2, 1), (1, n)),
+                'sl_ws': None, 'sl_obs_ws': None,
+                'lam_x': None, 'lam_g': None, 'lam_p': None,
+            }
+
+        if not self._use_opti and self._warmstart and 'z_ws' in self._warmstart and self._warmstart['z_ws'] is not None:
+            psi_ws = self._warmstart['z_ws'][3, 0]
+            shift = 2.0 * np.pi * np.round((x0[3] - psi_ws) / (2.0 * np.pi))
+            if shift != 0.0:
+                self._warmstart['z_ws'][3, :] += shift
+
         state = x0.tolist()
         ref_traj = [xref[0, :], xref[1, :], xref[2, :], xref[3, :]]
         prev_input = [float(u_prev[0]), float(u_prev[1])]
@@ -209,6 +235,10 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
         self.declare_parameter('normalize_yaw_error', True)
         self.declare_parameter('solver_type', 'quad')
         self.declare_parameter('solver', 'qrqp')
+        self.declare_parameter('sqp_convexify_strategy', 'regularize')
+        self.declare_parameter('sqp_hessian_approximation', 'exact')
+        self.declare_parameter('qp_inner_max_iter', 0)
+        self.declare_parameter('suppress_solver_output', True)
         self.declare_parameter('slack_weights_input_rate', [1.0, 1.0])
         self.declare_parameter('slack_scale_input_rate', [1.0, 1.0])
         self.declare_parameter('slack_upper_bound_input_rate', [1e9, 1e9])
@@ -224,6 +254,16 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
         normalize_yaw_error = self.get_parameter('normalize_yaw_error').value
         solver_type = self.get_parameter('solver_type').value
         solver = self.get_parameter('solver').value
+        sqp_convexify_strategy = self.get_parameter('sqp_convexify_strategy').value
+        sqp_hessian_approximation = self.get_parameter('sqp_hessian_approximation').value
+        qp_inner_max_iter = int(self.get_parameter('qp_inner_max_iter').value)
+        suppress_solver_output = self.get_parameter('suppress_solver_output').value
+
+        if solver_type == 'qp' and normalize_yaw_error:
+            self.get_logger().warn(
+                "solver_type='qp' requires normalize_yaw_error=False because atan2 wrapping breaks "
+                "the quadratic cost requirement of casadi.qpsol. Overriding normalize_yaw_error to False.")
+            normalize_yaw_error = False
 
         _is_ipopt = (solver_type == 'nlp' and solver == 'ipopt') or \
                     (solver_type == 'quad' and solver == 'ipopt')
@@ -261,10 +301,22 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
                 f"Unsupported solver combination (solver_type='{solver_type}', "
                 f"solver='{solver}') for ode_type='{ode_type}'. Supported combinations:\n"
                 f"{matrix}\nAll 'quad' paths require Rd > 0.")
-        # 'quad' (SQP/QP) paths need a non-zero input-rate penalty Rd to stay feasible.
-        if not use_opti and solver_type == 'quad' and not np.any(self.Rd.diagonal() > 0):
+        if solver_type == 'qp':
+            if use_opti or discrete_model_type != 'ltv' or 'discrete' not in ode_type or num_obstacles > 0:
+                raise ValueError(
+                    f"solver_type='qp' requires discrete_model_type='ltv', a discrete ode_type, "
+                    f"num_obstacles=0, and use_opti=False. Got ode_type='{ode_type}', "
+                    f"discrete_model_type='{discrete_model_type}', num_obstacles={num_obstacles}, "
+                    f"use_opti={use_opti}.")
+        if discrete_model_type == 'ltv' and num_obstacles > 0:
+            raise ValueError(
+                f"discrete_model_type='ltv' does not support obstacle avoidance "
+                f"(num_obstacles={num_obstacles} > 0). Set discrete_model_type='nonlinear' "
+                f"or num_obstacles=0.")
+        # 'quad' / 'qp' (SQP/QP) paths need a non-zero input-rate penalty Rd to stay feasible.
+        if not use_opti and solver_type in ('quad', 'qp') and not np.any(self.Rd.diagonal() > 0):
             self.get_logger().warn(
-                f"solver_type='quad' (solver='{solver}') needs Rd > 0 for the input-rate "
+                f"solver_type='{solver_type}' (solver='{solver}') needs Rd > 0 for the input-rate "
                 f"slack to keep the QP feasible/convex, but Rd is all zeros. Expect "
                 f"infeasible/suboptimal solves; set a non-zero Rd.")
 
@@ -282,7 +334,10 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
             jerk_bound=(self.MIN_JERK, self.MAX_JERK),
             delta_rate_bound=(-self.MAX_STEER_RATE, self.MAX_STEER_RATE),
             solver_type=solver_type, solver=solver,
-            suppress_ipopt_output=True,
+            suppress_solver_output=suppress_solver_output,
+            sqp_convexify_strategy=sqp_convexify_strategy,
+            sqp_hessian_approximation=sqp_hessian_approximation,
+            qp_inner_max_iter=qp_inner_max_iter,
             max_iter=max_iter,
             normalize_yaw_error=normalize_yaw_error,
             slack_weights_u_rate=slack_weights,
@@ -332,7 +387,8 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
             controller, use_opti=use_opti,
             num_obstacles=num_obstacles,
             n_obstacle_states=3,
-            solver=solver)
+            solver=solver,
+            vel_bound=(self.MIN_SPEED, self.MAX_SPEED))
 
     def _control_timer_callback(self):
         """Update obstacle states before each solve, then delegate to base."""

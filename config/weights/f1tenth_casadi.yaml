@@ -8,15 +8,38 @@
     horizon: 25
     sample_time: 0.05
     prediction_time: 1.25  # sample_time * horizon
-    max_iter: 200          # safe for quad/qrqp (sqpmethod outer iters)
+    # max_iter = sqpmethod outer iterations for solver_type=quad; unused by the
+    # direct-QP path (bound the QP itself via qp_inner_max_iter if > 0).
+    max_iter: 200
     termination_condition: 0.1
 
-    # CasADi solver + discrete model form
+    # CasADi solver + discrete model form.
+    # ACTIVE (default): sqpmethod on the full nonlinear model. Verified
+    # 2026-07-02: full loop, 14 ms median / 20.5 ms p95, zero failures, goal
+    # reached. Chosen as default because it carries obstacle-avoidance
+    # constraints (a pure QP cannot, until constraint linearization is
+    # implemented) and is the most battle-tested path.
     solver_type: quad
     solver: qrqp
     discrete_model_type: nonlinear
     discrete_integration_method: rk4
-    use_opti: False
+    # Quadratic u-rate slack cost: REQUIRED for the direct-QP path below (a
+    # LINEAR slack cost leaves zero rows in the QP Hessian; raw qrqp on that
+    # singular H can report success with the steering box violated, fail
+    # sporadically, and run ~7x slower). Also helps sqpmethod: the same zero
+    # Hessian rows forced its convexify regularization to fire every iteration.
+    slack_objective_is_quadratic: True
+    # Fast no-obstacle alternative (direct LTV-QP, one qpsol QP per tick;
+    # verified 2026-07-02: full loop, 0.4-2.9 ms solves, zero failures):
+    # solver_type: qp
+    # solver: qrqp
+    # discrete_model_type: ltv
+    # discrete_integration_method: euler  # ignored by ltv (Jacobian form)
+    # use_opti is a formulation selector, not a weight — do NOT pin it here.
+    # closed_loop_sim.launch.py applies `use_opti` after this overlay so the
+    # `use_opti:=true|false` launch arg (default false) is authoritative; pinning
+    # it here would silently override the CLI. Set it via the launch arg instead.
+    # use_opti: False
 
     # Cost weights
     Q:  [50.0, 50.0, 100.0, 8.0]

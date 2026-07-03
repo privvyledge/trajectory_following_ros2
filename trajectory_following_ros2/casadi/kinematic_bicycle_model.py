@@ -361,22 +361,27 @@ class KinematicBicycleModel(object):
                     f"(Taylor) discretization; discrete_integration_method="
                     f"'{self.discrete_integration_method}' is ignored. Use "
                     f"discrete_model_type='nonlinear' for higher-order schemes.")
+            z_op = symbol_type.sym('z_op', z.shape[0])
+            u_op = symbol_type.sym('u_op', u.shape[0])
+            psi_op = z_op[3]
+            vel_op = z_op[2]
+            delta_op = u_op[1]
             A = casadi.blockcat([
-                [1, 0, casadi.cos(psi) * dt, -vel * casadi.sin(psi) * dt],
-                [0, 1, casadi.sin(psi) * dt, vel * casadi.cos(psi) * dt],
+                [1, 0, casadi.cos(psi_op) * dt, -vel_op * casadi.sin(psi_op) * dt],
+                [0, 1, casadi.sin(psi_op) * dt, vel_op * casadi.cos(psi_op) * dt],
                 [0, 0, 1, 0],
-                [0, 0, dt * casadi.tan(delta) / wheelbase, 1],
+                [0, 0, dt * casadi.tan(delta_op) / wheelbase, 1],
             ])
             B = casadi.blockcat([
                 [0, 0],
                 [0, 0],
                 [dt, 0],
-                [0, dt * vel / (wheelbase * casadi.cos(delta) ** 2)],
+                [0, dt * vel_op / (wheelbase * casadi.cos(delta_op) ** 2)],
             ])
-            G = casadi.vertcat(vel * casadi.sin(psi) * psi * dt,
-                               -vel * casadi.cos(psi) * psi * dt,
+            G = casadi.vertcat(vel_op * casadi.sin(psi_op) * psi_op * dt,
+                               -vel_op * casadi.cos(psi_op) * psi_op * dt,
                                0,
-                               -(vel * delta) * dt / (wheelbase * casadi.cos(delta) ** 2))
+                               -(vel_op * delta_op) * dt / (wheelbase * casadi.cos(delta_op) ** 2))
             f_expl = A @ z + B @ u + G
         elif model_type == 'nonlinear':
             # The MPC NLP is SX-expanded at solve setup, which requires the
@@ -465,6 +470,9 @@ class KinematicBicycleModel(object):
         params.wheelbase = wheelbase
         # params.mass = 0.2
         params.dt = dt
+        if model_type == 'ltv':
+            params.z_op = z_op
+            params.u_op = u_op
 
         model.f_impl_expr = z_dot - f_expl
         model.f_expl_expr = f_expl
@@ -483,9 +491,13 @@ class KinematicBicycleModel(object):
         ode = casadi.substitute(ode, casadi.vertcat(*symbols), casadi.vertcat(*values))
         return ode
 
-    def create_ode_function(self, ode, x, u, function_name='ode'):
-        ode_function = casadi.Function(function_name, [x, u], [ode],
-                                       ['x', 'u'], ['ode'])
+    def create_ode_function(self, ode, x, u, p_op=None, function_name='ode'):
+        if p_op is not None:
+            ode_function = casadi.Function(function_name, [x, u, p_op], [ode],
+                                           ['x', 'u', 'p_op'], ['ode'])
+        else:
+            ode_function = casadi.Function(function_name, [x, u], [ode],
+                                           ['x', 'u'], ['ode'])
         return ode_function
 
     def setup_linearizer(self, ode, y_meas=None, x=None, u=None, xss=None, uss=None, wheelbase=None, method='jac'):

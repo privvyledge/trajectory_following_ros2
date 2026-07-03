@@ -27,7 +27,9 @@ class KinematicMPCBase(ABC):
                  delta_rate_bound=(-np.radians(352.9411764706), np.radians(352.9411764706)),
                  symbol_type='MX', warmstart=True,
                  solver_options=None, solver_type='nlp', solver='ipopt',
-                 suppress_ipopt_output=True, max_iter=2000, normalize_yaw_error=True,
+                 suppress_ipopt_output=None, suppress_solver_output=True,
+                 sqp_convexify_strategy='regularize', sqp_hessian_approximation='exact',
+                 qp_inner_max_iter=0, max_iter=2000, normalize_yaw_error=True,
                  slack_weights_u_rate=(1e-6, 1e-6),
                  slack_scale_u_rate=(1.0, 1.0),
                  slack_upper_bound_u_rate=None,
@@ -76,6 +78,10 @@ class KinematicMPCBase(ABC):
         self.code_gen_mode = code_gen_mode
         self.max_iter = max_iter
         self.normalize_yaw_error = normalize_yaw_error
+        self.sqp_convexify_strategy = sqp_convexify_strategy
+        self.sqp_hessian_approximation = sqp_hessian_approximation
+        self.qp_inner_max_iter = qp_inner_max_iter
+        self.suppress_solver_output = suppress_solver_output if suppress_ipopt_output is None else suppress_ipopt_output
 
         self.Ts = sample_time
         self.T_predict = self.Ts * self.horizon
@@ -90,6 +96,8 @@ class KinematicMPCBase(ABC):
             self.symbol_type = casadi.SX
         else:
             self.symbol_type = casadi.MX
+
+        self.discrete_model_type = getattr(self, 'discrete_model_type', 'nonlinear')
 
         # --- Subclass builds vehicle model, sets self.vehicle / self.model / self.ode / self.ode_function ---
         self._build_vehicle_model(vehicle, nx, nu, x0,
@@ -117,6 +125,12 @@ class KinematicMPCBase(ABC):
         self.psi_dv = None
         self.z_dv = np.zeros((self.nx, self.horizon + 1))
         self.z_dv_value = np.zeros((self.nx, self.horizon + 1))
+        if self.discrete_model_type == 'ltv':
+            self._z_op = np.zeros((self.nx, self.horizon + 1))
+            self._u_op = np.zeros((self.nu, self.horizon))
+        else:
+            self._z_op = None
+            self._u_op = None
         self.z_pred_dv = None
         self.z_pred_value = None
 
@@ -231,15 +245,19 @@ class KinematicMPCBase(ABC):
         open_loop_trajectory = np.zeros((self.nx, self.horizon + 1))
         open_loop_trajectory[:, 0] = x0
         for k in range(self.horizon):
-            delta, acc = self.u_prev_value.flatten().tolist()
-            x0_ = self.ode_function(open_loop_trajectory[:, k], [delta, acc])
+            acc, delta = self.u_prev_value.flatten().tolist()
+            if self.discrete_model_type == 'ltv':
+                p_op_k = casadi.vertcat(open_loop_trajectory[:, k], [acc, delta])
+                x0_ = self.ode_function(open_loop_trajectory[:, k], [acc, delta], p_op_k)
+            else:
+                x0_ = self.ode_function(open_loop_trajectory[:, k], [acc, delta])
             open_loop_trajectory[:, k + 1] = x0_.full()[:, 0]
         self.update_reference(*open_loop_trajectory.tolist())
 
         self.solver, self.opt_variables, \
             self.opt_params, self.opt_constraints = self.setup_solver(
                 cost=self.objective, constraints=self.constraints,
-                suppress_output=suppress_ipopt_output,
+                suppress_output=self.suppress_solver_output,
                 solver_options=self.solver_options,
                 solver=solver, solver_type=solver_type)
 
@@ -263,6 +281,12 @@ class KinematicMPCBase(ABC):
         self.u_ref = self.symbol_type.sym('u_ref', nu, horizon)
         self.z_dv = self.symbol_type.sym('z_dv', nx, horizon + 1)
         self.u_dv = self.symbol_type.sym('u_dv', nu, horizon)
+        if self.discrete_model_type == 'ltv':
+            self.z_op_dv = self.symbol_type.sym('z_op_dv', nx, horizon + 1)
+            self.u_op_dv = self.symbol_type.sym('u_op_dv', nu, horizon)
+        else:
+            self.z_op_dv = None
+            self.u_op_dv = None
         self.u_rate_dv = None
         if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
             self.sl_dv = self.symbol_type.sym('sl_dv', nu, horizon)
@@ -321,26 +345,25 @@ class KinematicMPCBase(ABC):
             else:
                 cost += self._quad_form(self.z_dv[:, k] - self.z_ref[:, k], self.Q)
 
-            if k < (self.horizon - 1):
-                cost += self._quad_form(self.u_dv[:, k], self.R)
-                cost += self._quad_form(self.u_dv[:, k] - u_prev, self.Rd)
-                u_prev = self.u_dv[:, k]
+            cost += self._quad_form(self.u_dv[:, k], self.R)
+            cost += self._quad_form(self.u_dv[:, k] - u_prev, self.Rd)
+            u_prev = self.u_dv[:, k]
 
-                if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
-                    if self.slack_objective_is_quadratic:
-                        cost += self._quad_form(self.sl_dv[:, k], self.P_u_rate)
-                    else:
-                        cost += casadi.mtimes(casadi.diag(self.P_u_rate).T, self.sl_dv[:, k])
+            if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
+                if self.slack_objective_is_quadratic:
+                    cost += self._quad_form(self.sl_dv[:, k], self.P_u_rate)
+                else:
+                    cost += casadi.mtimes(casadi.diag(self.P_u_rate).T, self.sl_dv[:, k])
 
-                if (self.n_obstacles > 0
-                        and not casadi.is_equal(
-                            self.P_obstacle_avoidance,
-                            casadi.DM.zeros(self.n_obstacles, self.n_obstacles))):
-                    if self.slack_objective_is_quadratic:
-                        cost += self._quad_form(self.sl_obs_dv[:, k], self.P_obstacle_avoidance)
-                    else:
-                        cost += casadi.mtimes(
-                            casadi.diag(self.P_obstacle_avoidance).T, self.sl_obs_dv[:, k])
+            if (self.n_obstacles > 0
+                    and not casadi.is_equal(
+                        self.P_obstacle_avoidance,
+                        casadi.DM.zeros(self.n_obstacles, self.n_obstacles))):
+                if self.slack_objective_is_quadratic:
+                    cost += self._quad_form(self.sl_obs_dv[:, k], self.P_obstacle_avoidance)
+                else:
+                    cost += casadi.mtimes(
+                        casadi.diag(self.P_obstacle_avoidance).T, self.sl_obs_dv[:, k])
 
         if self.normalize_yaw_error:
             cost += self._quad_form(
@@ -402,12 +425,12 @@ class KinematicMPCBase(ABC):
         self.ego_radius_value = self.ego_radius_func(ego_radius).full().item()
 
     def update(self, state=None, ref_traj=None, previous_input=None,
-               warmstart_variables=None):
+               warmstart_variables=None, z_op=None, u_op=None):
         self.update_initial_condition(*state)
         self.update_reference(*ref_traj)
         self.update_previous_input(*previous_input)
 
-        if self.warmstart and len(warmstart_variables) > 0:
+        if self.warmstart and warmstart_variables is not None and len(warmstart_variables) > 0:
             self.z_dv_value = warmstart_variables['z_ws']
             self.u_dv_value = warmstart_variables['u_ws']
             if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
@@ -422,6 +445,14 @@ class KinematicMPCBase(ABC):
             self.lam_x_value = warmstart_variables['lam_x']
             self.lam_g_value = warmstart_variables['lam_g']
             self.lam_p_value = warmstart_variables['lam_p']
+
+        if self.discrete_model_type == 'ltv':
+            if z_op is not None and u_op is not None:
+                self._z_op = z_op
+                self._u_op = u_op
+            else:
+                self._z_op = np.copy(self.z_dv_value)
+                self._u_op = np.copy(self.u_dv_value)
 
     def set_weights(self, Q, R, Rd, Qf):
         def _to_flat(w):
