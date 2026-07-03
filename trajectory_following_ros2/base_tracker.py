@@ -488,6 +488,22 @@ class BaseTrajectoryTracker(Node, ABC):
         new_path = np.array(coordinate_list)
         new_yaw = np.array(yaw_list)
 
+        if new_path.shape[0] < 2:
+            self.get_logger().warn(
+                f'path_callback: received path with {new_path.shape[0]} pose(s) '
+                '— need ≥ 2 for curvature; ignoring.')
+            return
+
+        # Reject malformed paths (NaN/inf coordinates or yaw) at ingestion rather than
+        # letting them propagate: a non-finite path otherwise crashes downstream at the
+        # curvature filter, the speed/dt timing, or the KD-tree build. Drop it with a
+        # warning and retain the previously latched path.
+        if not (np.all(np.isfinite(new_path)) and np.all(np.isfinite(new_yaw))):
+            self.get_logger().warn(
+                'path_callback: received a path with non-finite (NaN/inf) coordinates; '
+                'ignoring and retaining the previous path.')
+            return
+
         # Ignore identical re-delivery of the same path: transient-local/latched
         # redelivery, or a planner republishing an unchanged plan. Nothing to rebuild.
         if self.path_received and np.array_equal(new_path, self.path):
@@ -626,6 +642,8 @@ class BaseTrajectoryTracker(Node, ABC):
         with self.mutex:
             self.u_prev[0, 0] = msg.drive.acceleration
             self.u_prev[1, 0] = msg.drive.steering_angle
+            if not self._u_prev_from_echo:
+                self.get_logger().info('u_prev warm-start: sourcing from drive echo.')
             self._u_prev_from_echo = True
 
     def _snapshot_state(self):
@@ -913,13 +931,17 @@ class BaseTrajectoryTracker(Node, ABC):
 
     def _init_trajectory(self):
         tc = self.trajectory.trajectory_key_to_column
-        if self.speeds is None:
-            # No speed topic received — synthesize a constant-speed profile from desired_speed.
+        if self.speeds is None or len(self.speeds) != len(self.path):
+            # No speed topic received, or the speeds are stale from a previous path of a
+            # different length (e.g. a replan on the latched /trajectory/path topic whose
+            # matching speed message was not re-published) — synthesize a constant-speed
+            # profile from desired_speed sized to the current path so the assignment below
+            # cannot raise a broadcast-shape error.
             v = max(abs(self.desired_speed), 0.1)
             self.speeds = np.full(len(self.path), v)
             self.get_logger().info(
-                f'No speed topic received; using constant desired_speed={v:.2f} m/s '
-                'for trajectory timing.')
+                f'No matching speed profile for the current path ({len(self.path)} pts); '
+                f'using constant desired_speed={v:.2f} m/s for trajectory timing.')
         relative_times, relative_dts = trajectory_utils.calc_path_relative_time(
             self.path, self.speeds, min_dt=1.0)
 

@@ -385,13 +385,21 @@ def calculate_curvature_all(cdists, psis, smooth=True):
     diff_dists = np.diff(cdists)
     diff_psis = np.diff(np.unwrap(psis))
 
-    assert np.max(np.abs(diff_psis)) < np.pi, "Detected a jump in the angle difference."
-
+    # A heading jump > pi surviving unwrap, or NaN/inf yaw (degenerate/replanned path),
+    # used to trip a bare assert here and crash the controller in path_callback. Treat it
+    # as bad data instead: sanitize to zero curvature so the downstream solver degrades to
+    # a suboptimal solve (handled by the consecutive-failure safety) rather than killing
+    # the node.
     curv_raw = diff_psis / np.maximum(diff_dists, 0.1)  # use diff_dists where greater than 10 cm
     curv_raw = np.insert(curv_raw, len(curv_raw), curv_raw[-1])  # curvature at last waypoint
+    curv_raw = np.nan_to_num(curv_raw, nan=0.0, posinf=0.0, neginf=0.0)
 
     # Curvature Filtering
-    if smooth:
+    # filtfilt requires len(x) > padlen, where padlen defaults to 3*max(len(a), len(b))
+    # = 3*11 = 33 for this 11-tap moving-average filter. Short paths (a Nav2 replan, or a
+    # stub/degenerate path) would otherwise raise ValueError and crash the controller, so
+    # skip smoothing when the signal is too short to pad.
+    if smooth and len(curv_raw) > 33:
         curv_filt = filtfilt(np.ones((11,)) / 11, 1, curv_raw)
         return curv_filt
     return curv_raw

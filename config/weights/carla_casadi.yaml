@@ -15,7 +15,11 @@
     solver: qrqp
     discrete_model_type: nonlinear
     discrete_integration_method: rk4
-    use_opti: False
+    # use_opti is a formulation selector, not a weight — do NOT pin it here.
+    # closed_loop_sim.launch.py applies `use_opti` after this overlay so the
+    # `use_opti:=true|false` launch arg (default false) is authoritative; pinning
+    # it here would silently override the CLI. Set it via the launch arg instead.
+    # use_opti: False
 
     Q:  [1.0, 1.0, 10.0, 0.01]
     R:  [10.0, 100.0]

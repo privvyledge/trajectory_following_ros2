@@ -47,7 +47,9 @@ Example:
   ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py \
       discrete_model_type:=nonlinear discrete_integration_method:=euler
   ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py \
-      discrete_model_type:=ltv   # collapses to nonlinear+euler (Jacobian at decision vars)
+      discrete_model_type:=ltv   # true LTV since 2026-07-02: A/B/G at per-stage z_op/u_op
+                                 # (shifted warm start); pairs with solver_type:=qp for a
+                                 # direct one-QP-per-tick qpsol path (no obstacles/opti)
 
   # Verify JIT artifacts land in code_gen_directory, not the launch cwd.
   ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py code_gen_directory:=/tmp/cg
@@ -131,6 +133,8 @@ def generate_launch_description():
     solver = LaunchConfiguration('solver')
     max_iter = LaunchConfiguration('max_iter')
     integrator_type = LaunchConfiguration('integrator_type')
+    stage_cost_type = LaunchConfiguration('stage_cost_type')
+    terminal_cost_type = LaunchConfiguration('terminal_cost_type')
     code_gen_directory = LaunchConfiguration('code_gen_directory')
 
     viz_backend = LaunchConfiguration('viz_backend')
@@ -218,6 +222,15 @@ def generate_launch_description():
             'integrator_type', default_value='ERK',
             description='acados only: OCP integrator. ERK (default) | DISCRETE. '
                         'Changing it regenerates the acados C-code.'),
+        DeclareLaunchArgument(
+            'stage_cost_type', default_value='NONLINEAR_LS',
+            description='acados only: stage cost module. NONLINEAR_LS (default) | LINEAR_LS | '
+                        'EXTERNAL. Only EXTERNAL carries the Rd input-rate penalty (LS costs '
+                        'silently drop it); EXTERNAL is also required for obstacle/CBF constraints.'),
+        DeclareLaunchArgument(
+            'terminal_cost_type', default_value='NONLINEAR_LS',
+            description='acados only: terminal cost module. NONLINEAR_LS (default) | LINEAR_LS | '
+                        'EXTERNAL. Set to EXTERNAL alongside stage_cost_type for the Rd penalty.'),
         DeclareLaunchArgument(
             'code_gen_directory',
             default_value=os.path.join(pkg_prefix, 'data', 'casadi_codegen'),
@@ -366,13 +379,19 @@ def generate_launch_description():
         'ode_type': ode_type,
         'discrete_model_type': discrete_model_type,
         'discrete_integration_method': discrete_integration_method,
-        'use_opti': use_opti,
         'solver_type': solver_type,
         'solver': solver,
         'max_iter': max_iter,
     }
+    # `use_opti` is a FORMULATION selector, not a weight, so it is applied in the
+    # tail_dict (AFTER the platform/weights overlays) — an explicit `use_opti:=...`
+    # launch arg must win. (The other solver knobs above stay before the overlays
+    # so a per-backend weights file can still tune solver_type/solver/max_iter/
+    # discrete_* on purpose.)
     acados_solver_params = {
         'integrator_type': integrator_type,
+        'stage_cost_type': stage_cost_type,
+        'terminal_cost_type': terminal_cost_type,
         'max_iter': max_iter,
     }
     do_mpc_solver_params = {
@@ -400,7 +419,8 @@ def generate_launch_description():
                 output='screen',
                 parameters=_params(
                     casadi_solver_params,
-                    {**sim_controller_params, 'code_gen_directory': code_gen_directory}),
+                    {**sim_controller_params, 'code_gen_directory': code_gen_directory,
+                     'use_opti': use_opti}),
             ),
             Node(
                 condition=LaunchConfigurationEquals('mpc_toolbox', 'acados'),

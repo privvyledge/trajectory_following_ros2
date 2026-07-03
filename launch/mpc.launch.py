@@ -45,6 +45,7 @@ def generate_launch_description():
     publish_twist_topic = LaunchConfiguration('publish_twist_topic')
     wheelbase = LaunchConfiguration('wheelbase')
     ode_type = LaunchConfiguration('ode_type')
+    use_opti = LaunchConfiguration('use_opti')
     discrete_model_type = LaunchConfiguration('discrete_model_type')
     discrete_integration_method = LaunchConfiguration('discrete_integration_method')
     load_waypoints = LaunchConfiguration('load_waypoints')
@@ -213,6 +214,14 @@ def generate_launch_description():
                         '   discrete_kinematic_coupled, discrete_kinematic_coupled_augmented, '
                         '   discrete_dynamic_decoupled '
                         'Options: continuous/discrete, kinematic/dynamic, coupled/decoupled, augmented.'
+    )
+    use_opti_la = DeclareLaunchArgument(
+            'use_opti',
+            default_value='False',
+            description='CasADi only: use the Opti-stack formulation (KinematicMPCCasadiOpti) '
+                        'instead of the function-based NLP. Restart-only. Applied AFTER the '
+                        'platform/weights overlays so the launch arg is authoritative (it is a '
+                        'formulation selector, not a weight).'
     )
     discrete_model_type_la = DeclareLaunchArgument(
             'discrete_model_type',
@@ -501,6 +510,7 @@ def generate_launch_description():
              platform_la, weights_la,
              robot_frame_la, global_frame_la,
              frequency_la, publish_twist_topic_la, wheelbase_la, ode_type_la,
+             use_opti_la,
              discrete_model_type_la, discrete_integration_method_la,
              load_waypoints_la, waypoints_csv_la,
              saturate_input_la, allow_reversing_la, max_speed_la, min_speed_la, max_accel_la, max_decel_la,
@@ -688,7 +698,8 @@ def generate_launch_description():
                 SetParameter(name='horizon', value=horizon, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='sample_time', value=sample_time, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='prediction_time', value=prediction_time, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='use_opti', value=False, condition=IfCondition(load_params_from_args)),
+                # NOTE: use_opti is set AFTER the overlays (see below) so the launch arg wins;
+                # it is a formulation selector, not a weight, and must not be overridable here.
                 SetParameter(name='solver_type', value='quad', condition=IfCondition(load_params_from_args)),
                 SetParameter(name='solver', value='qrqp', condition=IfCondition(load_params_from_args)),
                 SetParameter(name='normalize_yaw_error', value=True, condition=IfCondition(load_params_from_args)),
@@ -768,6 +779,10 @@ def generate_launch_description():
                 SetParametersFromFile(
                         [weights_dir, '/', weights, '.yaml'],
                         condition=IfCondition(PythonExpression(["'", weights, "' != ''"]))),
+
+                # Formulation selector applied LAST so the `use_opti:=...` launch arg is
+                # authoritative over any overlay (mirrors closed_loop_sim.launch.py).
+                SetParameter(name='use_opti', value=use_opti, condition=IfCondition(load_params_from_args)),
 
                 # Load nodes
                 waypoint_loader_node,
