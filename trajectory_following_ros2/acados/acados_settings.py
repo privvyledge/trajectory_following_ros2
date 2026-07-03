@@ -31,6 +31,7 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
                     cost_module='external', cost_module_e='external',
                     qp_solver='PARTIAL_CONDENSING_HPIPM',
                     nlp_solver_type='SQP_RTI',
+                    integrator_type='ERK',
                     qp_solver_cond_N=None,
                     generate=True, build=True, with_cython=True,
                     num_iterations=10, tolerance=1e-6,
@@ -46,8 +47,9 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     # create render arguments
     ocp = AcadosOcp()
 
-    # export model
-    model, constraint = kinematic_model()
+    # export model. Pass dt=Tf/N so the model carries a DISCRETE (RK4) one-step
+    # map; acados only uses it when integrator_type='DISCRETE'.
+    model, constraint = kinematic_model(dt=Tf / N)
 
     # Override constraint bounds from ROS params (fall back to kinematic_model defaults if None)
     if vel_min is not None:
@@ -71,6 +73,9 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     model_ac.xdot = model.xdot
     model_ac.u = model.u
     model_ac.z = model.z
+    if model.disc_dyn_expr is not None:
+        # Only consumed by acados when integrator_type='DISCRETE'; harmless otherwise.
+        model_ac.disc_dyn_expr = model.disc_dyn_expr
 
     if num_obstacles > 0:
         _obs_states = casadi.SX.sym('obs_states', 3 * num_obstacles)
@@ -380,16 +385,25 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     # PARTIAL_CONDENSING_QPDUNES, PARTIAL_CONDENSING_OSQP, FULL_CONDENSING_DAQP
     ocp.solver_options.nlp_solver_type = nlp_solver_type  # SQP_RTI, SQP. SQP_RTI does only one iteration while SQP solves to a certain tolerance
     # ocp.solver_options.globalization = 'MERIT_BACKTRACKING'  # turns on globalization. 'FUNNEL_L1PEN_LINESEARCH' if not self.use_RTI else 'MERIT_BACKTRACKING'
-    ocp.solver_options.hessian_approx = "GAUSS_NEWTON"  # 'GAUSS_NEWTON', 'EXACT'.
-    ocp.solver_options.integrator_type = "ERK"  # 'IRK' (implicit), 'ERK' (explicit), 'GNSF', 'DISCRETE', 'LIFTED_IRK'
+    # GAUSS_NEWTON is only valid for [NON]LINEAR_LS costs. For EXTERNAL cost acados
+    # cannot form a GN Hessian (it prints a warning and silently falls back to the
+    # exact cost Hessian every solve), so select EXACT explicitly. The CONVEXIFY
+    # regularization set below keeps the (possibly indefinite) exact Hessian usable.
+    _uses_external_cost = ('external' in (cost_module.lower(), cost_module_e.lower()))
+    ocp.solver_options.hessian_approx = "EXACT" if _uses_external_cost else "GAUSS_NEWTON"
+    # 'IRK' (implicit), 'ERK' (explicit), 'GNSF', 'DISCRETE', 'LIFTED_IRK'.
+    # DISCRETE consumes model.disc_dyn_expr (RK4 one-step map); the continuous
+    # sim_method_* options below only apply to ERK/IRK.
+    ocp.solver_options.integrator_type = integrator_type
     # ocp.solver_options.collocation_type = 'EXPLICIT_RUNGE_KUTTA'  # 'GAUSS_RADAU_IIA', 'GAUSS_LEGENDRE', 'EXPLICIT_RUNGE_KUTTA'
     ocp.solver_options.hpipm_mode = 'SPEED'  # 'BALANCE', 'SPEED_ABS', 'SPEED', 'ROBUST' (Tested)
     # NO_REGULARIZE, MIRROR, PROJECT (Tested), CONVEXIFY, PROJECT_REDUC_HESS
     ocp.solver_options.regularize_method = "CONVEXIFY"
     ocp.solver_options.reg_epsilon = 1e-4
     ocp.solver_options.print_level = 0
-    ocp.solver_options.sim_method_num_stages = 4  # (1) RK1, (2) RK2, (4) RK4
-    ocp.solver_options.sim_method_num_steps = 1  # 3, 1. Higher values improve discretization accuracy but with increased computational cost
+    if integrator_type.upper() != 'DISCRETE':
+        ocp.solver_options.sim_method_num_stages = 4  # (1) RK1, (2) RK2, (4) RK4
+        ocp.solver_options.sim_method_num_steps = 1  # 3, 1. Higher values improve discretization accuracy but with increased computational cost
     # ocp.solver_options.nlp_solver_step_length = 0.05
     ocp.solver_options.nlp_solver_max_iter = num_iterations
     # ocp.solver_options.tol = tolerance  # 1e-4

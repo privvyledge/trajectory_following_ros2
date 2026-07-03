@@ -576,17 +576,38 @@ class KinematicMPCCasadiOpti(object):
             # so this is a handled fallback rather than a hard failure — warn, no traceback.
             error_message = repr(e)
             logger.warning('Opti solve() fell back to debug values: %s', error_message)
-            u_mpc = self.mpc.debug.value(self.u_dv)
-            z_mpc = self.mpc.debug.value(self.z_dv)
-            if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
-                sl_mpc = self.mpc.debug.value(self.sl_dv)
-            z_ref = self.mpc.debug.value(self.z_ref)
-            u_rate = self.mpc.debug.value(self.u_rate_dv)
-            u_prev = self.mpc.debug.value(self.previous_input)
+            try:
+                u_mpc = self.mpc.debug.value(self.u_dv)
+                z_mpc = self.mpc.debug.value(self.z_dv)
+                if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
+                    sl_mpc = self.mpc.debug.value(self.sl_dv)
+                z_ref = self.mpc.debug.value(self.z_ref)
+                u_rate = self.mpc.debug.value(self.u_rate_dv)
+                u_prev = self.mpc.debug.value(self.previous_input)
+                lam_g = self.mpc.debug.value(self.mpc.lam_g)
+            except Exception as debug_err:
+                # Opti.debug.value() asserts solved(); on the construction-time cold
+                # warm-up solve (before any successful solve, e.g. the singular v=0 QP
+                # under qrqp) it raises and would hard-crash the node. Degrade to zeros
+                # of the right shape so solve() still returns a usable dict — the base
+                # tracker treats is_opt=False as a suboptimal solve, not a crash.
+                logger.warning(
+                    'Opti debug values unavailable (stack never solved): %s; using zeros',
+                    repr(debug_err))
+                u_mpc = np.zeros(self.u_dv.shape)
+                z_mpc = np.zeros(self.z_dv.shape)
+                if not casadi.is_equal(self.P_u_rate, casadi.DM.zeros((self.nu, self.nu))):
+                    sl_mpc = np.zeros(self.sl_dv.shape)
+                z_ref = np.zeros(self.z_ref.shape)
+                u_rate = np.zeros(self.u_rate_dv.shape)
+                u_prev = np.zeros(self.previous_input.shape)
+                # Must be a real array, not None: it is fed back as the warm-start
+                # (update() calls self.mpc.set_initial(self.mpc.lam_g, lam_g), which
+                # rejects None with a NotImplementedError).
+                lam_g = np.zeros(self.mpc.lam_g.shape)
             iteration_count = None
             is_opt = False
             success = False
-            lam_g = self.mpc.debug.value(self.mpc.lam_g)
             lam_x = None  # sol.value(self.mpc.lam_x)
             lam_p = None  # sol.value(self.mpc.lam_p)
 

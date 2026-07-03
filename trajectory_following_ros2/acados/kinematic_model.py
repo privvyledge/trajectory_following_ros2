@@ -14,8 +14,10 @@ import types
 import numpy as np
 from casadi import *
 
+from trajectory_following_ros2.utils.integrators import make_discrete_dynamics
 
-def kinematic_model(symbol_type='SX'):
+
+def kinematic_model(symbol_type='SX', dt=None):
     # define structs
     constraint = types.SimpleNamespace()
     model = types.SimpleNamespace()
@@ -96,6 +98,16 @@ def kinematic_model(symbol_type='SX'):
             (vel / wheelbase) * tan(delta)
     )  # continuous non-linear model
 
+    # Discrete one-step map x_{k+1}=F(x_k,u_k) for the acados DISCRETE integrator.
+    # Built unconditionally when dt is given (acados ignores it unless
+    # integrator_type='DISCRETE'); reuses the shared RK4 discretizer. The
+    # wheelbase parameter is held constant over the step.
+    disc_dyn_expr = None
+    if dt is not None:
+        disc_dyn_expr = make_discrete_dynamics(
+                f_expl, z, u, dt, p=wheelbase, method='rk4',
+                function_name='kinematic_disc')
+
     '''Constraints/bounds.
     Todo: add rate constraints'''
     # state bounds
@@ -130,6 +142,7 @@ def kinematic_model(symbol_type='SX'):
     params.wheelbase = wheelbase
     model.f_impl_expr = zdot - f_expl
     model.f_expl_expr = f_expl
+    model.disc_dyn_expr = disc_dyn_expr
     # model.f_disk = discretizer(x_k, u_k, p_k)  # provide function
     model.x = z
     model.xdot = zdot

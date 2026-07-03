@@ -177,6 +177,11 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         self.declare_parameter('build_with_cython', True)
         self.declare_parameter('qp_solver', 'PARTIAL_CONDENSING_HPIPM')
         self.declare_parameter('nlp_solver_type', 'SQP_RTI')
+        # 'ERK' (default, continuous ODE) or 'DISCRETE' (RK4 one-step map via
+        # model.disc_dyn_expr). Consumed at model-build time; a restart is
+        # required to change it (not hot-reloadable — the base parameter callback
+        # rejects unrecognized params).
+        self.declare_parameter('integrator_type', 'ERK')
         # Unified name across backends (CasADi controller uses the same param). Holds
         # the generated acados C-code + compiled model here.
         self.declare_parameter('code_gen_directory',
@@ -195,6 +200,12 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         with_cython = self.get_parameter('build_with_cython').value
         qp_solver = self.get_parameter('qp_solver').value
         nlp_solver_type = self.get_parameter('nlp_solver_type').value
+        integrator_type = str(self.get_parameter('integrator_type').value).upper()
+        if integrator_type not in ('ERK', 'DISCRETE'):
+            self.get_logger().warn(
+                f"integrator_type='{integrator_type}' not supported by this node "
+                "(only 'ERK'/'DISCRETE'); falling back to 'ERK'.")
+            integrator_type = 'ERK'
         model_dir = self.get_parameter('code_gen_directory').value
         num_obstacles = self.get_parameter('num_obstacles').value
         collision_method = self.get_parameter('obstacle_collision_avoidance_method').value
@@ -227,6 +238,8 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         else:
             self.get_logger().info('Loading pre-built acados OCP solver...')
 
+        self.get_logger().info(f'acados integrator_type: {integrator_type}')
+
         cwd = os.getcwd()
         os.chdir(build_path)
 
@@ -244,6 +257,7 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
             cost_module_e=terminal_cost_type,
             qp_solver=qp_solver,
             nlp_solver_type=nlp_solver_type,
+            integrator_type=integrator_type,
             generate=True,
             build=generate,
             with_cython=with_cython,
