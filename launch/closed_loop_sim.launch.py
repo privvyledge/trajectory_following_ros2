@@ -334,6 +334,16 @@ def generate_launch_description():
         'initial_yaw': initial_yaw,
         'initial_speed': initial_speed,
         'step_on_command': step_on_command,
+        # Simulator-fidelity knobs (0.0 = ideal sim, the default). Set non-zero to
+        # stress-test controller robustness: Gaussian odometry noise (std devs) and
+        # first-order actuator lag (time constants, s). Realistic F1/10 stress values
+        # are ~0.02 m / 0.05 m/s / 0.02 rad noise and ~0.08 s / 0.15 s lag.
+        'noise_std_x': 0.0,
+        'noise_std_y': 0.0,
+        'noise_std_v': 0.0,
+        'noise_std_psi': 0.0,
+        'steering_time_constant': 0.0,
+        'acceleration_time_constant': 0.0,
     }]
     dompc_simulator_node = Node(
         condition=LaunchConfigurationEquals('simulator', 'do_mpc'),

@@ -1,0 +1,56 @@
+/**:
+  ros__parameters:
+    # ---------------------------------------------------------------------------
+    # F1/10 × CasADi Opti-stack — cost weights + horizon + solver config + speed
+    # policy. Overlay (highest wins): weights > platforms/f1tenth.yaml > base.
+    #
+    # HOW TO RUN (both flags matter):
+    #   ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py \
+    #       platform:=f1tenth weights:=f1tenth_opti viz_backend:=native \
+    #       use_opti:=true step_on_command:=true
+    #
+    #   * use_opti:=true       — selects the Opti formulation (a launch arg, NOT a
+    #                            weight; the launch applies it after this overlay so
+    #                            the CLI stays authoritative). Without it this file
+    #                            still runs, but on the function-based NLP, not Opti.
+    #   * step_on_command:=true — lockstep the simulator: it advances one physics
+    #                            step only when a fresh command arrives. Opti-on-ipopt
+    #                            solves in ~65 ms (> the 50 ms control period), so at
+    #                            real time the vehicle would coast through stale ticks
+    #                            and diverge at the sharp corner.
+    #
+    # WHY nlp/ipopt (do NOT change to qrqp/quad/conic): the Opti stack hands the raw
+    # QP straight to the solver with no SQP regularization layer, so a bare QP solver
+    # is singular at v=0 (steering has no yaw authority at standstill) and cannot pull
+    # away from rest ("conic process failed"). ipopt regularizes and solves at v=0.
+    # A qrqp/quad line here silently maps to Opti('conic') and bricks the standstill
+    # start. (The function-based NLP is what uses quad/qrqp — that is f1tenth_casadi.)
+    # ---------------------------------------------------------------------------
+    horizon: 25
+    sample_time: 0.05
+    prediction_time: 1.25  # sample_time * horizon
+    max_iter: 200          # ipopt interior-point iterations (keep >= 100 for ipopt)
+    termination_condition: 0.1
+
+    solver_type: nlp
+    solver: ipopt
+    discrete_model_type: nonlinear
+    discrete_integration_method: rk4
+    # Quadratic u-rate slack cost: harmless for ipopt, improves Hessian conditioning.
+    slack_objective_is_quadratic: True
+
+    # Cost weights (Gemini round-2 tuned; shares the CasADi structure).
+    Q:  [100.0, 100.0, 100.0, 8.0]
+    Qf: [100.0, 100.0, 200.0, 40.0]
+    R:  [0.01, 0.01]
+    Rd: [10.0, 10.0]
+    use_bryson_weights: false
+
+    # Reference speed / curvature policy
+    use_speed_profile: True
+    max_lateral_accel: 2.5
+    min_reference_speed: 0.3
+
+    # CasADi JIT codegen. Build once, then flip False to skip the per-launch recompile.
+    generate_mpc_model: True
+    build_with_cython: True

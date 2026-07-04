@@ -42,7 +42,7 @@
     # use_opti: False
 
     # Cost weights
-    Q:  [50.0, 50.0, 100.0, 8.0]
+    Q:  [100.0, 100.0, 100.0, 8.0]
     Qf: [100.0, 100.0, 200.0, 40.0]
     R:  [0.01, 0.01]
     Rd: [10.0, 10.0]
@@ -50,7 +50,7 @@
 
     # Reference speed / curvature policy
     use_speed_profile: True
-    max_lateral_accel: 3.0
+    max_lateral_accel: 2.5
     min_reference_speed: 0.3
 
     # CasADi JIT codegen

@@ -11,7 +11,7 @@
     max_iter: 200
     termination_condition: 0.1
 
-    Q:  [50.0, 50.0, 100.0, 8.0]
+    Q:  [100.0, 100.0, 100.0, 8.0]
     Qf: [100.0, 100.0, 200.0, 40.0]
     R:  [0.01, 0.01]
     Rd: [10.0, 10.0]
@@ -25,5 +25,5 @@
     # Build once, then flip to False to skip the per-launch recompile
     # (acados C-gen / do_mpc AOT ~min; casadi JIT ~secs). Re-True only if
     # the model form / horizon / num_obstacles change.
-    generate_mpc_model: True
+    generate_mpc_model: False
     build_with_cython: True

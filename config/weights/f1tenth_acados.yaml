@@ -3,16 +3,31 @@
     # ---------------------------------------------------------------------------
     # F1/10 × acados — cost weights + horizon + speed policy.
     # Overlay (highest wins): weights > platforms/f1tenth.yaml > base.
-    # SEED from the CasADi baseline (Q[50,50,100,8]/Rd[10,10]); RE-TUNE for acados.
+    #
+    # Requires EXTERNAL cost (only cost type carrying the Rd rate penalty):
+    #   ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py \
+    #       platform:=f1tenth weights:=f1tenth_acados mpc_toolbox:=acados \
+    #       stage_cost_type:=EXTERNAL terminal_cost_type:=EXTERNAL
+    #
+    # Weights are ABSOLUTE values (not a CasADi match): scale_cost defaults False,
+    # so the unscale=N/Tf factor in acados_settings.py is inactive. Normalized to a
+    # terminal:stage ratio comparable to the other backends; acados needed a slightly
+    # higher Q[psi]=16 and Qf[x,y]=200 to hold the corner. Completes the lap with
+    # 0 failures; forward-cruise corner CTE < 0.10 m.
     # ---------------------------------------------------------------------------
     horizon: 25
     sample_time: 0.05
     prediction_time: 1.25
-    max_iter: 200
     termination_condition: 0.1
 
-    Q:  [50.0, 50.0, 100.0, 8.0]
-    Qf: [100.0, 100.0, 200.0, 40.0]
+    # Full SQP (not the default single-iteration SQP_RTI): one RTI step is too weak
+    # at the sharp corner under sensor noise + actuator lag and silently stalls
+    # (idx freezes, cte diverges, no failure flag). Full SQP tracks robustly.
+    nlp_solver_type: SQP
+    max_iter: 20
+
+    Q:  [100.0, 100.0, 100.0, 16.0]
+    Qf: [200.0, 200.0, 200.0, 40.0]
     R:  [0.01, 0.01]
     Rd: [10.0, 10.0]
     use_bryson_weights: false
