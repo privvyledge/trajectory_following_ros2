@@ -55,6 +55,21 @@ class WaypointRecorderNode(Node):
         self.declare_parameter('twist_topic', 'twist')
         self.declare_parameter('path_topic', 'waypoint_recorder/path')
         self.declare_parameter('marker_topic', 'waypoint_recorder/markers')
+        self.declare_parameter('marker_max_speed', 10.0,
+                               ParameterDescriptor(description='Speed (m/s) mapped to the fast end of the trail '
+                                                              'arrow colour gradient (blue=slow → red=fast).'))
+        self.declare_parameter('publish_path', True,
+                               ParameterDescriptor(description='Publish the accumulating Path trail. Disable to '
+                                                              'remove all path-viz overhead during recording.'))
+        self.declare_parameter('publish_markers', True,
+                               ParameterDescriptor(description='Publish the velocity-arrow trail + live position '
+                                                              'sphere. Disable to remove all marker-viz overhead.'))
+        self.declare_parameter('viz_publish_interval', 0.0,
+                               ParameterDescriptor(description='Minimum seconds between visualization publishes. '
+                                                              '0.0 (default) publishes every recorded row. A larger '
+                                                              'value throttles the O(N) Path/marker publish without '
+                                                              'dropping trail points (accumulation is unthrottled), '
+                                                              'protecting the CSV write on long recordings.'))
         self.declare_parameter('save_if_transform_fails', False,
                                ParameterDescriptor(description='Save pose in source frame if TF to '
                                                                'target_frame_id is unavailable.'))
@@ -84,6 +99,10 @@ class WaypointRecorderNode(Node):
         self.twist_topic = self.get_parameter('twist_topic').value
         self.path_topic = self.get_parameter('path_topic').value
         self.marker_topic = self.get_parameter('marker_topic').value
+        self.marker_max_speed = self.get_parameter('marker_max_speed').value
+        self._enable_path_pub = self.get_parameter('publish_path').value
+        self._enable_marker_pub = self.get_parameter('publish_markers').value
+        self._viz_publish_interval = self.get_parameter('viz_publish_interval').value
         self.save_if_transform_fails = self.get_parameter('save_if_transform_fails').value
         self.stale_odom_timeout = self.get_parameter('stale_odom_timeout').value
         self.min_distance = self.get_parameter('min_distance').value
@@ -110,6 +129,9 @@ class WaypointRecorderNode(Node):
         self._is_stale = False            # True while odom is stale (edge-triggered logging)
         self._new_odom_since_last_write = False  # cleared after each write; prevents duplicate rows
         self._steady_clock = Clock(clock_type=ClockType.STEADY_TIME)
+        self._trail_marker_id = 0         # monotonic id so recorded trail arrows persist (never overwritten)
+        self._pending_arrows = []         # arrows accumulated since the last (throttled) marker publish
+        self._last_viz_pub_time = None    # node-clock time of last visualization publish, for throttling
 
         # buffering=1: line-buffered — each line ending with '\n' is flushed to disk immediately
         header = 'frame_id, total_time_elapsed, dt, x, y, z, yaw, qx, qy, qz, qw, vx, vy, speed, omega\n'
@@ -123,7 +145,6 @@ class WaypointRecorderNode(Node):
 
         # visualization messages
         self.path_msg = Path()
-        self.marker_array_msg = MarkerArray()
 
         # publishers
         self.path_pub = self.create_publisher(Path, self.path_topic, 1)
@@ -213,7 +234,6 @@ class WaypointRecorderNode(Node):
         self.speed = np.linalg.norm([self.vx, self.vy, self.vz])
 
         self._new_odom_since_last_write = True
-        self.publish_marker(position, orientation, self.speed)
 
     def pose_callback(self, data):
         pass
@@ -269,13 +289,33 @@ class WaypointRecorderNode(Node):
         self._last_write_time = now
         self._last_recorded_x = self.x
         self._last_recorded_y = self.y
-        self.publish_path()
+
+        # Visualization runs AFTER the CSV write so it can never delay or interrupt
+        # recording. Accumulation below is O(1) per row and always runs (so no trail
+        # points are dropped); only the O(N) publish is throttled by viz_publish_interval.
+        if self._enable_path_pub:
+            self._append_path_pose()
+        if self._enable_marker_pub:
+            self._pending_arrows.append(self._build_trail_arrow())
+        if (self._enable_path_pub or self._enable_marker_pub) and self._viz_publish_due(now):
+            self._last_viz_pub_time = now
+            if self._enable_path_pub:
+                self.publish_path()
+            if self._enable_marker_pub:
+                self._publish_markers()
 
         self.get_logger().info(
             f'Recording: {self._row_count} rows written ({self.total_time_elapsed:.1f}s elapsed)',
             **self.log_kwarg)
 
-    def publish_path(self):
+    def _viz_publish_due(self, now):
+        """Return whether the throttle interval has elapsed since the last viz publish."""
+        if self._viz_publish_interval <= 0.0 or self._last_viz_pub_time is None:
+            return True
+        return (now - self._last_viz_pub_time).nanoseconds / 1e9 >= self._viz_publish_interval
+
+    def _append_path_pose(self):
+        """Append the current pose to the accumulating Path (O(1), always runs)."""
         pose_msg = PoseStamped()
         pose_msg.header.stamp = self.get_clock().now().to_msg()
         pose_msg.header.frame_id = self.global_frame
@@ -286,45 +326,99 @@ class WaypointRecorderNode(Node):
         pose_msg.pose.orientation.y = self.qy
         pose_msg.pose.orientation.z = self.qz
         pose_msg.pose.orientation.w = self.qw
-
-        self.path_msg.header.stamp = pose_msg.header.stamp
-        self.path_msg.header.frame_id = self.global_frame
         self.path_msg.poses.append(pose_msg)
+
+    def publish_path(self):
+        """Republish the full accumulated Path (O(N); throttled by the caller)."""
+        self.path_msg.header.stamp = self.get_clock().now().to_msg()
+        self.path_msg.header.frame_id = self.global_frame
         self.path_pub.publish(self.path_msg)
 
-    def publish_marker(self, position, orientation, speed, scale=None, rgb=None):
-        if rgb is None:
-            rgb = [0., 1., 0.]
-        if scale is None:
-            scale = [1., 1., 1.]
+    def _publish_markers(self):
+        """Publish the batch of pending trail arrows + the live position sphere.
 
+        Arrows carry unique monotonic ids and an infinite lifetime, so RViz
+        accumulates them into a persistent trail; the sphere (fixed id 0) is
+        overwritten each publish to track the latest recorded position.
+        """
+        markers = self._pending_arrows + [self._build_current_sphere()]
+        self.marker_pub.publish(MarkerArray(markers=markers))
+        self._pending_arrows = []
+
+    def _build_current_sphere(self):
+        """Build the live current-position sphere marker (green, id 0, overwritten)."""
         marker = Marker()
         marker.header.frame_id = self.global_frame
         marker.header.stamp = self.get_clock().now().to_msg()
-        marker.ns = 'waypoint_recorder'
-        marker.id = 0  # always overwrite the same marker — only current position shown
+        marker.ns = 'waypoint_recorder/current'
+        marker.id = 0  # always overwrite the same marker — live current-position indicator
 
-        marker.type = marker.SPHERE  # SPHERE, ARROW, TEXT_VIEW_FACING
+        marker.type = marker.SPHERE
         marker.action = marker.ADD
 
-        marker.scale.x = scale[0]
-        marker.scale.y = scale[1]
-        marker.scale.z = scale[2]
+        marker.scale.x = marker.scale.y = marker.scale.z = 1.0
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = 0.0, 1.0, 0.0, 1.0
 
-        marker.color.r = rgb[0]
-        marker.color.g = rgb[1]
-        marker.color.b = rgb[2]
-        marker.color.a = 1.0
+        marker.pose.position.x = self.x
+        marker.pose.position.y = self.y
+        marker.pose.position.z = self.z
+        marker.pose.orientation.x = self.qx
+        marker.pose.orientation.y = self.qy
+        marker.pose.orientation.z = self.qz
+        marker.pose.orientation.w = self.qw
 
-        marker.pose.position = position
-        marker.pose.orientation = orientation
-
-        marker.text = f"{speed:.2f}"
+        marker.text = f"{self.speed:.2f}"
         marker.lifetime = Duration(seconds=0).to_msg()  # 0 means forever
+        return marker
 
-        # Replace rather than append: only the current position marker is kept
-        self.marker_array_msg.markers = [marker]
-        self.marker_pub.publish(self.marker_array_msg)
+    def _speed_to_color(self, speed):
+        """Map speed to an RGB gradient: blue (slow) → green → red (fast)."""
+        if self.marker_max_speed <= 0.0:
+            return 0.0, 1.0, 0.0  # gradient disabled → constant green
+        t = min(max(abs(speed) / self.marker_max_speed, 0.0), 1.0)
+        if t < 0.5:  # blue → green
+            s = t / 0.5
+            return 0.0, s, 1.0 - s
+        s = (t - 0.5) / 0.5  # green → red
+        return s, 1.0 - s, 0.0
+
+    def _build_trail_arrow(self):
+        """Build a persistent velocity arrow at the just-recorded waypoint.
+
+        One arrow per recorded row, oriented along the vehicle heading, length
+        scaled by speed and colour-coded by speed. Unique monotonic ids + an
+        infinite lifetime mean the arrows accumulate into a trail rather than
+        overwriting each other (unlike the live current-position sphere).
+        """
+        marker = Marker()
+        marker.header.frame_id = self.global_frame
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = 'waypoint_recorder/trail'
+        marker.id = self._trail_marker_id
+        self._trail_marker_id += 1
+
+        marker.type = marker.ARROW
+        marker.action = marker.ADD
+
+        # Arrow points along the vehicle's +x (heading ≈ velocity direction for a car).
+        # Shaft length encodes speed; a floor keeps stopped waypoints visible.
+        marker.scale.x = max(0.5, abs(self.speed) * 0.3)  # shaft length
+        marker.scale.y = 0.2                              # shaft diameter
+        marker.scale.z = 0.3                              # head diameter
+
+        r, g, b = self._speed_to_color(self.speed)
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = r, g, b, 1.0
+
+        marker.pose.position.x = self.x
+        marker.pose.position.y = self.y
+        marker.pose.position.z = self.z
+        marker.pose.orientation.x = self.qx
+        marker.pose.orientation.y = self.qy
+        marker.pose.orientation.z = self.qz
+        marker.pose.orientation.w = self.qw
+
+        marker.lifetime = Duration(seconds=0).to_msg()  # 0 means forever
+        return marker
 
 
 def main(args=None):
