@@ -27,5 +27,9 @@ casadi_nlp.so
 nlp.c
 nlp.so
 
+# do_mpc generated NLP code-gen artifacts
+nlp_do_mpc.c
+nlp_do_mpc.so
+
 # Rerun recordings
 *.rrd
