@@ -35,7 +35,10 @@ class RerunBackend(BaseVizBackend):
                  connect_addr: str, recording_path: str,
                  stamp_fn: Callable,
                  serve_web: bool = False, web_port=None,
-                 open_browser: bool = True):
+                 open_browser: bool = True,
+                 ego_radius: float = 0.0, safe_distance: float = 0.0,
+                 vehicle_length: float = 0.58, vehicle_width: float = 0.31,
+                 vehicle_height: float = 0.12, footprint_rear_axle_offset: float = 0.19):
         """
         stamp_fn — zero-argument callable returning the current ROS stamp.
                    Signature: () -> builtin_interfaces.msg.Time
@@ -59,6 +62,14 @@ class RerunBackend(BaseVizBackend):
             rr.send_blueprint(blueprint)
         self._stamp_fn = stamp_fn
         self._log_world_axes()
+
+        self._ego_radius = ego_radius
+        self._safe_distance = safe_distance
+        self._vehicle_length = vehicle_length
+        self._vehicle_width = vehicle_width
+        self._vehicle_height = vehicle_height
+        self._footprint_rear_axle_offset = footprint_rear_axle_offset
+        self._footprint_poly = []
 
     # ------------------------------------------------------------------
     # World frame
@@ -127,7 +138,18 @@ class RerunBackend(BaseVizBackend):
                     f'rerun {rr.__version__} (single-sink). Keeping the web viewer and '
                     'skipping the recording. Record in a separate run, or upgrade to '
                     'rerun >= 0.23 for simultaneous sinks.', stacklevel=2)
-            rr.serve_web(open_browser=open_browser, web_port=web_port)
+            # ws_port defaults to 9877 in rerun 0.22; the served web viewer at
+            # http://localhost:<web_port>/ shows the generic start page unless the
+            # data-source URL is appended. Bare http://localhost:9090 will NOT connect.
+            wp = web_port if web_port is not None else 9090
+            ws_port = 9877
+            rr.serve_web(open_browser=open_browser, web_port=wp, ws_port=ws_port)
+            print(
+                f'[RerunBackend] Web viewer ready. Open this FULL URL in your browser '
+                f'(bare http://localhost:{wp} shows the empty start page):\n'
+                f'    http://localhost:{wp}/?url=ws://localhost:{ws_port}\n'
+                f'    (WSL2: localhost forwards to Windows automatically.)',
+                flush=True)
             return
 
         live_requested = bool(spawn_viewer) or bool(connect_addr)
@@ -213,6 +235,35 @@ class RerunBackend(BaseVizBackend):
         rr.log(ENTITY['speed_actual'], rr.Scalar(speed))
         rr.log(ENTITY['heading_deg'],  rr.Scalar(math.degrees(yaw)))
 
+        # 1. Log Ego Radius Circle (translucent Points2D)
+        if self._ego_radius > 0.0:
+            rr.log(ENTITY['ego_radius'],
+                   rr.Points2D([self._xy(x, y)], colors=[COLORS['ego_radius']], radii=self._ego_radius))
+
+        # 2. Log Safe Distance Circle (radius = ego_radius + safe_distance)
+        if self._safe_distance > 0.0 or self._ego_radius > 0.0:
+            rr.log(ENTITY['safe_distance'],
+                   rr.Points2D([self._xy(x, y)], colors=[COLORS['safe_distance']], radii=self._ego_radius + self._safe_distance))
+
+        # 3. Log Footprint (Nav2 polygon prism or default 3D box)
+        if self._footprint_poly:
+            self._log_prism(ENTITY['vehicle_footprint'], self._footprint_poly, self._vehicle_height, COLORS['ego_footprint'])
+        else:
+            cos_y = math.cos(yaw)
+            sin_y = math.sin(yaw)
+            cx = x + self._footprint_rear_axle_offset * cos_y
+            cy = y + self._footprint_rear_axle_offset * sin_y
+            cz = self._vehicle_height / 2.0
+            q_neg = [0.0, 0.0, math.sin(-yaw / 2), math.cos(-yaw / 2)]
+
+            rr.log(ENTITY['vehicle_footprint'],
+                   rr.Boxes3D(
+                       centers=[[cx, -cy, cz]],
+                       half_sizes=[[self._vehicle_length / 2.0, self._vehicle_width / 2.0, self._vehicle_height / 2.0]],
+                       rotations=[q_neg],
+                       colors=[COLORS['ego_footprint']]
+                   ))
+
     def log_full_path(self, pts: List[Tuple[float, float]], stamp=None) -> None:
         if stamp is not None:
             self._set_time_from_stamp(stamp)
@@ -296,3 +347,106 @@ class RerunBackend(BaseVizBackend):
         rr.log(ENTITY['accel_reference'],     rr.Scalar(accel))
         rr.log(ENTITY['steer_reference_deg'], rr.Scalar(steer_deg))
         rr.log(ENTITY['speed_reference'],     rr.Scalar(speed))
+
+    def _log_prism(self, entity_path: str, pts_2d: List[Tuple[float, float]], height: float, color: List[int]) -> None:
+        bottom_pts = [[p[0], -p[1], 0.0] for p in pts_2d]
+        top_pts = [[p[0], -p[1], height] for p in pts_2d]
+
+        if bottom_pts:
+            bottom_pts.append(bottom_pts[0])
+            top_pts.append(top_pts[0])
+
+        verticals = []
+        for b, t in zip(bottom_pts[:-1], top_pts[:-1]):
+            verticals.append([b, t])
+
+        strips = [bottom_pts, top_pts] + verticals
+        rr.log(entity_path, rr.LineStrips3D(strips, colors=[color], radii=0.015))
+
+    def log_footprint_polygon(self, pts: List[Tuple[float, float]], stamp=None) -> None:
+        if stamp is not None:
+            self._set_time_from_stamp(stamp)
+        self._footprint_poly = list(pts)
+
+    def log_obstacles(self, obstacles: List[dict], margin_offset: float = 0.0, stamp=None) -> None:
+        if stamp is not None:
+            self._set_time_from_stamp(stamp)
+
+        if not obstacles:
+            rr.log(ENTITY['obstacles_circles'], rr.Points2D([]))
+            rr.log(ENTITY['obstacles_margin_circles'], rr.Points2D([]))
+            rr.log(ENTITY['obstacles_boxes'], rr.LineStrips2D([]))
+            rr.log(ENTITY['obstacles_margin_boxes'], rr.LineStrips2D([]))
+            return
+
+        circle_positions = []
+        circle_radii = []
+        box_strips = []
+        box_margin_strips = []
+
+        for obs in obstacles:
+            o_type = obs['type']
+            x = obs['x']
+            y = obs['y']
+            yaw = obs['yaw']
+            dims = obs['dimensions']
+
+            if o_type in ('SPHERE', 'CYLINDER') and dims:
+                r = dims[0] if o_type == 'SPHERE' else (dims[1] if len(dims) >= 2 else dims[0])
+                circle_positions.append(self._xy(x, y))
+                circle_radii.append(r)
+            elif o_type == 'BOX' and len(dims) >= 2:
+                length, width = dims[0], dims[1]
+
+                cos_y = math.cos(yaw)
+                sin_y = math.sin(yaw)
+                dx = length / 2.0
+                dy = width / 2.0
+
+                local_corners = [
+                    (dx, dy),
+                    (dx, -dy),
+                    (-dx, -dy),
+                    (-dx, dy),
+                    (dx, dy)
+                ]
+                strip = [[x + lx * cos_y - ly * sin_y, -(y + lx * sin_y + ly * cos_y)] for lx, ly in local_corners]
+                box_strips.append(strip)
+
+                if margin_offset > 0.0:
+                    mx = dx + margin_offset
+                    my = dy + margin_offset
+                    local_margin_corners = [
+                        (mx, my),
+                        (mx, -my),
+                        (-mx, -my),
+                        (-mx, my),
+                        (mx, my)
+                    ]
+                    margin_strip = [[x + lx * cos_y - ly * sin_y, -(y + lx * sin_y + ly * cos_y)] for lx, ly in local_margin_corners]
+                    box_margin_strips.append(margin_strip)
+
+        if circle_positions:
+            rr.log(ENTITY['obstacles_circles'],
+                   rr.Points2D(circle_positions, radii=circle_radii, colors=[COLORS['obstacle']]))
+            if margin_offset > 0.0:
+                margin_radii = [r + margin_offset for r in circle_radii]
+                rr.log(ENTITY['obstacles_margin_circles'],
+                       rr.Points2D(circle_positions, radii=margin_radii, colors=[COLORS['obstacle_margin']]))
+            else:
+                rr.log(ENTITY['obstacles_margin_circles'], rr.Points2D([]))
+        else:
+            rr.log(ENTITY['obstacles_circles'], rr.Points2D([]))
+            rr.log(ENTITY['obstacles_margin_circles'], rr.Points2D([]))
+
+        if box_strips:
+            rr.log(ENTITY['obstacles_boxes'],
+                   rr.LineStrips2D(box_strips, colors=[COLORS['obstacle']], radii=0.03))
+            if box_margin_strips:
+                rr.log(ENTITY['obstacles_margin_boxes'],
+                       rr.LineStrips2D(box_margin_strips, colors=[COLORS['obstacle_margin']], radii=0.015))
+            else:
+                rr.log(ENTITY['obstacles_margin_boxes'], rr.LineStrips2D([]))
+        else:
+            rr.log(ENTITY['obstacles_boxes'], rr.LineStrips2D([]))
+            rr.log(ENTITY['obstacles_margin_boxes'], rr.LineStrips2D([]))

@@ -82,6 +82,7 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import LaunchConfigurationEquals
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.descriptions import ParameterValue
 
 
 def _overlay_files(context, platforms_dir, weights_dir):
@@ -125,6 +126,7 @@ def generate_launch_description():
     platforms_dir = os.path.join(pkg_prefix, 'config', 'platforms')
     weights_dir = os.path.join(pkg_prefix, 'config', 'weights')
 
+    num_obstacles = LaunchConfiguration('num_obstacles')
     ode_type = LaunchConfiguration('ode_type')
     discrete_model_type = LaunchConfiguration('discrete_model_type')
     discrete_integration_method = LaunchConfiguration('discrete_integration_method')
@@ -136,6 +138,21 @@ def generate_launch_description():
     stage_cost_type = LaunchConfiguration('stage_cost_type')
     terminal_cost_type = LaunchConfiguration('terminal_cost_type')
     code_gen_directory = LaunchConfiguration('code_gen_directory')
+    arclength_index_advance = LaunchConfiguration('arclength_index_advance')
+    projection_window = LaunchConfiguration('projection_window')
+    delay_compensation_enabled = LaunchConfiguration('delay_compensation_enabled')
+    estimated_delay = LaunchConfiguration('estimated_delay')
+    delay_compensation_method = LaunchConfiguration('delay_compensation_method')
+
+    obstacle_topic = LaunchConfiguration('obstacle_topic')
+    footprint_topic = LaunchConfiguration('footprint_topic')
+    viz_ego_radius = LaunchConfiguration('viz_ego_radius')
+    viz_safe_distance = LaunchConfiguration('viz_safe_distance')
+    vehicle_length = LaunchConfiguration('vehicle_length')
+    vehicle_width = LaunchConfiguration('vehicle_width')
+    vehicle_height = LaunchConfiguration('vehicle_height')
+    footprint_rear_axle_offset = LaunchConfiguration('footprint_rear_axle_offset')
+
 
     viz_backend = LaunchConfiguration('viz_backend')
     viz_spawn_viewer = LaunchConfiguration('viz_spawn_viewer')
@@ -184,6 +201,33 @@ def generate_launch_description():
                         '+ speed policy. Empty = skip overlay. Overrides the launch-arg solver '
                         'config (solver_type/solver/max_iter/discrete_*) below.'),
         DeclareLaunchArgument(
+            'obstacle_topic', default_value='fake_obstacles/object_array',
+            description='Topic where fake obstacles are published (ObjectArray).'),
+        DeclareLaunchArgument(
+            'footprint_topic', default_value='',
+            description='Topic where Nav2 footprint is published (PolygonStamped).'),
+        DeclareLaunchArgument(
+            'viz_ego_radius', default_value='0.15',
+            description='Ego vehicle radius (m) for visualizer margin circles.'),
+        DeclareLaunchArgument(
+            'viz_safe_distance', default_value='0.15',
+            description='Safety margin distance (m) for visualizer margin circles. '
+                        'F1/10-realistic default; the drawn margin ring is '
+                        'viz_ego_radius + viz_safe_distance. Raise for larger platforms.'),
+        DeclareLaunchArgument(
+            'vehicle_length', default_value='0.58',
+            description='Vehicle physical footprint length (m).'),
+        DeclareLaunchArgument(
+            'vehicle_width', default_value='0.31',
+            description='Vehicle physical footprint width (m).'),
+        DeclareLaunchArgument(
+            'vehicle_height', default_value='0.12',
+            description='Vehicle physical footprint height (m).'),
+        DeclareLaunchArgument(
+            'footprint_rear_axle_offset', default_value='0.19',
+            description='Distance (m) from rear axle to footprint geometric center.'),
+
+        DeclareLaunchArgument(
             'mpc_toolbox', default_value='casadi',
             choices=['acados', 'casadi', 'do_mpc', 'none'],
             description='Which MPC controller node to launch (when control_type=mpc). '
@@ -219,18 +263,24 @@ def generate_launch_description():
             'max_iter', default_value='200',
             description='Iteration budget. >=100 for IPOPT (node default 15 is too low for IPOPT).'),
         DeclareLaunchArgument(
+            'num_obstacles', default_value='0',
+            description='Number of obstacles the controller constrains against (casadi/acados). '
+                        '0 disables obstacle avoidance. Requires an ObjectArray publisher on '
+                        'the obstacle_topic (e.g. the fake_obstacle_publisher node). Applied '
+                        'before the weights overlay, so a weights file may override it.'),
+        DeclareLaunchArgument(
             'integrator_type', default_value='ERK',
             description='acados only: OCP integrator. ERK (default) | DISCRETE. '
                         'Changing it regenerates the acados C-code.'),
         DeclareLaunchArgument(
-            'stage_cost_type', default_value='NONLINEAR_LS',
-            description='acados only: stage cost module. NONLINEAR_LS (default) | LINEAR_LS | '
-                        'EXTERNAL. Only EXTERNAL carries the Rd input-rate penalty (LS costs '
+            'stage_cost_type', default_value='EXTERNAL',
+            description='acados only: stage cost module. EXTERNAL (default) | NONLINEAR_LS | '
+                        'LINEAR_LS. Only EXTERNAL carries the Rd input-rate penalty (LS costs '
                         'silently drop it); EXTERNAL is also required for obstacle/CBF constraints.'),
         DeclareLaunchArgument(
-            'terminal_cost_type', default_value='NONLINEAR_LS',
-            description='acados only: terminal cost module. NONLINEAR_LS (default) | LINEAR_LS | '
-                        'EXTERNAL. Set to EXTERNAL alongside stage_cost_type for the Rd penalty.'),
+            'terminal_cost_type', default_value='EXTERNAL',
+            description='acados only: terminal cost module. EXTERNAL (default) | NONLINEAR_LS | '
+                        'LINEAR_LS. Keep it EXTERNAL alongside stage_cost_type for the Rd penalty.'),
         DeclareLaunchArgument(
             'code_gen_directory',
             default_value=os.path.join(pkg_prefix, 'data', 'casadi_codegen'),
@@ -292,6 +342,31 @@ def generate_launch_description():
             'simulator', default_value='do_mpc',
             description='Simulator backend: do_mpc | acados. Selects which simulator '
                         'node closes the loop.'),
+        DeclareLaunchArgument(
+            'arclength_index_advance', default_value='True',
+            description='Reference-index advance mode (all controllers). True = '
+                        'along-track (arc-length) projection: the index advances with '
+                        'longitudinal progress even when the vehicle is held laterally '
+                        'off the line (obstacle swerve), never freezing at a standoff. '
+                        'False = legacy Euclidean distance-gate.'),
+        DeclareLaunchArgument(
+            'projection_window', default_value='5.0',
+            description='Forward arc-length span (m) of the arc-length projection '
+                        'window. Kept short so the projection cannot leap to '
+                        'end-of-path points sitting near the start on a closed loop; '
+                        'must be < loop length and > one tick of travel.'),
+        DeclareLaunchArgument(
+            'delay_compensation_enabled', default_value='false',
+            description='Replace x0 with an RK4-propagated state (over estimated_delay) '
+                        'before each solve (all MPC controllers). Compensates sensor + '
+                        'solve + actuator latency.'),
+        DeclareLaunchArgument(
+            'estimated_delay', default_value='0.0',
+            description='Total round-trip delay (s) propagated forward when '
+                        'delay_compensation_enabled is true (0 = no propagation).'),
+        DeclareLaunchArgument(
+            'delay_compensation_method', default_value='forward_simulation',
+            description='Delay-compensation method (currently forward_simulation).'),
     ]
 
     # ---- 1. Static transform: map -> odom (identity) ------------------------
@@ -345,22 +420,53 @@ def generate_launch_description():
         'steering_time_constant': 0.0,
         'acceleration_time_constant': 0.0,
     }]
-    dompc_simulator_node = Node(
-        condition=LaunchConfigurationEquals('simulator', 'do_mpc'),
-        package='trajectory_following_ros2',
-        executable='kinematic_dompc_simulator',
-        name='kinematic_dompc_simulator',
-        output='screen',
-        parameters=simulator_params,
-    )
-    acados_simulator_node = Node(
-        condition=LaunchConfigurationEquals('simulator', 'acados'),
-        package='trajectory_following_ros2',
-        executable='kinematic_acados_simulator',
-        name='kinematic_acados_simulator',
-        output='screen',
-        parameters=simulator_params,
-    )
+    # Built in an OpaqueFunction so the platform overlay's PHYSICAL vehicle params
+    # (wheelbase, steer/speed/accel limits) can be resolved and applied to the
+    # simulator too. Without this the simulator uses its own defaults (wheelbase
+    # 0.256 m + max_steer 30 deg, F1/10) while the controller uses the platform's
+    # values, so any non-F1/10 platform drives a controller/plant model mismatch:
+    # the plant over-rotates and clips steering vs the plan, and tracking diverges.
+    # Only the physical keys the simulator declares are pulled from the platform
+    # file — NOT the whole file: the platform also carries use_sim_time, frames, and
+    # command topics that would repoint the sim off this harness (there is no /clock
+    # here, so use_sim_time:=True would freeze the sim). The extracted physical dict
+    # is merged on top of the sim's own param dict, which keeps its frames/topics/
+    # initial pose (the platform sets none of the physical keys the sim would then
+    # need to re-assert).
+    def _make_simulator_nodes(context, *_args, **_kwargs):
+        import yaml
+        physical_keys = {
+            'wheelbase', 'max_steer', 'min_steer', 'max_steer_rate',
+            'max_speed', 'min_speed', 'max_accel', 'max_decel',
+        }
+        platform_name = LaunchConfiguration('platform').perform(context)
+        sim_phys = {}
+        if platform_name:
+            platform_file = os.path.join(platforms_dir, platform_name + '.yaml')
+            if os.path.exists(platform_file):
+                with open(platform_file) as fh:
+                    doc = yaml.safe_load(fh) or {}
+                params = (doc.get('/**', {}) or {}).get('ros__parameters', {}) or {}
+                sim_phys = {k: v for k, v in params.items() if k in physical_keys}
+        sim_params = [{**simulator_params[0], **sim_phys}]
+        return [
+            Node(
+                condition=LaunchConfigurationEquals('simulator', 'do_mpc'),
+                package='trajectory_following_ros2',
+                executable='kinematic_dompc_simulator',
+                name='kinematic_dompc_simulator',
+                output='screen',
+                parameters=sim_params,
+            ),
+            Node(
+                condition=LaunchConfigurationEquals('simulator', 'acados'),
+                package='trajectory_following_ros2',
+                executable='kinematic_acados_simulator',
+                name='kinematic_acados_simulator',
+                output='screen',
+                parameters=sim_params,
+            ),
+        ]
 
     # ---- 4. Controller -------------------------------------------------------
     # Selected by `control_type` (mpc | purepursuit) and, for MPC, `mpc_toolbox`
@@ -392,6 +498,7 @@ def generate_launch_description():
         'solver_type': solver_type,
         'solver': solver,
         'max_iter': max_iter,
+        'num_obstacles': num_obstacles,
     }
     # `use_opti` is a FORMULATION selector, not a weight, so it is applied in the
     # tail_dict (AFTER the platform/weights overlays) — an explicit `use_opti:=...`
@@ -403,6 +510,7 @@ def generate_launch_description():
         'stage_cost_type': stage_cost_type,
         'terminal_cost_type': terminal_cost_type,
         'max_iter': max_iter,
+        'num_obstacles': num_obstacles,
     }
     do_mpc_solver_params = {
         'max_iter': max_iter,
@@ -417,8 +525,26 @@ def generate_launch_description():
     def _make_controller_nodes(context, *_args, **_kwargs):
         overlays = _overlay_files(context, platforms_dir, weights_dir)
 
+        # Backend-agnostic reference-index params (base_tracker) applied to every
+        # controller. Placed BEFORE the overlays so a weights file may still pin them
+        # per-platform (e.g. a shorter projection_window for a small loop); with no
+        # weights override the launch-arg default takes effect.
+        # Wrap in ParameterValue with an explicit value_type: a bare LaunchConfiguration
+        # in a param dict resolves to a STRING, and a string override against a node's
+        # typed (bool/float) declared param — which mpc_parameters.yaml sets — is dropped,
+        # so the launch arg would silently have no effect (e.g. delay compensation staying
+        # off despite delay_compensation_enabled:=true).
+        reference_params = {
+            'arclength_index_advance': ParameterValue(arclength_index_advance, value_type=bool),
+            'projection_window': ParameterValue(projection_window, value_type=float),
+            'delay_compensation_enabled': ParameterValue(
+                delay_compensation_enabled, value_type=bool),
+            'estimated_delay': ParameterValue(estimated_delay, value_type=float),
+            'delay_compensation_method': delay_compensation_method,
+        }
+
         def _params(solver_dict, tail_dict):
-            return [params_file, solver_dict] + overlays + [tail_dict]
+            return [params_file, reference_params, solver_dict] + overlays + [tail_dict]
 
         return [
             Node(
@@ -482,14 +608,22 @@ def generate_launch_description():
                 'serve_web': viz_serve_web,
                 'web_port': viz_web_port,
                 'web_open_browser': viz_web_open_browser,
+                'obstacle_topic': obstacle_topic,
+                'footprint_topic': footprint_topic,
+                'viz_ego_radius': viz_ego_radius,
+                'viz_safe_distance': viz_safe_distance,
+                'vehicle_length': vehicle_length,
+                'vehicle_width': vehicle_width,
+                'vehicle_height': vehicle_height,
+                'footprint_rear_axle_offset': footprint_rear_axle_offset,
             }],
+
         )]
 
     return LaunchDescription(declare_args + [
         static_tf_node,
         waypoint_loader_node,
-        dompc_simulator_node,
-        acados_simulator_node,
+        OpaqueFunction(function=_make_simulator_nodes),
         OpaqueFunction(function=_make_controller_nodes),
         OpaqueFunction(function=_make_visualizer_node),
     ])

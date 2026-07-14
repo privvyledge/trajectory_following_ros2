@@ -18,10 +18,16 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
 
 from std_msgs.msg import Float32
-from geometry_msgs.msg import PointStamped, AccelWithCovarianceStamped
+from geometry_msgs.msg import PointStamped, AccelWithCovarianceStamped, PolygonStamped
 from nav_msgs.msg import Odometry, Path
 from ackermann_msgs.msg import AckermannDriveStamped
 import tf_transformations
+
+try:
+    OBSTACLES_AVAILABLE = True
+    from derived_object_msgs.msg import ObjectArray
+except ImportError:
+    OBSTACLES_AVAILABLE = False
 
 
 class VisualizerNode(Node):
@@ -34,7 +40,7 @@ class VisualizerNode(Node):
         self._read_parameters()
 
         self._mutex = threading.Lock()
-        self._ref_first_xy  = None
+        self._ref_first_xy = None
         self._ref_first_yaw = None
 
         self._backends: list = []
@@ -59,6 +65,14 @@ class VisualizerNode(Node):
         self.declare_parameter('solve_time_topic',        'mpc/solve_time')
         self.declare_parameter('actuator_feedback_topic', '')
         self.declare_parameter('reference_cmd_topic',     '')
+        self.declare_parameter('obstacle_topic',          'fake_obstacles/object_array')
+        self.declare_parameter('footprint_topic',          '')
+        self.declare_parameter('viz_ego_radius',          0.15)
+        self.declare_parameter('viz_safe_distance',        0.15)
+        self.declare_parameter('vehicle_length',          0.58)
+        self.declare_parameter('vehicle_width',           0.31)
+        self.declare_parameter('vehicle_height',          0.12)
+        self.declare_parameter('footprint_rear_axle_offset', 0.19)
         # Rerun connection
         self.declare_parameter('app_name',        'trajectory_following_ros2')
         self.declare_parameter('spawn_viewer',    True)
@@ -78,30 +92,38 @@ class VisualizerNode(Node):
 
     def _read_parameters(self):
         gp = lambda n: self.get_parameter(n).value  # noqa: E731
-        self.odom_topic              = gp('odom_topic')
-        self.path_topic              = gp('path_topic')
-        self.predicted_path_topic    = gp('predicted_path_topic')
-        self.reference_path_topic    = gp('reference_path_topic')
-        self.goal_topic              = gp('goal_topic')
-        self.des_yaw_rate_topic      = gp('des_yaw_rate_topic')
-        self.ackermann_cmd_topic     = gp('ackermann_cmd_topic')
-        self.accel_topic             = gp('accel_topic')
-        self.solve_time_topic        = gp('solve_time_topic')
+        self.odom_topic = gp('odom_topic')
+        self.path_topic = gp('path_topic')
+        self.predicted_path_topic = gp('predicted_path_topic')
+        self.reference_path_topic = gp('reference_path_topic')
+        self.goal_topic = gp('goal_topic')
+        self.des_yaw_rate_topic = gp('des_yaw_rate_topic')
+        self.ackermann_cmd_topic = gp('ackermann_cmd_topic')
+        self.accel_topic = gp('accel_topic')
+        self.solve_time_topic = gp('solve_time_topic')
         self.actuator_feedback_topic = gp('actuator_feedback_topic')
-        self.reference_cmd_topic     = gp('reference_cmd_topic')
-        self.app_name                = gp('app_name')
-        self.spawn_viewer            = gp('spawn_viewer')
-        self.connect_addr            = gp('connect_addr')
-        self.recording_path          = gp('recording_path')
-        self.serve_web               = gp('serve_web')
-        self.web_port                = gp('web_port')
-        self.web_open_browser        = gp('web_open_browser')
+        self.reference_cmd_topic = gp('reference_cmd_topic')
+        self.obstacle_topic = gp('obstacle_topic')
+        self.footprint_topic = gp('footprint_topic')
+        self.viz_ego_radius = gp('viz_ego_radius')
+        self.viz_safe_distance = gp('viz_safe_distance')
+        self.vehicle_length = gp('vehicle_length')
+        self.vehicle_width = gp('vehicle_width')
+        self.vehicle_height = gp('vehicle_height')
+        self.footprint_rear_axle_offset = gp('footprint_rear_axle_offset')
+        self.app_name = gp('app_name')
+        self.spawn_viewer = gp('spawn_viewer')
+        self.connect_addr = gp('connect_addr')
+        self.recording_path = gp('recording_path')
+        self.serve_web = gp('serve_web')
+        self.web_port = gp('web_port')
+        self.web_open_browser = gp('web_open_browser')
 
     def _init_backends(self):
         backend_choice = self.get_parameter('viz_backend').value
-        buf_size       = self.get_parameter('plot_buffer_size').value
+        buf_size = self.get_parameter('plot_buffer_size').value
 
-        use_rerun  = backend_choice in ('rerun',  'both')
+        use_rerun = backend_choice in ('rerun', 'both')
         use_native = backend_choice in ('native', 'both')
 
         if use_rerun:
@@ -116,6 +138,12 @@ class VisualizerNode(Node):
                     serve_web=self.serve_web,
                     web_port=self.web_port,
                     open_browser=self.web_open_browser,
+                    ego_radius=self.viz_ego_radius,
+                    safe_distance=self.viz_safe_distance,
+                    vehicle_length=self.vehicle_length,
+                    vehicle_width=self.vehicle_width,
+                    vehicle_height=self.vehicle_height,
+                    footprint_rear_axle_offset=self.footprint_rear_axle_offset,
                 )
                 self._backends.append(rb)
                 self.get_logger().info('Rerun backend active.')
@@ -131,6 +159,12 @@ class VisualizerNode(Node):
                     buffer_size=buf_size,
                     video_path=self.get_parameter('native_video_path').value,
                     video_fps=self.get_parameter('native_video_fps').value,
+                    ego_radius=self.viz_ego_radius,
+                    safe_distance=self.viz_safe_distance,
+                    vehicle_length=self.vehicle_length,
+                    vehicle_width=self.vehicle_width,
+                    vehicle_height=self.vehicle_height,
+                    footprint_rear_axle_offset=self.footprint_rear_axle_offset,
                 )
                 self._backends.append(mb)
                 self.get_logger().info('Matplotlib backend active.')
@@ -157,6 +191,20 @@ class VisualizerNode(Node):
         cs(AckermannDriveStamped,      self.ackermann_cmd_topic,  self._cmd_cb,        10)
         cs(AccelWithCovarianceStamped, self.accel_topic,          self._accel_cb,      10)
         cs(Float32,                    self.solve_time_topic,     self._solve_time_cb, 10)
+
+        if self.obstacle_topic:
+            if OBSTACLES_AVAILABLE:
+                cs(ObjectArray, self.obstacle_topic, self._obstacle_cb, 10)
+                self.get_logger().info(f'Obstacle visualization enabled on: {self.obstacle_topic}')
+            else:
+                self.get_logger().warn(
+                    'Obstacle topic configured but derived_object_msgs is not available. '
+                    'Obstacles will not be rendered.'
+                )
+
+        if self.footprint_topic:
+            cs(PolygonStamped, self.footprint_topic, self._footprint_cb, 10)
+            self.get_logger().info(f'Ego footprint visualization enabled on: {self.footprint_topic}')
 
         if self.actuator_feedback_topic:
             cs(AckermannDriveStamped, self.actuator_feedback_topic,
@@ -188,16 +236,16 @@ class VisualizerNode(Node):
     # ------------------------------------------------------------------
 
     def _odom_cb(self, msg: Odometry):
-        x     = msg.pose.pose.position.x
-        y     = msg.pose.pose.position.y
-        q     = msg.pose.pose.orientation
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
         _, _, yaw = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
         speed = msg.twist.twist.linear.x
 
         self._log('log_vehicle_pose', x, y, yaw, speed, stamp=msg.header.stamp)
 
         with self._mutex:
-            ref_xy  = self._ref_first_xy
+            ref_xy = self._ref_first_xy
             ref_yaw = self._ref_first_yaw
 
         if ref_xy is not None:
@@ -226,7 +274,7 @@ class VisualizerNode(Node):
         q = msg.poses[0].pose.orientation
         _, _, yaw = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
         with self._mutex:
-            self._ref_first_xy  = pts[0]
+            self._ref_first_xy = pts[0]
             self._ref_first_yaw = yaw
         self._log('log_ref_window', pts, stamp=msg.header.stamp)
 
@@ -274,6 +322,33 @@ class VisualizerNode(Node):
                   math.degrees(msg.drive.steering_angle),
                   msg.drive.speed,
                   stamp=msg.header.stamp)
+
+    def _obstacle_cb(self, msg: 'ObjectArray'):
+        obstacles = []
+        for obj in msg.objects:
+            pos = [obj.pose.position.x, obj.pose.position.y, obj.pose.position.z]
+            q = obj.pose.orientation
+            _, _, yaw = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
+
+            shape_type = {
+                obj.shape.BOX: 'BOX',
+                obj.shape.SPHERE: 'SPHERE',
+                obj.shape.CYLINDER: 'CYLINDER',
+            }.get(obj.shape.type, 'BOX')
+
+            obstacles.append({
+                'type': shape_type,
+                'x': pos[0],
+                'y': pos[1],
+                'yaw': yaw,
+                'dimensions': list(obj.shape.dimensions)
+            })
+
+        self._log('log_obstacles', obstacles, margin_offset=self.viz_ego_radius + self.viz_safe_distance, stamp=msg.header.stamp)
+
+    def _footprint_cb(self, msg: PolygonStamped):
+        pts = [(p.x, p.y) for p in msg.polygon.points]
+        self._log('log_footprint_polygon', pts, stamp=msg.header.stamp)
 
     # ------------------------------------------------------------------
     # Lifecycle

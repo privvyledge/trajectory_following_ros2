@@ -103,8 +103,21 @@ class Trajectory(object):
         self.min_reference_speed = 0.0  # forward creep floor (m/s)
         self.max_reference_speed = None  # upper speed cap (m/s); None => use v_target alone
 
+        # Reference-index advance mode (set by the owning node from its ROS param).
+        # True  => along-track (arc-length) projection: the index advances with
+        #          longitudinal progress even when the vehicle is held laterally off
+        #          the line, so it never freezes at an obstacle-avoidance standoff.
+        # False => legacy Euclidean distance-gate (find_closest_waypoints).
+        # previous_index is the monotonic projection anchor for the arc-length path.
+        self.arclength_index_advance = True
+        # Forward arc-length span (m) of the projection window. Kept short so the
+        # projection cannot leap to end-of-path points that sit physically near the
+        # start on a closed loop; must be < loop length and > one tick's travel.
+        self.projection_window = 5.0
+
     def calc_nearest_index(self, waypoints=None, state=None, current_index=None, num_neighbours=10,
                            min_search_radius=0.0, max_search_radius=30.0, use_euclidean_distance=True, workers=1):
+        waypoints_is_self = waypoints is None
         if waypoints is None:
             waypoints = self.trajectory[:, [self.trajectory_key_to_column['x'], self.trajectory_key_to_column['y']]]
 
@@ -122,6 +135,25 @@ class Trajectory(object):
 
         if self.waypoint_kdtree is None:
             self.waypoint_kdtree = trajectory_utils.generate_kd_tree(waypoints)
+
+        if self.arclength_index_advance:
+            # Along-track projection: advance by arc length off self.previous_index
+            # (the monotonic projection anchor), decoupled from lateral offset.
+            # min_search_radius doubles as the reference-anchor (look-ahead) distance,
+            # exactly as GOAL_DIS does on the legacy path.
+            if waypoints_is_self:
+                cum_dist = self.trajectory[:, self.trajectory_key_to_column['cum_dist']]
+            else:
+                cum_dist = trajectory_utils.cumulative_distance_along_path(waypoints[:, :2])
+            indices, distances, proj_index = trajectory_utils.project_index_and_lookahead(
+                waypoints[:, :2], cum_dist, state,
+                floor_index=self.previous_index,
+                lookahead_distance=min_search_radius,
+                projection_window=self.projection_window,
+                max_search_radius=max_search_radius)
+            self.previous_index = proj_index  # feed back as next tick's floor
+            return indices, distances
+
         indices, distances = trajectory_utils.find_closest_waypoints(waypoints[:, :2], state,
                                                                      current_index=current_index,
                                                                      num_neighbours=num_neighbours,

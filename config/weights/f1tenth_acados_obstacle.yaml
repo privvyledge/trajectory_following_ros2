@@ -1,0 +1,58 @@
+/**:
+  ros__parameters:
+    # ---------------------------------------------------------------------------
+    # F1/10 × acados — obstacle avoidance (EXACT nonlinear keep-out constraint).
+    # Overlay (highest wins): weights > platforms/f1tenth.yaml > base.
+    # Launch (EXTERNAL cost is the default now, but obstacles REQUIRE it):
+    #   mpc_toolbox:=acados weights:=f1tenth_acados_obstacle \
+    #       stage_cost_type:=EXTERNAL terminal_cost_type:=EXTERNAL \
+    #       num_obstacles:=1 generate_mpc_model:=true
+    #
+    # acados adds the obstacle as an exact nonlinear con_h constraint (slacked), so
+    # unlike the CasADi qp/ltv path it is not linearized — on-path / head-on
+    # avoidance is strong. Obstacles need EXTERNAL cost (the only cost type that both
+    # carries the Rd rate penalty and enables the constraint block).
+    # ---------------------------------------------------------------------------
+    horizon: 25
+    sample_time: 0.05
+    prediction_time: 1.25
+    termination_condition: 0.1
+
+    # Full SQP (SQP_RTI's single step is too weak near a corner + obstacle).
+    nlp_solver_type: SQP
+    # 40 (not 20): with the obstacle con_h active, ~20 SQP iters leaves a short cluster
+    # of consecutive non-convergent solves while the obstacle first enters the horizon
+    # during the standstill launch (longest run 4 at 20 -> would approach base_tracker's
+    # >=5 zero-command gate); 40 breaks the cluster (remaining failures are isolated
+    # single ticks the near-converged iterate absorbs). Costs a few ms only on hard ticks.
+    max_iter: 40
+
+    # Obstacle avoidance (exact nonlinear con_h; num_obstacles may also be given as a
+    # launch arg — both work, restart-only either way).
+    num_obstacles: 1
+    obstacle_collision_avoidance_method: euclidean
+    # Keep-out = ego_radius + obstacle_radius + safe_distance = 0.15 + r_obs + 0.15.
+    # An obstacle exactly ON the line is supported: the adapter projects in-keep-out
+    # reference points onto the keep-out boundary (side-hysteresis arc) and accepts
+    # budget-limited (status 2) SQP iterates, so the car detours ~0.6 m around the
+    # bubble instead of stalling. Expect status=2 log blips while negotiating it.
+    ego_radius: 0.15
+    safe_distance: 0.15  # now wired into the acados keep-out (was hardcoded 0.5)
+    # SLACK-WEIGHT LEVER (restart-only): acados uses a SCALAR obstacle_slack_weight
+    # (NOT the CasADi array params). Raise to harden avoidance (default 100).
+    obstacle_slack_weight: 1000.0
+
+    Q:  [100.0, 100.0, 100.0, 16.0]
+    Qf: [200.0, 200.0, 200.0, 40.0]
+    R:  [0.01, 0.01]
+    Rd: [10.0, 10.0]
+    use_bryson_weights: false
+
+    use_speed_profile: True
+    max_lateral_accel: 3.0
+    min_reference_speed: 0.3
+
+    # acados C-code generation + Cython wrapper (regenerate when the obstacle
+    # structure / horizon changes).
+    generate_mpc_model: True
+    build_with_cython: True

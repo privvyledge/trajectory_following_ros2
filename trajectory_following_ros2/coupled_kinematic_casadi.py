@@ -241,8 +241,15 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
         self.declare_parameter('suppress_solver_output', True)
         self.declare_parameter('slack_weights_input_rate', [1.0, 1.0])
         self.declare_parameter('slack_scale_input_rate', [1.0, 1.0])
-        self.declare_parameter('slack_upper_bound_input_rate', [1e9, 1e9])
+        self.declare_parameter('slack_upper_bound_input_rate', [float('inf'), float('inf')])
         self.declare_parameter('slack_objective_is_quadratic', False)
+        # Per-obstacle slack (soft collision constraint). Empty lists ([]) mean the
+        # solver falls back to a hard constraint. These are sized to num_obstacles at
+        # read time (a scalar is broadcast); the slacked form is what lets the
+        # linearized LTV/QP obstacle constraint stay feasible when the operating point
+        # sits inside the inflated obstacle.
+        self.declare_parameter('slack_weights_obstacle_avoidance', [1000.0])
+        self.declare_parameter('slack_upper_bound_obstacle_avoidance', [1000.0])
 
     def _init_solver(self) -> Optional[BaseSolver]:
         ode_type = self.get_parameter('ode_type').value
@@ -287,9 +294,20 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
         num_obstacles = self.get_parameter('num_obstacles').value
         collision_method = self.get_parameter('obstacle_collision_avoidance_method').value
 
+        def _size_obstacle_slack(param_name):
+            vals = list(self.get_parameter(param_name).get_parameter_value().double_array_value)
+            if not vals or num_obstacles <= 0:
+                return None
+            if len(vals) == 1:
+                return vals * num_obstacles
+            return vals
+        slack_weights_obs = _size_obstacle_slack('slack_weights_obstacle_avoidance')
+        slack_ub_obs = _size_obstacle_slack('slack_upper_bound_obstacle_avoidance')
+
         ego_radius = self.get_parameter('ego_radius').value
         if ego_radius <= 0.0:
             ego_radius = 2.731977273419954 / 1.3  # Carla Model 3 default
+        safe_distance = self.get_parameter('safe_distance').value
 
         model_type = 'continuous' if 'continuous' in ode_type else 'discrete'
 
@@ -302,17 +320,20 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
                 f"solver='{solver}') for ode_type='{ode_type}'. Supported combinations:\n"
                 f"{matrix}\nAll 'quad' paths require Rd > 0.")
         if solver_type == 'qp':
-            if use_opti or discrete_model_type != 'ltv' or 'discrete' not in ode_type or num_obstacles > 0:
+            if use_opti or discrete_model_type != 'ltv' or 'discrete' not in ode_type:
                 raise ValueError(
                     f"solver_type='qp' requires discrete_model_type='ltv', a discrete ode_type, "
-                    f"num_obstacles=0, and use_opti=False. Got ode_type='{ode_type}', "
-                    f"discrete_model_type='{discrete_model_type}', num_obstacles={num_obstacles}, "
+                    f"and use_opti=False. Got ode_type='{ode_type}', "
+                    f"discrete_model_type='{discrete_model_type}', "
                     f"use_opti={use_opti}.")
-        if discrete_model_type == 'ltv' and num_obstacles > 0:
+        if discrete_model_type == 'ltv' and num_obstacles > 0 and solver_type != 'qp':
             raise ValueError(
-                f"discrete_model_type='ltv' does not support obstacle avoidance "
-                f"(num_obstacles={num_obstacles} > 0). Set discrete_model_type='nonlinear' "
-                f"or num_obstacles=0.")
+                f"discrete_model_type='ltv' does not support obstacle avoidance for solver_type='{solver_type}'. "
+                f"Set discrete_model_type='nonlinear' or num_obstacles=0.")
+        if solver_type == 'qp' and num_obstacles > 0 and collision_method == 'cbf':
+            raise ValueError(
+                "solver_type='qp' does not support CBF obstacle avoidance. "
+                "CBF stays nlp-only. Use collision_avoidance_method='euclidean'.")
         # 'quad' / 'qp' (SQP/QP) paths need a non-zero input-rate penalty Rd to stay feasible.
         if not use_opti and solver_type in ('quad', 'qp') and not np.any(self.Rd.diagonal() > 0):
             self.get_logger().warn(
@@ -372,7 +393,9 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
                 code_gen_directory=code_gen_directory,
                 num_obstacles=num_obstacles,
                 collision_avoidance_scheme=collision_method,
-                ego_radius=ego_radius,
+                ego_radius=ego_radius, safe_distance=safe_distance,
+                slack_weights_obstacle_avoidance=slack_weights_obs,
+                slack_upper_bound_obstacle_avoidance=slack_ub_obs,
                 **common_kwargs)
 
         if model_type == 'discrete' and not use_opti:

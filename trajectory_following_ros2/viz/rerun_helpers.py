@@ -14,6 +14,13 @@ ENTITY = {
     'ref_window':        'world/paths/mpc_reference_window',
     'predicted':         'world/paths/mpc_predicted',
     'goal':              'world/paths/goal_point',
+    'obstacles_circles':         'world/obstacles/circles/actual',
+    'obstacles_margin_circles':  'world/obstacles/circles/margin',
+    'obstacles_boxes':           'world/obstacles/boxes/actual',
+    'obstacles_margin_boxes':    'world/obstacles/boxes/margin',
+    'vehicle_footprint':         'world/vehicle/footprint',
+    'ego_radius':                'world/vehicle/ego_radius',
+    'safe_distance':             'world/vehicle/safe_distance',
     # State
     'speed_actual':      'signals/state/speed_mps',
     'heading_deg':       'signals/state/heading_deg',
@@ -54,6 +61,11 @@ COLORS = {
     'commanded':  [255, 140,   0, 255],   # orange
     'reference':  [100, 120, 255, 255],   # blue
     'feedback':   [200, 100, 255, 255],   # purple
+    'obstacle':          [255,   0,   0, 255],   # solid red
+    'obstacle_margin':   [255,   0,   0,  64],   # translucent red
+    'ego_footprint':     [0,   255, 150, 255],   # bright mint green
+    'ego_radius':        [180,  50, 255,  30],   # translucent purple
+    'safe_distance':     [255, 165,   0,  15],   # translucent orange
 }
 
 
@@ -83,7 +95,7 @@ def build_blueprint():
     except ImportError:
         return None
 
-    spatial = rrb.Spatial2DView(name='World', origin='world', contents='world/**')
+    spatial = rrb.Spatial3DView(name='World', origin='world', contents='world/**')
 
     speed = rrb.TimeSeriesView(name='Speed (m/s)', contents=[
         ENTITY['speed_actual'],

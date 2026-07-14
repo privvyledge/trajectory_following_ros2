@@ -1,7 +1,10 @@
+import csv
 import logging
 import math
+import os
 import queue
 import threading
+import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -67,6 +70,7 @@ class BaseTrajectoryTracker(Node, ABC):
         self._setup_tf()
         self._setup_pub_sub()
         self._solver: Optional[BaseSolver] = self._init_solver()
+        self._setup_solver_log()
 
     # ------------------------------------------------------------------
     # Abstract / override points
@@ -78,6 +82,57 @@ class BaseTrajectoryTracker(Node, ABC):
 
     def _declare_backend_parameters(self) -> None:
         """Declare backend-specific ROS parameters. Override in subclasses."""
+
+    def _setup_solver_log(self) -> None:
+        """Open the per-solve stats CSV if ``solver_log_file`` is set (else disabled).
+
+        Backend-agnostic: writes one row per solve from the returned ``SolverResult``,
+        so every MPC backend is covered without touching the adapters. Failures here
+        never abort startup — a bad path just disables logging with a warning.
+        """
+        self._solver_log_fh = None
+        self._solver_log_writer = None
+        path = str(self.get_parameter('solver_log_file').value).strip()
+        if not path or self._solver is None:
+            return
+        try:
+            path = os.path.expanduser(path)
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self._solver_log_fh = open(path, 'w', newline='')
+            self._solver_log_writer = csv.writer(self._solver_log_fh)
+            self._solver_log_writer.writerow([
+                'wall_time', 'ref_idx', 'solve_time_ms', 'status', 'is_optimal',
+                'consecutive_failures', 'accel_cmd', 'steering_cmd', 'velocity_cmd', 'error',
+            ])
+            self._solver_log_fh.flush()
+            self.get_logger().info(f'Solver stats logging to {path}')
+        except OSError as exc:
+            self.get_logger().warn(f'Could not open solver_log_file ({path}): {exc}; disabling.')
+            self._solver_log_fh = None
+            self._solver_log_writer = None
+
+    def _log_solver_stats(self, result: SolverResult) -> None:
+        """Append one CSV row for this solve (no-op when logging is disabled)."""
+        if self._solver_log_writer is None:
+            return
+        try:
+            self._solver_log_writer.writerow([
+                f'{time.time():.6f}',
+                getattr(self, 'current_idx', -1),
+                f'{result.solve_time * 1e3:.4f}',
+                result.status,
+                int(result.is_optimal),
+                self._consecutive_failures,
+                f'{result.accel_cmd:.6f}',
+                f'{result.steering_cmd:.6f}',
+                f'{result.velocity_cmd:.6f}',
+                result.error or '',
+            ])
+            self._solver_log_fh.flush()
+        except (OSError, ValueError):
+            pass  # never let logging disturb the control loop
 
     # ------------------------------------------------------------------
     # Initialization helpers
@@ -95,6 +150,10 @@ class BaseTrajectoryTracker(Node, ABC):
         # point within ~100 ms of the live state; raise toward control_rate (20)
         # for tighter viz, lower on resource-constrained hardware (Jetson).
         self.declare_parameter('debug_frequency', 10.0)
+        # Per-solve solver-stats CSV log. Empty string (default) = disabled. When set
+        # to a path, one row per solve tick is appended (backend-agnostic: works for
+        # every MPC backend since it logs the returned SolverResult). Restart-only.
+        self.declare_parameter('solver_log_file', '')
         self.declare_parameter('distance_tolerance', 0.2)
         self.declare_parameter('speed_tolerance', 0.5)
         self.declare_parameter('wheelbase', 0.256)
@@ -139,6 +198,15 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('use_speed_profile', True)    # track the recorded speed profile over the horizon
         self.declare_parameter('max_lateral_accel', 3.0)     # m/s²; curvature speed cap v ≤ sqrt(a_lat/|κ|). 0 disables
         self.declare_parameter('min_reference_speed', 0.3)   # m/s; forward creep floor to lift a noisy near-zero start
+        # Reference-index advance mode. True = along-track (arc-length) projection: the
+        # target index advances with longitudinal progress even when the vehicle is held
+        # laterally off the line (obstacle-avoidance swerve), so it never freezes at a
+        # standoff. False = legacy Euclidean distance-gate. See utils/Trajectory.py.
+        self.declare_parameter('arclength_index_advance', True)
+        # Forward arc-length span (m) of the arc-length projection window. Kept short
+        # so the projection cannot leap to end-of-path points sitting physically near
+        # the start on a closed loop; must be < loop length and > one tick's travel.
+        self.declare_parameter('projection_window', 5.0)
         self.declare_parameter(
             'loop', 0,
             ParameterDescriptor(
@@ -153,6 +221,9 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('debug', False)
         self.declare_parameter('num_obstacles', 0)
         self.declare_parameter('ego_radius', -1.0)
+        # Extra keep-out buffer added to (ego_radius + obstacle_radius) when building
+        # the obstacle constraint. Restart-only (baked into the OCP at build time).
+        self.declare_parameter('safe_distance', 0.5)
         self.declare_parameter('obstacle_topic', 'fake_obstacles/object_array')
         self.declare_parameter('obstacle_collision_avoidance_method', 'euclidean')
         self.declare_parameter('actuator_feedback_topic', '')
@@ -230,6 +301,8 @@ class BaseTrajectoryTracker(Node, ABC):
         self.desired_speed = self._gp('desired_speed')
         self.use_speed_profile = self._gp('use_speed_profile')
         self.max_lateral_accel = self._gp('max_lateral_accel')
+        self.arclength_index_advance = self._gp('arclength_index_advance')
+        self.projection_window = self._gp('projection_window')
         self.min_reference_speed = self._gp('min_reference_speed')
         self.loop = int(self._gp('loop'))
         self.n_ind_search = self._gp('n_ind_search')
@@ -769,10 +842,16 @@ class BaseTrajectoryTracker(Node, ABC):
             u_prev_snapshot = self.u_prev.copy()
 
         if self.delay_compensation_enabled and self.estimated_delay > 0.0:
+            x0_raw = x0.copy()
             x0 = trajectory_utils.predict_state_rk4(
-                x0, u_prev_snapshot.flatten(), self.estimated_delay, self.WHEELBASE)
+                x0_raw, u_prev_snapshot.flatten(), self.estimated_delay, self.WHEELBASE)
+            self.get_logger().info(
+                f'Delay compensation ({self.estimated_delay * 1e3:.0f} ms): x0 '
+                f'{np.round(x0_raw, 4)} -> {np.round(x0, 4)}',
+                throttle_duration_sec=5.0)
 
         result: SolverResult = self._solver.solve(x0, xref, u_prev_snapshot.flatten())
+        self._log_solver_stats(result)
 
         # 11. Track consecutive failures. On an isolated suboptimal solve, hold the
         #     last good command instead of applying the (possibly saturated/garbage)
@@ -891,6 +970,8 @@ class BaseTrajectoryTracker(Node, ABC):
         self.trajectory.a_lat_max = self.max_lateral_accel
         self.trajectory.min_reference_speed = self.min_reference_speed
         self.trajectory.max_reference_speed = self.MAX_SPEED
+        self.trajectory.arclength_index_advance = self.arclength_index_advance
+        self.trajectory.projection_window = self.projection_window
 
     def _reset_lap_progress(self):
         """Reset trajectory progress to the start of the path.
@@ -982,7 +1063,7 @@ class BaseTrajectoryTracker(Node, ABC):
         # waypoints ahead, the end_of_path terminator latches final_goal_reached, and the
         # controller reports "Final goal reached." on tick 1 without ever moving. This is
         # the classic platform/waypoint scale mismatch (e.g. CARLA's 5 m tolerance on the
-        # F1/10 ~3 m path). See buglog bug-042.
+        # F1/10 ~3 m path).
         xy = self.path[:, :2]
         extent = float(np.linalg.norm(xy.max(axis=0) - xy.min(axis=0)))
         if self.distance_tolerance >= extent:
@@ -1145,19 +1226,31 @@ class BaseTrajectoryTracker(Node, ABC):
                 ref_msg.poses.append(pose)
             self.mpc_reference_path_pub.publish(ref_msg)
 
-    def _recompute_weights(self):
-        """Read Q/R/Rd/Qf from current ROS parameters (or Bryson's rule) and update self."""
-        if self._gp('use_bryson_weights'):
+    def _recompute_weights(self, overrides=None):
+        """Read Q/R/Rd/Qf from current ROS parameters (or Bryson's rule) and update self.
+
+        ``overrides`` maps parameter names to proposed values supplied by an
+        in-progress set-parameters callback. Inside such a callback the parameters
+        have not been committed yet, so ``get_parameter`` still returns the
+        pre-change values; the overrides take precedence so a runtime weight update
+        applies the just-set values immediately instead of lagging by one update.
+        """
+        overrides = overrides or {}
+
+        def _val(name):
+            return overrides[name] if name in overrides else self._gp(name)
+
+        if _val('use_bryson_weights'):
             self.Q, self.R, _Rd = bryson_weights(
                 max_state_errors={
-                    'x':   self._gp('max_error_x'),
-                    'y':   self._gp('max_error_y'),
-                    'v':   self._gp('max_error_v'),
-                    'psi': self._gp('max_error_psi'),
+                    'x':   _val('max_error_x'),
+                    'y':   _val('max_error_y'),
+                    'v':   _val('max_error_v'),
+                    'psi': _val('max_error_psi'),
                 },
                 max_inputs={
-                    'a':     self._gp('bryson_max_accel'),
-                    'delta': self._gp('bryson_max_steer'),
+                    'a':     _val('bryson_max_accel'),
+                    'delta': _val('bryson_max_steer'),
                 },
                 max_input_rates={
                     'jerk':       abs(self._gp('max_jerk')),
@@ -1167,15 +1260,26 @@ class BaseTrajectoryTracker(Node, ABC):
             self.Rd = _Rd
             self.Qf = self.Q.copy()
         else:
-            self.R = np.diag(self.get_parameter('R').get_parameter_value().double_array_value)
-            self.Rd = np.diag(self.get_parameter('Rd').get_parameter_value().double_array_value)
-            self.Q = np.diag(self.get_parameter('Q').get_parameter_value().double_array_value)
-            qf_vals = self.get_parameter('Qf').get_parameter_value().double_array_value
-            self.Qf = np.diag(qf_vals) if qf_vals is not None else self.Q.copy()
+            self.R = np.diag(_val('R'))
+            self.Rd = np.diag(_val('Rd'))
+            self.Q = np.diag(_val('Q'))
+            qf_vals = _val('Qf')
+            self.Qf = np.diag(qf_vals) if qf_vals is not None and len(qf_vals) \
+                else self.Q.copy()
 
     def parameter_change_callback(self, params):
         result = SetParametersResult(successful=True)
+        # Weight params are validated + accumulated across the batch, then applied
+        # once after the loop (an atomic set may change several at the same time).
+        _weight_names = ('Q', 'R', 'Rd', 'Qf', 'use_bryson_weights',
+                         'max_error_x', 'max_error_y', 'max_error_v', 'max_error_psi',
+                         'bryson_max_accel', 'bryson_max_steer')
+        _weight_expected_len = {'Q': self.NX, 'Qf': self.NX,
+                                'R': self.NU, 'Rd': self.NU}
+        weight_overrides = {}
+        weights_changed = False
         for param in params:
+            success = True
             if param.name == 'robot_frame':
                 self.robot_frame = param.value
             elif param.name == 'global_frame':
@@ -1198,6 +1302,12 @@ class BaseTrajectoryTracker(Node, ABC):
             elif param.name == 'min_reference_speed':
                 self.min_reference_speed = param.value
                 self._apply_speed_policy()
+            elif param.name == 'arclength_index_advance':
+                self.arclength_index_advance = param.value
+                self._apply_speed_policy()
+            elif param.name == 'projection_window':
+                self.projection_window = param.value
+                self._apply_speed_policy()
             elif param.name == 'min_speed':
                 self.MIN_SPEED = param.value
             elif param.name == 'max_accel':
@@ -1208,16 +1318,28 @@ class BaseTrajectoryTracker(Node, ABC):
                 self.desired_speed = param.value
             elif param.name == 'loop':
                 self.loop = int(param.value)
-            elif param.name in ('Q', 'R', 'Rd', 'Qf', 'use_bryson_weights',
-                                'max_error_x', 'max_error_y', 'max_error_v', 'max_error_psi',
-                                'bryson_max_accel', 'bryson_max_steer'):
-                self._recompute_weights()
-                if self._solver is not None:
-                    self._solver.set_weights(self.Q, self.R, self.Rd, self.Qf)
+            elif param.name in _weight_names:
+                exp = _weight_expected_len.get(param.name)
+                if exp is not None and len(param.value) != exp:
+                    success = False
+                    self.get_logger().error(
+                        f'Rejected {param.name}: expected {exp} elements, got '
+                        f'{len(param.value)}; retaining previous weights.')
+                else:
+                    weight_overrides[param.name] = param.value
+                    weights_changed = True
             else:
+                success = False
+            if not success:
                 result.successful = False
             self.get_logger().info(
-                f'Param change: {param.name}={param.value} success={result.successful}')
+                f'Param change: {param.name}={param.value} success={success}')
+        # A pre-set callback that returns unsuccessful vetoes the whole atomic set,
+        # so only apply the recompute when every param in the batch was accepted.
+        if weights_changed and result.successful:
+            self._recompute_weights(overrides=weight_overrides)
+            if self._solver is not None:
+                self._solver.set_weights(self.Q, self.R, self.Rd, self.Qf)
         return result
 
     @staticmethod

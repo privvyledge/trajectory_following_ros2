@@ -1,13 +1,34 @@
 /**:
   ros__parameters:
     # ---------------------------------------------------------------------------
-    # CARLA × CasADi — UNTUNED. Seeded from the known-good carla_do_mpc set +
-    # CasADi solver/discrete-model config. Overlay (highest wins):
-    # weights > platforms/carla.yaml > base. RE-TUNE for CasADi.
+    # CARLA × CasADi — TUNED (Town01 moving route). Completes cleanly, 0 failures.
+    # True cross-track (recorded odom vs full published path): mean 0.032 m,
+    # median 0.000 m, max 0.298 m — the whole run stays under 0.30 m, including the
+    # two R~11-12 m hairpins (corner CTE 0.28-0.30 m, down from ~2.5 m).
+    #
+    # The corner cut was NOT a weight ceiling / formulation limit. The dominant
+    # levers were two params that appear as speed/geometry settings, tuned together:
+    #   * distance_tolerance 5.0 -> 2.5 : GOAL_DIS = distance_tolerance is the
+    #     min_search_radius for the reference nearest-index lookup, so the reference
+    #     is anchored that far AHEAD of the car. At 5.0 m the anchor sat past the
+    #     R~12 m corner apex -> the controller aimed across the chord and cut ~2.5 m.
+    #     2.5 m anchors near the vehicle (biggest single win: corner 2.5 -> 0.5 m).
+    #     Do NOT go below ~2.5: at <=2.0 the preview is too short and route progress
+    #     stalls (index-advance limitation; the car creeps to a stop at a corner).
+    #   * max_lateral_accel 3.0 -> 1.2 : curvature speed cap v <= sqrt(a_lat/|kappa|)
+    #     slows the car to ~5 m/s through the hairpins so it can hold the line.
+    # Plus modest position authority (Q_pos=5) with high steering-rate damping
+    # (Rd_δ=1000) for stability on the ~9 m/s straights, and a low accel-axis
+    # penalty (R_a=0.5, Rd_a=1) so it can brake into the corners. Velocity weight
+    # highest in Q/Qf, yaw lowest.
+    #
+    # Overlay (highest wins): weights > platforms/carla.yaml > base. The
+    # distance_tolerance / max_lateral_accel overrides below intentionally beat the
+    # platform file (rclpy multi --params-file is last-wins).
     # ---------------------------------------------------------------------------
-    horizon: 50
+    horizon: 25
     sample_time: 0.05
-    prediction_time: 2.5
+    prediction_time: 1.25
     max_iter: 200          # quad/qrqp outer iters
     termination_condition: 0.0001
 
@@ -17,19 +38,26 @@
     discrete_integration_method: rk4
     # use_opti is a formulation selector, not a weight — do NOT pin it here.
     # closed_loop_sim.launch.py applies `use_opti` after this overlay so the
-    # `use_opti:=true|false` launch arg (default false) is authoritative; pinning
-    # it here would silently override the CLI. Set it via the launch arg instead.
+    # `use_opti:=true|false` launch arg (default false) is authoritative.
     # use_opti: False
 
-    Q:  [1.0, 1.0, 10.0, 0.01]
-    R:  [10.0, 100.0]
-    Rd: [100.0, 1000.0]
-    Qf: [0.002, 0.002, 0.0001, 0.00001]
+    Q:  [5.0, 5.0, 15.0, 0.05]
+    R:  [0.5, 100.0]
+    Rd: [1.0, 1000.0]
+    Qf: [10.0, 10.0, 30.0, 0.1]
     use_bryson_weights: false
+    # PD Hessian: required for a well-conditioned qrqp QP. Without it the u-rate
+    # slack leaves zero rows in the Hessian -> singular H -> multi-second solves
+    # and Search_Direction_Becomes_Too_Small at fast corners.
+    slack_objective_is_quadratic: True
 
     use_speed_profile: True
-    max_lateral_accel: 3.0
+    max_lateral_accel: 1.2     # curvature speed cap; slows the hairpins to ~5 m/s
     min_reference_speed: 0.3
+
+    # Reference anchor distance. Platform default 5.0 m over-anchors and cuts the
+    # R~12 m corners; 2.5 m tracks the near path. Do NOT drop below ~2.5 (stalls).
+    distance_tolerance: 2.5
 
     # Build once, then flip to False to skip the per-launch recompile
     # (acados C-gen / do_mpc AOT ~min; casadi JIT ~secs). Re-True only if

@@ -44,7 +44,10 @@ class KinematicMPCCasadiOpti(object):
                  Qf=(0.0, 0.0, 0.0, 0.0), Rd=(0.0, 0.0),
                  vel_bound=(-5.0, 5.0), delta_bound=(-np.radians(23.0), np.radians(23.0)), acc_bound=(-3.0, 3.0),
                  jerk_bound=(-1.5, 1.5), delta_rate_bound=(-np.radians(352.9411764706), np.radians(352.9411764706)),
-                 warmstart=True, solver_options=None, solver_type='nlp', solver='ipopt', suppress_ipopt_output=True,
+                 warmstart=True, solver_options=None, solver_type='nlp', solver='ipopt',
+                 suppress_ipopt_output=None, suppress_solver_output=True,
+                 sqp_convexify_strategy='regularize', sqp_hessian_approximation='exact',
+                 qp_inner_max_iter=0,
                  max_iter=2000,
                  normalize_yaw_error=True,
                  slack_weights_u_rate=(0.0, 0.0),  # (1e-6, 1e-6)
@@ -145,8 +148,11 @@ class KinematicMPCCasadiOpti(object):
                 u0 = u0.flatten().tolist()
             self.update_previous_input(u0[0], u0[1])
 
+        # suppress_ipopt_output is the legacy per-solver override; None means "defer to
+        # the unified suppress_solver_output flag". A non-None value keeps overriding.
+        effective_suppress = suppress_solver_output if suppress_ipopt_output is None else suppress_ipopt_output
         self.solver = self.setup_solver(self.cost, solver_options=self.solver_options, solver=self.solver_,
-                                        suppress_output=suppress_ipopt_output)  # returns None when using Opti
+                                        suppress_output=effective_suppress)  # returns None when using Opti
 
         self.solution = self.solve()
 

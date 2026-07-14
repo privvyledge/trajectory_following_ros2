@@ -12,6 +12,7 @@ from ament_index_python.packages import get_package_share_directory
 from trajectory_following_ros2.base_tracker import BaseTrajectoryTracker, _make_executor
 from trajectory_following_ros2.backends.base_solver import BaseSolver, SolverResult
 from trajectory_following_ros2.acados.acados_settings import acados_settings
+from trajectory_following_ros2.utils.trajectory_utils import project_reference_out_of_keepouts
 
 
 class AcadosSolverAdapter(BaseSolver):
@@ -21,6 +22,7 @@ class AcadosSolverAdapter(BaseSolver):
                  stage_cost_type: str = 'NONLINEAR_LS',
                  terminal_cost_type: str = 'NONLINEAR_LS',
                  num_obstacles: int = 0, ego_radius: float = 1.0,
+                 safe_distance: float = 0.5,
                  has_weight_params: bool = False,
                  Q: Optional[np.ndarray] = None,
                  R: Optional[np.ndarray] = None,
@@ -33,7 +35,9 @@ class AcadosSolverAdapter(BaseSolver):
         self._terminal_cost_type = terminal_cost_type
         self._num_obstacles = num_obstacles
         self._ego_radius = ego_radius
+        self._safe_distance = safe_distance
         self._obstacle_states: Optional[np.ndarray] = None  # (3*n_obs, N+1)
+        self._keepout_side_hints: Optional[list] = None  # go-around side memory
         self._has_weight_params = has_weight_params
         if has_weight_params:
             self._Q_diag = np.diag(Q) if Q is not None else np.ones(4)
@@ -58,6 +62,24 @@ class AcadosSolverAdapter(BaseSolver):
             return [*self._obstacle_states[:, k], self._ego_radius]
         return [*([1000.0, 1000.0, 1.0] * self._num_obstacles), self._ego_radius]
 
+    def _recover_from_failure(self, x0: np.ndarray, xref: np.ndarray) -> None:
+        """Reset the solver after a failed solve and re-seed a clean iterate.
+
+        Zeroes the primal/dual iterate and the QP-solver memory, then seeds the
+        state trajectory from the current state + (keep-out-projected) reference
+        and the inputs with zeros, so the next solve is a well-posed cold start
+        instead of a re-linearization at a degenerate (possibly NaN) iterate.
+        """
+        try:
+            self._controller.reset()
+        except Exception:  # older interface without reset(): reseeding still helps
+            pass
+        self._controller.set(0, 'x', np.asarray(x0, dtype=float))
+        for i in range(1, self._horizon + 1):
+            self._controller.set(i, 'x', np.asarray(xref[:, i], dtype=float))
+        for i in range(self._horizon):
+            self._controller.set(i, 'u', np.zeros(2))
+
     def initialize(self, x0: np.ndarray) -> None:
         for i in range(self._horizon + 1):
             self._controller.set(i, 'x', x0)
@@ -72,6 +94,20 @@ class AcadosSolverAdapter(BaseSolver):
         # x0: (4,); xref: (4, N+1); u_prev: (2,)
         self._controller.constraints_set(0, 'lbx', x0)
         self._controller.constraints_set(0, 'ubx', x0)
+
+        # Keep the tracked target feasible: reference points inside an obstacle
+        # keep-out are swept onto its boundary (go-around arc). Without this, a
+        # reference threading the keep-out makes "park at the bubble edge" the
+        # optimum; at v=0 steering has no yaw authority and the vehicle never
+        # detours. Copy first — the caller's xref feeds the debug/reference
+        # publishers and must stay the raw reference.
+        if self._num_obstacles > 0 and self._obstacle_states is not None:
+            obs0 = np.asarray(self._obstacle_states[:, 0], dtype=float).reshape(
+                self._num_obstacles, 3)
+            keepouts = self._ego_radius + obs0[:, 2] + self._safe_distance
+            xref, _, self._keepout_side_hints = project_reference_out_of_keepouts(
+                xref.copy(), obs0[:, :2], keepouts,
+                side_hints=self._keepout_side_hints)
 
         weight_params = (
             [*self._Q_diag, *self._R_diag, *self._Qe_diag, *self._Rd_diag]
@@ -139,6 +175,37 @@ class AcadosSolverAdapter(BaseSolver):
         except Exception:
             solve_time = solve_time_cpu
 
+        # Real-time-iteration-style acceptance: status 2 (max SQP iterations) is a
+        # budget-limited return, not a blow-up — near a nonconvex obstacle keep-out
+        # the SQP can cycle on the stationarity residual while every inner QP
+        # succeeds, and applying the near-converged iterate keeps the vehicle
+        # progressing (the CasADi adapter applies the same policy to
+        # Maximum_Iterations_Exceeded). Only a non-finite iterate is rejected;
+        # genuinely degenerate statuses (QP failure, NaN detection) still count as
+        # failures and feed the consecutive-failure zero-command safety fallback.
+        finite = bool(np.isfinite(u).all() and np.isfinite(x_seq).all())
+        is_optimal = finite and status in (0, 2)
+
+        if not is_optimal:
+            # A failed solve can leave a degenerate iterate in the solver memory
+            # (worst case NaN after an inner-QP failure). acados warm-starts every
+            # solve from that memory, so without a reset each later solve
+            # re-linearizes at the poisoned iterate and fails at the first QP —
+            # the failure becomes permanent even when a cold-started solve would
+            # succeed. Reset the solver (incl. QP-solver memory) and re-seed from
+            # the current state/reference so the next tick starts well-posed;
+            # the CasADi adapter recovers the same way (reference cold start
+            # after a degenerate solve).
+            self._recover_from_failure(x0, xref)
+
+        if not finite:
+            # Never let a non-finite iterate reach the published command, the
+            # u_prev echo, or the predicted-path debug topic.
+            u = np.zeros(2)
+            u_seq = np.zeros((2, self._horizon))
+            x_seq = np.tile(np.asarray(x0, dtype=float).reshape(4, 1),
+                            (1, self._horizon + 1))
+
         return SolverResult(
             accel_cmd=float(u[0]),
             steering_cmd=float(u[1]),
@@ -146,7 +213,7 @@ class AcadosSolverAdapter(BaseSolver):
             u_sequence=u_seq,
             x_sequence=x_seq,
             u_prev=u.copy(),
-            is_optimal=(status == 0),
+            is_optimal=is_optimal,
             solve_time=solve_time,
             status=str(status),
         )
@@ -168,15 +235,25 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
 
     def _declare_backend_parameters(self):
         self.declare_parameter('ode_type', 'continuous_kinematic_coupled')
-        self.declare_parameter('stage_cost_type', 'NONLINEAR_LS')
-        self.declare_parameter('terminal_cost_type', 'NONLINEAR_LS')
+        # EXTERNAL is the default: it is the only cost module that applies the Rd
+        # input-rate penalty (LINEAR_LS/NONLINEAR_LS silently drop it, so tuned
+        # steering-rate damping vanishes and steering jitters) and the only one that
+        # enables obstacle/CBF constraints. Its EXACT-Hessian cost (~5 ms/solve) is
+        # negligible against the control budget. Override to *_LS only for a pure
+        # tracking cost with no rate penalty.
+        self.declare_parameter('stage_cost_type', 'EXTERNAL')
+        self.declare_parameter('terminal_cost_type', 'EXTERNAL')
         self.declare_parameter('max_iter', 15)
         self.declare_parameter('termination_condition', 1e-6)
         self.declare_parameter('scale_cost', False)
         self.declare_parameter('generate_mpc_model', True)
         self.declare_parameter('build_with_cython', True)
         self.declare_parameter('qp_solver', 'PARTIAL_CONDENSING_HPIPM')
-        self.declare_parameter('nlp_solver_type', 'SQP_RTI')
+        # Full SQP by default (not single-iteration SQP_RTI): one RTI step is too
+        # weak at a sharp corner under odometry noise + actuator lag and silently
+        # stalls (index freezes, cross-track error diverges, no failure flag). Full
+        # SQP tracks robustly. Use SQP_RTI only for a clean sim or a hard timing budget.
+        self.declare_parameter('nlp_solver_type', 'SQP')
         # 'ERK' (default, continuous ODE) or 'DISCRETE' (RK4 one-step map via
         # model.disc_dyn_expr). Consumed at model-build time; a restart is
         # required to change it (not hot-reloadable — the base parameter callback
@@ -189,10 +266,33 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
                                    get_package_share_directory('trajectory_following_ros2'),
                                    'data', 'model'))
         self.declare_parameter('obstacle_slack_weight', 100.0)
+        # In-solver input-rate (slew) limiting. acados otherwise only penalizes the
+        # input rate via the Rd cost and never bounds it, so the solver can plan a
+        # slew faster than the actuator and get post-clipped (tracking mismatch). When
+        # enabled, a soft stage-0 constraint bounds |u0 - u_prev| to MAX_JERK*dt and
+        # MAX_STEER_RATE*dt — parity with the CasADi backend. Restart-only (changes the
+        # OCP structure; needs generate_mpc_model=True to re-codegen).
+        self.declare_parameter('enforce_input_rate_constraint', True)
+        self.declare_parameter('input_rate_slack_weight', 1000.0)
 
     def _init_solver(self) -> Optional[BaseSolver]:
         stage_cost_type = self.get_parameter('stage_cost_type').value
         terminal_cost_type = self.get_parameter('terminal_cost_type').value
+
+        # The Rd input-rate penalty and obstacle/CBF constraints live ONLY in the
+        # EXTERNAL cost branch. LINEAR_LS/NONLINEAR_LS silently drop Rd (steering then
+        # jitters) and cannot carry obstacle constraints — warn loudly so a non-EXTERNAL
+        # choice is a deliberate decision, not a silent regression.
+        if stage_cost_type != 'EXTERNAL':
+            self.get_logger().warn(
+                f"stage_cost_type='{stage_cost_type}' (not EXTERNAL): the Rd input-rate "
+                "penalty is dropped (steering may jitter) and obstacle/CBF constraints are "
+                "unavailable. Set stage_cost_type:=EXTERNAL to enable them.")
+        if terminal_cost_type != 'EXTERNAL':
+            self.get_logger().warn(
+                f"terminal_cost_type='{terminal_cost_type}' (not EXTERNAL): no terminal Rd "
+                "rate penalty. Set terminal_cost_type:=EXTERNAL for parity with the stage cost.")
+
         max_iter = int(self.get_parameter('max_iter').value)
         tol = self.get_parameter('termination_condition').value
         scale_cost = self.get_parameter('scale_cost').value
@@ -210,7 +310,10 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         num_obstacles = self.get_parameter('num_obstacles').value
         collision_method = self.get_parameter('obstacle_collision_avoidance_method').value
         ego_radius = self.get_parameter('ego_radius').value
+        safe_distance = self.get_parameter('safe_distance').value
         obstacle_slack_weight = self.get_parameter('obstacle_slack_weight').value
+        enforce_input_rate = bool(self.get_parameter('enforce_input_rate_constraint').value)
+        input_rate_slack_weight = float(self.get_parameter('input_rate_slack_weight').value)
 
         if ego_radius <= 0.0:
             ego_radius = 2.731977273419954 / 1.3  # Carla Model 3 default
@@ -239,6 +342,14 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
             self.get_logger().info('Loading pre-built acados OCP solver...')
 
         self.get_logger().info(f'acados integrator_type: {integrator_type}')
+        if enforce_input_rate:
+            self.get_logger().info(
+                'acados input-rate constraint: ON (soft stage-0 bound |u0 - u_prev| <= '
+                f'[jerk {self.MAX_JERK:.3g} m/s^3, steer_rate {self.MAX_STEER_RATE:.3g} rad/s] * dt, '
+                f'slack weight {input_rate_slack_weight:.3g}).')
+        else:
+            self.get_logger().info(
+                'acados input-rate constraint: OFF (input rate penalized only via Rd cost).')
 
         cwd = os.getcwd()
         os.chdir(build_path)
@@ -267,7 +378,11 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
             code_export_directory=build_path,
             num_obstacles=num_obstacles,
             ego_radius=ego_radius,
+            safe_distance=safe_distance,
             obstacle_slack_weight=obstacle_slack_weight,
+            steer_rate_max=(self.MAX_STEER_RATE if enforce_input_rate else None),
+            jerk_max=(self.MAX_JERK if enforce_input_rate else None),
+            input_rate_slack_weight=input_rate_slack_weight,
         )
 
         os.chdir(cwd)
@@ -284,6 +399,7 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
             terminal_cost_type=terminal_cost_type,
             num_obstacles=num_obstacles,
             ego_radius=ego_radius,
+            safe_distance=safe_distance,
             has_weight_params=has_weight_params,
             Q=self.Q, R=self.R, Qe=self.Qf, Rd=self.Rd,
         )

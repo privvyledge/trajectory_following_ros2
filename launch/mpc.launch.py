@@ -89,6 +89,8 @@ def generate_launch_description():
     # # Trajectory/goal parameters
     distance_tolerance = LaunchConfiguration('distance_tolerance')
     speed_tolerance = LaunchConfiguration('speed_tolerance')
+    arclength_index_advance = LaunchConfiguration('arclength_index_advance')
+    projection_window = LaunchConfiguration('projection_window')
 
     # #  Topics
     odom_topic = LaunchConfiguration('odom_topic', default="odometry/local")
@@ -385,13 +387,14 @@ def generate_launch_description():
     )
     stage_cost_type_la = DeclareLaunchArgument(
             'stage_cost_type',
-            default_value='NONLINEAR_LS',
-            description='Stage cost type. LINEAR_LS, NONLINEAR_LS, EXTERNAL'
+            default_value='EXTERNAL',
+            description='Stage cost type. EXTERNAL (default), NONLINEAR_LS, LINEAR_LS. '
+                        'Only EXTERNAL carries the Rd input-rate penalty and enables obstacles.'
     )
     terminal_cost_type_la = DeclareLaunchArgument(
             'terminal_cost_type',
-            default_value='NONLINEAR_LS',
-            description='Terminal cost type. LINEAR_LS, NONLINEAR_LS, EXTERNAL'
+            default_value='EXTERNAL',
+            description='Terminal cost type. EXTERNAL (default), NONLINEAR_LS, LINEAR_LS.'
     )
     generate_mpc_model_la = DeclareLaunchArgument(
             'generate_mpc_model',
@@ -413,6 +416,23 @@ def generate_launch_description():
             'distance_tolerance',
             default_value='0.2',
             description='Distance tolerance for arrival.'
+    )
+    arclength_index_advance_la = DeclareLaunchArgument(
+            'arclength_index_advance',
+            default_value='True',
+            description='Reference-index advance mode. True = along-track '
+                        '(arc-length) projection: the index advances with longitudinal '
+                        'progress even when the vehicle is held laterally off the line '
+                        '(obstacle swerve), never freezing at a standoff. False = legacy '
+                        'Euclidean distance-gate.'
+    )
+    projection_window_la = DeclareLaunchArgument(
+            'projection_window',
+            default_value='5.0',
+            description='Forward arc-length span (m) of the arc-length projection '
+                        'window. Kept short so the projection cannot leap to '
+                        'end-of-path points sitting near the start on a closed loop; '
+                        'must be < loop length and > one tick of travel.'
     )
     speed_tolerance_la = DeclareLaunchArgument(
             'speed_tolerance',
@@ -523,6 +543,7 @@ def generate_launch_description():
              stage_cost_type_la, terminal_cost_type_la,
              generate_mpc_model_la, build_with_cython_la, code_gen_directory_la,
              distance_tolerance_la, speed_tolerance_la,
+             arclength_index_advance_la, projection_window_la,
              declare_log_level_cmd,
              odom_topic_la, ackermann_cmd_topic_la, twist_topic_la, acceleration_topic_la, path_topic_la,
              speed_topic_la, debug_frequency_la,
@@ -721,6 +742,8 @@ def generate_launch_description():
                 SetParameter(name='terminal_cost_type', value=terminal_cost_type, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='distance_tolerance', value=distance_tolerance, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='speed_tolerance', value=speed_tolerance, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='arclength_index_advance', value=arclength_index_advance, condition=IfCondition(load_params_from_args)),
+                SetParameter(name='projection_window', value=projection_window, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='odom_topic', value=odom_topic, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='ackermann_cmd_topic', value=ackermann_cmd_topic, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='twist_topic', value=twist_topic, condition=IfCondition(load_params_from_args)),

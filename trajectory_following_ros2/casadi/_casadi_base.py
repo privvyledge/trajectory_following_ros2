@@ -36,7 +36,7 @@ class KinematicMPCBase(ABC):
                  slack_objective_is_quadratic=False,
                  code_gen_mode='jit',
                  num_obstacles=0, collision_avoidance_scheme='euclidean',
-                 ego_radius=None,
+                 ego_radius=None, safe_distance=0.5,
                  slack_weights_obstacle_avoidance=None,
                  slack_upper_bound_obstacle_avoidance=None):
 
@@ -164,7 +164,11 @@ class KinematicMPCBase(ABC):
         self.obstacles_value = np.ones((3 * self.n_obstacles, horizon + 1)) * 1000.0
         self.obstacle_distances = None
         self.obstacle_distances_value = np.ones((self.n_obstacles, horizon + 1)) * np.inf
-        self.safe_distance = 0.5
+        self.safe_distance = safe_distance
+        # Regularizes the distance norm when linearizing the obstacle constraint about
+        # an operating point (the QP/LTV path). Keeps the gradient finite if an
+        # operating point ever coincides with an obstacle centre (norm derivative 0/0).
+        self._obstacle_linearization_eps = 1e-3
         self.collision_avoidance_scheme = collision_avoidance_scheme
 
         if self.n_obstacles > 0:
@@ -208,21 +212,25 @@ class KinematicMPCBase(ABC):
             ['u_prev_k', 'u_k'], ['u_rate_k'])
 
         if self.n_obstacles > 0:
+            func_inputs = [self.z_k, self.z_dv, self.obstacles, self.ego_radius]
+            func_input_names = ['z_k', 'z_dv', 'obstacles', 'ego_radius']
             if not casadi.is_equal(self.P_obstacle_avoidance,
                                    casadi.DM.zeros(self.n_obstacles, self.n_obstacles)):
-                self.obstacle_distances_func = casadi.Function(
-                    "obstacle_distances",
-                    [self.z_k, self.z_dv, self.obstacles, self.ego_radius, self.sl_obs_dv],
-                    [self.obstacle_distances],
-                    ['z_k', 'z_dv', 'obstacles', 'ego_radius', 'slack_obs'],
-                    ['obstacle_distances'])
-            else:
-                self.obstacle_distances_func = casadi.Function(
-                    "obstacle_distances",
-                    [self.z_k, self.z_dv, self.obstacles, self.ego_radius],
-                    [self.obstacle_distances],
-                    ['z_k', 'z_dv', 'obstacles', 'ego_radius'],
-                    ['obstacle_distances'])
+                func_inputs.append(self.sl_obs_dv)
+                func_input_names.append('slack_obs')
+            if self.z_op_dv is not None:
+                func_inputs.append(self.z_op_dv)
+                func_input_names.append('z_op')
+            if self.u_op_dv is not None:
+                func_inputs.append(self.u_op_dv)
+                func_input_names.append('u_op')
+
+            self.obstacle_distances_func = casadi.Function(
+                "obstacle_distances",
+                func_inputs,
+                [self.obstacle_distances],
+                func_input_names,
+                ['obstacle_distances'])
             self.ego_radius_func = casadi.Function(
                 "ego_radius", [self.ego_radius], [self.ego_radius],
                 ['ego_radius_value'], ['ego_radius'])
@@ -414,12 +422,15 @@ class KinematicMPCBase(ABC):
 
     def update_obstacle_distances(self, z_k, z_dv, obstacles_state, ego_radius,
                                   slack_obs=None):
-        if slack_obs is None:
-            self.obstacle_distances_value = self.obstacle_distances_func(
-                z_k, z_dv, obstacles_state, ego_radius).full()
-        else:
-            self.obstacle_distances_value = self.obstacle_distances_func(
-                z_k, z_dv, obstacles_state, ego_radius, slack_obs).full()
+        args = [z_k, z_dv, obstacles_state, ego_radius]
+        if not casadi.is_equal(self.P_obstacle_avoidance,
+                               casadi.DM.zeros(self.n_obstacles, self.n_obstacles)) and slack_obs is not None:
+            args.append(slack_obs)
+        if self.z_op_dv is not None:
+            args.append(self._z_op)
+        if self.u_op_dv is not None:
+            args.append(self._u_op)
+        self.obstacle_distances_value = self.obstacle_distances_func(*args).full()
 
     def update_ego_radius(self, ego_radius):
         self.ego_radius_value = self.ego_radius_func(ego_radius).full().item()
@@ -453,6 +464,19 @@ class KinematicMPCBase(ABC):
             else:
                 self._z_op = np.copy(self.z_dv_value)
                 self._u_op = np.copy(self.u_dv_value)
+
+    def _linearize(self, expr, vars_vec, op_vec):
+        """
+        Generic helper to linearize a nonlinear expression `expr` (which depends on
+        decision variables `vars_vec`) around the operating point `op_vec`.
+        Returns the first-order Taylor expansion: g_lin = g(op) + J_g(op) * (vars - op).
+        """
+        g_op = casadi.substitute(expr, vars_vec, op_vec)
+        vars_flat = casadi.vec(vars_vec)
+        op_flat = casadi.vec(op_vec)
+        Jg = casadi.jacobian(expr, vars_flat)
+        Jg_op = casadi.substitute(Jg, vars_vec, op_vec)
+        return g_op + casadi.mtimes(Jg_op, vars_flat - op_flat)
 
     def set_weights(self, Q, R, Rd, Qf):
         def _to_flat(w):

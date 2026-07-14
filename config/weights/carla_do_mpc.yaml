@@ -1,29 +1,39 @@
 /**:
   ros__parameters:
     # ---------------------------------------------------------------------------
-    # CARLA × do-mpc — the user's known-good "Working DO_MPC" set (pre-refactor).
+    # CARLA × do-mpc. Adopts the tuned CasADi template — the backend-independent
+    # reference levers are what fixed the corner-cutting on every backend:
+    #   * distance_tolerance 5.0 -> 2.5 : the reference nearest-index anchor
+    #     (GOAL_DIS = distance_tolerance = min_search_radius). At 5.0 m it anchors
+    #     past the R~12 m corner apex → the controller aims across the chord and
+    #     cuts ~2.5 m. 2.5 anchors near the vehicle.
+    #   * max_lateral_accel 3.0 -> 1.2 : curvature speed cap, slows the hairpins.
+    # do-mpc is collocation + ipopt; run with step_on_command:=true (lockstep) so
+    # the sim advances only on a control command (its solve is slower than realtime)
+    # and generate_mpc_model:=true on the FIRST run (AOT recompile ~1 min).
     # Overlay (highest wins): weights > platforms/carla.yaml > base.
-    # NOTE: pre-refactor param names may have shifted (scale_cost may be gone) —
-    # verify on first launch. Tune against the NEW recorded CARLA waypoints.
     # ---------------------------------------------------------------------------
-    horizon: 50
+    horizon: 25
     sample_time: 0.05
-    prediction_time: 2.5  # sample_time * horizon
+    prediction_time: 1.25  # sample_time * horizon
     max_iter: 30
     termination_condition: 0.0001
 
-    Q:  [1.0, 1.0, 10.0, 0.01]
-    R:  [10.0, 100.0]
-    Rd: [100.0, 1000.0]
-    Qf: [0.002, 0.002, 0.0001, 0.00001]
+    Q:  [5.0, 5.0, 15.0, 0.05]
+    R:  [0.5, 100.0]
+    Rd: [1.0, 1000.0]
+    Qf: [10.0, 10.0, 30.0, 0.1]
     use_bryson_weights: false
 
     use_speed_profile: True
-    max_lateral_accel: 3.0
+    max_lateral_accel: 1.2
     min_reference_speed: 0.3
 
-    # Build once, then flip to False to skip the per-launch recompile
-    # (acados C-gen / do_mpc AOT ~min; casadi JIT ~secs). Re-True only if
-    # the model form / horizon / num_obstacles change.
+    # Reference anchor distance (platform default 5.0 m over-anchors and cuts the
+    # R~12 m corners). Do NOT drop below ~2.5 (route progress stalls).
+    distance_tolerance: 2.5
+
+    # Build once, then flip to False to skip the per-launch AOT recompile (~1 min).
+    # Re-True only if the model form / horizon change.
     generate_mpc_model: True
     build_with_cython: True

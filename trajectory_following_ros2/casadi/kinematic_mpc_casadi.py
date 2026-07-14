@@ -80,7 +80,7 @@ class KinematicMPCCasadi(KinematicMPCBase):
                  discrete_model_type='nonlinear', discrete_integration_method='rk4',
                  code_gen_directory=None,
                  num_obstacles=0, collision_avoidance_scheme='euclidean',
-                 ego_radius=None,
+                 ego_radius=None, safe_distance=0.5,
                  slack_weights_obstacle_avoidance=None,
                  slack_upper_bound_obstacle_avoidance=None):
         # consumed by _build_vehicle_model / setup_solver (called inside super().__init__)
@@ -116,7 +116,7 @@ class KinematicMPCCasadi(KinematicMPCBase):
             code_gen_mode=code_gen_mode,
             num_obstacles=num_obstacles,
             collision_avoidance_scheme=collision_avoidance_scheme,
-            ego_radius=ego_radius,
+            ego_radius=ego_radius, safe_distance=safe_distance,
             slack_weights_obstacle_avoidance=slack_weights_obstacle_avoidance,
             slack_upper_bound_obstacle_avoidance=slack_upper_bound_obstacle_avoidance)
 
@@ -245,7 +245,19 @@ class KinematicMPCCasadi(KinematicMPCBase):
         u_dot_list = casadi.horzcat(*u_dot_list)
         self.u_rate_dv = u_dot_list
 
-        # Obstacle avoidance constraints
+        # Obstacle avoidance constraints.
+        #
+        # Euclidean scheme keeps the ego a minimum distance from each inflated
+        # obstacle. On the LTV/QP path the constraint must be affine in the decision
+        # variables, so the distance is linearized about the per-stage operating point
+        # via _linearize. The *distance* is linearized (not its square) so the gradient
+        # has unit magnitude and never vanishes when the operating point sits on the
+        # obstacle centre — a head-on obstacle then still produces a braking/steering
+        # response instead of a zero-gradient constraint the slack silently absorbs. A
+        # small epsilon regularizes the sqrt at zero separation. The slack term is
+        # retained so the linearized constraint can be locally relaxed when the
+        # operating point lies inside the inflated obstacle. The nonlinear (quad/nlp)
+        # path keeps the exact squared-distance form.
         if self.n_obstacles > 0:
             distance_expression_list = []
 
@@ -263,20 +275,28 @@ class KinematicMPCCasadi(KinematicMPCBase):
                     obs_state = self.obstacles[3 * i:3 * i + 3, k]
                     # Use per-obstacle slack sl_obs_dv[i, k] (scalar).
                     sl_i = self.sl_obs_dv[i, k] if slack_obs_flag else 0
-                    dist_sq = casadi.sumsqr(ego_xy - obs_state[0:2])
                     margin = self.ego_radius + obs_state[2] + self.safe_distance
-                    h = dist_sq + sl_i - margin ** 2
 
                     if self.collision_avoidance_scheme == 'euclidean':
+                        if self.z_op_dv is not None:
+                            dist = casadi.sqrt(
+                                casadi.sumsqr(ego_xy - obs_state[0:2])
+                                + self._obstacle_linearization_eps ** 2)
+                            h = self._linearize(dist, self.z_dv, self.z_op_dv) + sl_i - margin
+                        else:
+                            dist_sq = casadi.sumsqr(ego_xy - obs_state[0:2])
+                            h = dist_sq + sl_i - margin ** 2
                         distance_expression_list.append(h)
                         lbg = casadi.vertcat(lbg, casadi.DM([[0.]]))
                         ubg = casadi.vertcat(ubg, casadi.DM([[casadi.inf]]))
                     elif self.collision_avoidance_scheme == 'cbf':
+                        dist_sq = casadi.sumsqr(ego_xy - obs_state[0:2])
+                        h = dist_sq + sl_i - margin ** 2
                         ego_xy_next = self.z_dv[0:2, k + 1]
                         obs_state_next = self.obstacles[3 * i:3 * i + 3, k + 1]
                         sl_i_next = self.sl_obs_dv[i, k + 1] if slack_obs_flag else 0
-                        dist_sq_next = casadi.sumsqr(ego_xy_next - obs_state_next[0:2])
                         margin_next = self.ego_radius + obs_state_next[2] + self.safe_distance
+                        dist_sq_next = casadi.sumsqr(ego_xy_next - obs_state_next[0:2])
                         h_next = dist_sq_next + sl_i_next - margin_next ** 2
                         distance_expression_list.append(h_next - h + self.gamma * h)
                         lbg = casadi.vertcat(lbg, casadi.DM([[0.]]))

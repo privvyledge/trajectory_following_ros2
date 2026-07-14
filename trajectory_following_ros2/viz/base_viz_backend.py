@@ -75,8 +75,16 @@ class BaseVizBackend(ABC):
                           stamp=None) -> None:
         """Reference commands from a driver-recorded dataset.  Default no-op."""
 
+    def log_obstacles(self, obstacles: list, margin_offset: float = 0.0,
+                      stamp=None) -> None:
+        """Obstacles with shape type, position, orientation, dimensions, and margin offset. Default no-op."""
+
+    def log_footprint_polygon(self, pts: list, stamp=None) -> None:
+        """Polygon coordinates (x, y) of the ego footprint. Default no-op."""
+
     # ------------------------------------------------------------------
     # Lifecycle
+
     # ------------------------------------------------------------------
 
     def shutdown(self) -> None:

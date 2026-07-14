@@ -90,6 +90,92 @@ def find_closest_waypoints(waypoints, position, num_neighbours=10,
     return eligible_indices, eligible_distances
 
 
+def project_index_and_lookahead(waypoints, cum_dist, position, floor_index=0,
+                                lookahead_distance=0.0, projection_window=5.0,
+                                max_search_radius=np.inf):
+    """Along-track (arc-length) reference-index advance.
+
+    An alternative to the Euclidean distance-gate in ``find_closest_waypoints``
+    that decouples reference-index *advancement* from the vehicle's *lateral*
+    offset to the path. Two steps:
+
+    1. **Project** ``position`` onto the path: the nearest waypoint within a
+       forward-only window ``[floor_index, ...]`` spanning ``projection_window``
+       metres of arc length. Restricting the window to ``index >= floor_index``
+       keeps the projection monotonic; bounding it to a *short* local arc span is
+       what prevents it leaping forward where a self-intersecting or closed path
+       loops back physically near the vehicle. On a closed loop whose end returns
+       near its own start (a lap that parks where it began), an unbounded window
+       would let the nearest-waypoint pick jump to the end-of-path points sitting
+       ~0 m from the start; a window shorter than the loop makes that impossible.
+       Per control tick the vehicle advances at most ``v*dt`` of arc (< 1 m at
+       typical speeds), so a few metres is ample for tracking and for
+       re-acquiring after a lateral disturbance. **Assumes the vehicle starts
+       near ``floor_index`` (index 0 on the first tick) — true for the closed-loop
+       sim, which spawns at the route start.**
+    2. **Look ahead**: return the first waypoint that is at least
+       ``lookahead_distance`` metres of arc *ahead* of the projection.
+
+    Because the projection is the nearest point regardless of lateral distance,
+    it keeps advancing while the vehicle is held off the line (e.g. during an
+    obstacle-avoidance swerve), so the reference index never freezes at a
+    lateral standoff — unlike the distance-gate, where a large lateral offset
+    keeps every nearby waypoint outside the ``[min_search_radius, ...]`` band and
+    the index sticks.
+
+    :param waypoints: (N, 2) path x/y.
+    :param cum_dist: (N,) cumulative arc length along the path, aligned to
+        ``waypoints`` (the trajectory's precomputed ``cum_dist`` column).
+    :param position: (1, 2) vehicle x/y.
+    :param floor_index: monotonic lower bound on the projection (last tick's
+        projection); the window is ``index >= floor_index``.
+    :param lookahead_distance: arc length ahead of the projection at which to
+        anchor the returned target (the reference-anchor distance, == GOAL_DIS).
+    :param projection_window: forward arc-length span (m) of the projection
+        window. Must be shorter than the loop length on a path that returns near
+        its own start, and comfortably longer than one tick's along-track travel.
+    :param max_search_radius: extra sanity cap on the vehicle-to-waypoint distance
+        considered (a point local in arc but implausibly far in space is dropped).
+    :return: ``(target_indices, distances, proj_index)`` where ``target_indices``
+        is a 1-element array with the look-ahead target (or empty when the
+        projection is within ``lookahead_distance`` of the path end — the caller
+        treats empty as end-of-path), ``distances`` the matching vehicle
+        distances, and ``proj_index`` the projection to feed back as the next
+        ``floor_index``.
+    """
+    n = len(waypoints)
+    indices = np.arange(n)
+    distances = get_distance(position, waypoints)
+
+    floor_index = int(min(max(floor_index, 0), n - 1))
+    s_floor = cum_dist[floor_index]
+
+    # forward-only, SHORT-arc-length projection window (the short span is the
+    # closed-loop-leap guard — see the projection_window note above)
+    window_mask = ((indices >= floor_index)
+                   & ((cum_dist - s_floor) <= projection_window)
+                   & (distances <= max_search_radius))
+    window_indices = indices[window_mask]
+    if len(window_indices) == 0:
+        # nothing ahead within range (end of path, or pushed beyond the radius)
+        return np.array([], dtype=int), np.array([]), floor_index
+
+    # projection = nearest waypoint in the window (ignores lateral offset)
+    proj_index = int(window_indices[np.argmin(distances[window_indices])])
+
+    # look-ahead target: first index >= proj_index at least lookahead_distance
+    # of arc length ahead of the projection
+    s_proj = cum_dist[proj_index]
+    ahead_mask = (indices >= proj_index) & ((cum_dist - s_proj) >= lookahead_distance)
+    ahead_indices = indices[ahead_mask]
+    if len(ahead_indices) == 0:
+        # projection is within lookahead_distance of the path end -> end of path
+        return np.array([], dtype=int), np.array([]), proj_index
+
+    target_index = int(ahead_indices[0])
+    return np.array([target_index], dtype=int), distances[[target_index]], proj_index
+
+
 def find_closest_waypoints_kdtree(waypoints_kd_tree, position, num_neighbours=1,
                                   current_index=0, min_search_radius=0.0, max_search_radius=np.inf,
                                   use_euclidean_distance=True, workers=1, create_kdtree=False, waypoints=None):
@@ -427,6 +513,10 @@ def calculate_curvature_single(waypoints, goal_index):
         # fails if a or c is zero (i.e. the 2 previous points are the same caused by duplicates)
         return 0.0
 
+    # Clamp to [-1, 1]: the law-of-cosines ratio can drift a hair outside the valid
+    # arccos domain for near-collinear points (floating-point rounding), which makes
+    # np.arccos return NaN (curvature then NaN). Nearly-straight ⇒ sinB ≈ 0.
+    cosB = min(1.0, max(-1.0, cosB))
     sinB = np.sin(np.arccos(cosB))
 
     cross = (waypoints[idx_prev][0] - waypoints[idx_pprev][0]) * \
@@ -1040,6 +1130,93 @@ def generate_reference_trajectory_by_interpolation(trajectory, init_pose, closes
     waypoint_dict['vel_ref'] = np.insert(waypoint_dict['vel_ref'], len(waypoint_dict['vel_ref']),
                                        waypoint_dict['vel_ref'][-1])  # v_{N-1} = v_N
     return waypoint_dict
+
+
+def project_reference_out_of_keepouts(xref, obstacles, keepout_radii, margin=0.05,
+                                      side_hints=None):
+    """Move reference points that fall inside an obstacle keep-out circle onto its
+    boundary, so the tracked target stays feasible.
+
+    A reference that threads *through* a keep-out (e.g. an obstacle sitting exactly on
+    the recorded path) gives the tracking cost a target the constraints forbid; the
+    closest feasible solution is then to park at the bubble edge, where (at v=0)
+    steering has no yaw authority and the optimizer cannot see the detour. Projecting
+    the in-bubble points onto the circle turns the target into a go-around arc: for
+    each contiguous run of inside points, the angle about the obstacle centre is
+    interpolated from the run's entry angle to its exit angle (the neighbouring
+    outside points; the run's own endpoint angles when the whole window is inside).
+    yaw over the modified span is recomputed from successive projected points; the
+    speed row is left untouched.
+
+    Side hysteresis: on a dead head-on approach the entry/exit angles are nearly
+    diametrically opposed, so the "shortest way" arc direction is knife-edge and can
+    flip between calls — the vehicle then chases an alternating left/right target and
+    parks at the bubble edge instead of committing. When the sweep is ambiguous
+    (|sweep| > pi/2) and a hint from the previous call exists, the arc keeps the
+    hinted direction; when the geometry clearly dictates a side (|sweep| <= pi/2) it
+    wins and refreshes the hint. Pass the returned hints back in on the next call.
+
+    :param xref: (4, H) reference array [x, y, v, yaw]; modified in place.
+    :param obstacles: (n, 2+) array-like of obstacle centres (extra columns ignored).
+    :param keepout_radii: scalar or length-n sequence of keep-out radii
+        (ego_radius + obstacle_radius + safe_distance per obstacle).
+    :param margin: extra clearance (m) added to each keep-out radius.
+    :param side_hints: optional length-n list of go-around directions from the
+        previous call (+1 counter-clockwise, -1 clockwise, 0 none yet).
+    :return: (xref, n_projected, side_hints) — the array, how many points were
+        moved, and the updated per-obstacle direction hints.
+    """
+    obstacles = np.atleast_2d(np.asarray(obstacles, dtype=float))
+    n_obstacles = obstacles.shape[0]
+    radii = np.broadcast_to(np.asarray(keepout_radii, dtype=float).ravel(),
+                            (n_obstacles,))
+    if side_hints is None or len(side_hints) != n_obstacles:
+        side_hints = [0] * n_obstacles
+    side_hints = list(side_hints)
+    horizon_len = xref.shape[1]
+    n_projected = 0
+    for obs_i, ((cx, cy), keepout) in enumerate(zip(obstacles[:, :2], radii)):
+        boundary_radius = keepout + margin
+        dist = np.hypot(xref[0, :] - cx, xref[1, :] - cy)
+        inside = dist < boundary_radius
+        if not inside.any():
+            side_hints[obs_i] = 0  # negotiation over; next encounter re-decides
+            continue
+        angles = np.arctan2(xref[1, :] - cy, xref[0, :] - cx)
+        hint = side_hints[obs_i]
+        i = 0
+        while i < horizon_len:
+            if not inside[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < horizon_len and inside[j + 1]:
+                j += 1
+            angle_in = angles[i - 1] if i > 0 else angles[i]
+            angle_out = angles[j + 1] if j + 1 < horizon_len else angles[j]
+            sweep = np.arctan2(np.sin(angle_out - angle_in),
+                               np.cos(angle_out - angle_in))
+            side = 1 if sweep >= 0.0 else -1
+            if abs(sweep) > np.pi / 2 and hint != 0 and side != hint:
+                # ambiguous (near head-on): stay on the previously chosen side,
+                # sweeping the complementary (long-way) arc
+                sweep = sweep - side * 2.0 * np.pi
+                side = hint
+            hint = side
+            count = j - i + 1
+            for m, k in enumerate(range(i, j + 1)):
+                theta = angle_in + sweep * (m + 1) / (count + 1)
+                xref[0, k] = cx + boundary_radius * np.cos(theta)
+                xref[1, k] = cy + boundary_radius * np.sin(theta)
+            for k in range(max(i - 1, 0), min(j + 1, horizon_len - 1)):
+                dx = xref[0, k + 1] - xref[0, k]
+                dy = xref[1, k + 1] - xref[1, k]
+                if dx * dx + dy * dy > 1e-12:
+                    xref[3, k] = np.arctan2(dy, dx)
+            n_projected += count
+            i = j + 1
+        side_hints[obs_i] = hint
+    return xref, n_projected, side_hints
 
 
 if __name__ == '__main__':

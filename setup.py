@@ -77,6 +77,7 @@ setup(
                 'waypoint_loader = trajectory_following_ros2.waypoint_loader:main',
                 'trajectory_visualizer = trajectory_following_ros2.viz.visualizer_node:main',
                 'image_overlay = trajectory_following_ros2.image_overlay_node:main',
+                'fake_obstacle_publisher = trajectory_following_ros2.fake_obstacle_publisher:main',
             ],
         },
 )

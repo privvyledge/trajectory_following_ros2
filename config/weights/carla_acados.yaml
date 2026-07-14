@@ -1,27 +1,48 @@
 /**:
   ros__parameters:
     # ---------------------------------------------------------------------------
-    # CARLA × acados — UNTUNED. Seeded from the known-good carla_do_mpc set.
-    # Overlay (highest wins): weights > platforms/carla.yaml > base. RE-TUNE for acados.
+    # CARLA × acados — TUNED (Town01 moving route). Completes cleanly. True CTE
+    # (recorded odom vs full published path): mean 0.068 m, median 0.001 m,
+    # max 0.465 m; the two R~11-12 m hairpins ~0.46 m (down from ~2.5 m).
+    #
+    # Adopts the tuned CasADi template — the backend-independent reference levers
+    # are what fixed the corners:
+    #   * distance_tolerance 5.0 -> 2.5 : the reference nearest-index anchor
+    #     (GOAL_DIS = distance_tolerance = min_search_radius). At 5.0 m it anchors
+    #     past the R~12 m corner apex and the controller cuts ~2.5 m. Set to 2.5
+    #     for margin: acados SQP HOLDS down to 2.0 (mean 0.055 / max 0.363, tighter
+    #     corners) but FAILS at 1.8 (consecutive-solver-failure fallback), so 2.0
+    #     is one step from its floor. 2.5 keeps two steps of margin for the real car.
+    #   * max_lateral_accel 3.0 -> 1.0 : curvature speed cap, slows the hairpins to
+    #     ~5 m/s so the car can hold the line.
+    # acados needs EXTERNAL stage/terminal cost (only path that applies Rd) and
+    # SQP (node defaults) for these weights to take effect. Restart with
+    # generate_mpc_model:=true on the FIRST run only (C-code regen ~1 min).
+    # Overlay (highest wins): weights > platforms/carla.yaml > base.
     # ---------------------------------------------------------------------------
-    horizon: 50
+    horizon: 25
     sample_time: 0.05
-    prediction_time: 2.5
+    prediction_time: 1.25
     max_iter: 200
     termination_condition: 0.0001
 
-    Q:  [1.0, 1.0, 10.0, 0.01]
-    R:  [10.0, 100.0]
-    Rd: [100.0, 1000.0]
-    Qf: [0.002, 0.002, 0.0001, 0.00001]
+    Q:  [5.0, 5.0, 15.0, 0.05]
+    R:  [0.5, 100.0]
+    Rd: [1.0, 1000.0]
+    Qf: [10.0, 10.0, 30.0, 0.1]
     use_bryson_weights: false
 
     use_speed_profile: True
-    max_lateral_accel: 3.0
+    max_lateral_accel: 1.0
     min_reference_speed: 0.3
 
-    # Build once, then flip to False to skip the per-launch recompile
-    # (acados C-gen / do_mpc AOT ~min; casadi JIT ~secs). Re-True only if
-    # the model form / horizon / num_obstacles change.
+    # Reference anchor distance (platform default 5.0 m over-anchors and cuts the
+    # R~12 m corners). acados SQP holds down to 2.0 (1.8 fails) — 2.5 keeps margin.
+    # Drop to 2.0 for tighter corners (max 0.363) if you accept less robustness.
+    distance_tolerance: 2.5
+
+    # Build once, then flip to False to skip the per-launch recompile (acados C-gen
+    # ~1 min). a_lat/distance_tolerance are reference params (no recompile); only a
+    # horizon/model-form change needs a rebuild. Left True for a safe fresh checkout.
     generate_mpc_model: True
     build_with_cython: True

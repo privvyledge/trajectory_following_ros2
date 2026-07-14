@@ -1,0 +1,60 @@
+/**:
+  ros__parameters:
+    # ---------------------------------------------------------------------------
+    # F1/10 × CasADi — EXACT (sqpmethod) obstacle avoidance.
+    # Overlay (highest wins): weights > platforms/f1tenth.yaml > base.
+    # Launch: mpc_toolbox:=casadi weights:=f1tenth_casadi_obstacle
+    #
+    # Unlike f1tenth_casadi_qp_obstacle.yaml (solver_type=qp + ltv, which LINEARIZES
+    # the exterior-of-circle keep-out about a per-stage operating point and slacks
+    # it — soft, and the linearization gradient vanishes head-on), this uses the
+    # quad/qrqp sqpmethod path on the full nonlinear model, which carries the EXACT
+    # squared-distance constraint (the SQP convexify layer handles its nonconvexity).
+    # That makes on-path / head-on avoidance far stronger. Pair with the standalone
+    # obstacle publisher on `fake_obstacles/object_array`.
+    # ---------------------------------------------------------------------------
+    horizon: 25
+    sample_time: 0.05
+    prediction_time: 1.25  # sample_time * horizon
+    max_iter: 200          # sqpmethod outer iterations (quad path)
+    termination_condition: 0.1
+
+    # EXACT nonconvex-constraint path: sqpmethod on the full nonlinear model.
+    solver_type: quad
+    solver: qrqp
+    discrete_model_type: nonlinear
+    discrete_integration_method: rk4
+    slack_objective_is_quadratic: True
+
+    # Obstacle avoidance (Euclidean, EXACT squared distance on the quad path).
+    num_obstacles: 1
+    obstacle_collision_avoidance_method: euclidean
+    # Keep-out from an obstacle centre = ego_radius + obstacle_radius + safe_distance
+    # = 0.15 + r_obs + 0.15. NOTE: on the small F1/10 loop a 0.6 m keep-out already
+    # covers a large arc, so an obstacle placed exactly ON the recorded line is a hard
+    # (sometimes infeasible) case — prefer an obstacle offset ~0.3-0.6 m from the line.
+    ego_radius: 0.15
+    safe_distance: 0.15
+    # SLACK-WEIGHT LEVER: raising this hardens avoidance (the keep-out is soft/slacked
+    # so it stays feasible when the reference is briefly inside the bubble). Try
+    # 1000 -> 10000 -> 100000 to force progressively larger deviation. Restart-only
+    # (baked into the OCP at build; keep generate_mpc_model:=true when you change it).
+    slack_weights_obstacle_avoidance: [1000.0]
+    slack_upper_bound_obstacle_avoidance: [1000.0]
+
+    # Cost weights (mirror f1tenth_casadi.yaml)
+    Q:  [100.0, 100.0, 100.0, 8.0]
+    Qf: [100.0, 100.0, 200.0, 40.0]
+    R:  [0.01, 0.01]
+    Rd: [10.0, 10.0]
+    use_bryson_weights: false
+
+    # Reference speed / curvature policy
+    use_speed_profile: True
+    max_lateral_accel: 2.5
+    min_reference_speed: 0.3
+
+    # CasADi JIT codegen. Keep True: the OCP structure includes the obstacle
+    # constraints, so the model must be (re)generated when this overlay is used.
+    generate_mpc_model: True
+    build_with_cython: True

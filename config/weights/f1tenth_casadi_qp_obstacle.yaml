@@ -1,0 +1,62 @@
+/**:
+  ros__parameters:
+    # ---------------------------------------------------------------------------
+    # F1/10 × CasADi — direct LTV-QP path WITH Euclidean obstacle avoidance.
+    # Overlay (highest wins): weights > platforms/f1tenth.yaml > base.
+    # Purpose: exercise the qp + num_obstacles path in the closed-loop sim. Pair
+    # with the standalone obstacle publisher on `fake_obstacles/object_array`.
+    # Launch: mpc_toolbox:=casadi weights:=f1tenth_casadi_qp_obstacle
+    # ode_type stays the launch default (discrete_kinematic_coupled) — a discrete
+    # ode_type is required for solver_type=qp. use_opti must stay false (the qp
+    # path is the function-based NLP, not Opti) — it is NOT pinned here (the launch
+    # arg is authoritative); leave the launch default false.
+    # ---------------------------------------------------------------------------
+    horizon: 25
+    sample_time: 0.05
+    prediction_time: 1.25  # sample_time * horizon
+    termination_condition: 0.1
+
+    # Direct one-QP-per-tick LTV path. max_iter is unused on the qp path (no outer
+    # SQP loop); bound the QP itself with qp_inner_max_iter.
+    solver_type: qp
+    solver: qrqp
+    discrete_model_type: ltv
+    discrete_integration_method: euler  # ignored by ltv (Jacobian form)
+    qp_inner_max_iter: 500
+    # Quadratic u-rate slack: REQUIRED for the direct-QP path (a LINEAR slack cost
+    # leaves zero rows in the QP Hessian; raw qrqp on that singular H can report
+    # success with the steering box violated and run much slower).
+    slack_objective_is_quadratic: True
+
+    # Obstacle avoidance (Euclidean; the LTV/QP path linearizes the distance
+    # constraint about the per-stage operating point). Slacked so the linearized
+    # constraint stays feasible when the operating point is inside the inflated
+    # obstacle. Scalars are broadcast to num_obstacles at read time.
+    num_obstacles: 1
+    obstacle_collision_avoidance_method: euclidean
+    # Keep-out from an obstacle centre = ego_radius + obstacle_radius + safe_distance.
+    # F1/10 is ~0.3 m wide, so ego_radius 0.15 (half-width) is right. The old
+    # safe_distance default (0.5 m, hardcoded) added ~1.7 car-widths of buffer on top,
+    # which swallowed the path and deadlocked avoidance near the line; 0.15 m keeps a
+    # realistic margin so avoidance is a squeeze-through, not a wall.
+    ego_radius: 0.15
+    safe_distance: 0.15
+    slack_weights_obstacle_avoidance: [1000.0]
+    slack_upper_bound_obstacle_avoidance: [1000.0]
+
+    # Cost weights (mirror f1tenth_casadi.yaml; Rd > 0 is required by the qp path).
+    Q:  [100.0, 100.0, 100.0, 8.0]
+    Qf: [100.0, 100.0, 200.0, 40.0]
+    R:  [0.01, 0.01]
+    Rd: [10.0, 10.0]
+    use_bryson_weights: false
+
+    # Reference speed / curvature policy
+    use_speed_profile: True
+    max_lateral_accel: 2.5
+    min_reference_speed: 0.3
+
+    # CasADi JIT codegen. Keep True: the OCP structure includes the obstacle
+    # constraints, so the model must be (re)generated when this overlay is used.
+    generate_mpc_model: True
+    build_with_cython: True

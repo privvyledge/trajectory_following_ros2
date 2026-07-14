@@ -38,7 +38,9 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
                     mpc_config_file="kinematic_bicycle_acados_ocp.json",
                     code_export_directory="c_generated_code",
                     num_obstacles=0, ego_radius=1.0, safe_distance=0.5,
-                    obstacle_slack_weight=100.0):
+                    obstacle_slack_weight=100.0,
+                    steer_rate_max=None, jerk_max=None,
+                    input_rate_slack_weight=1e3):
     # generate = True  # generates the OCP and stores in the json file
     # build = True  # builds/compiles the model and stores in code_export_directory
     # the cython version is faster than bare C because there is no call overhead as opposed to the C code call overhead
@@ -324,17 +326,30 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         ocp.model.con_h_expr = h_expr    # stages 0..N-1
         ocp.model.con_h_expr_e = h_expr  # stage N (con_h_expr_e uses only model.x, no model.u)
 
+        # One-sided keep-out h = dist^2 - keepout^2 >= 0 (lower-bounded; the upper
+        # side is nominally unbounded). Do NOT use 1e15 for the "infinite" upper
+        # bound: HPIPM's interior-point barrier cannot scale a 1e15-magnitude box and
+        # returns qp_stat=2 (max-iter) EVERY SQP iteration, so the OCP never converges
+        # from standstill even with the obstacle far away and inactive. A
+        # finite, well-scaled upper bound converges cleanly (2 SQP iters). The bounds
+        # sit far above any realistic value yet below the HPIPM breakdown: the unseen-
+        # obstacle "parked far away" fallback is dist~1000 m -> h~2e6, so uh=1e8 keeps it
+        # feasible with ~50x margin; the slack only ever needs ~keepout^2 (tens of m^2),
+        # so ush=1e6 is huge margin. Both are ~100x below the empirical HPIPM breakdown
+        # (uh=1e10/ush=1e8 fails; uh=1e8/ush=1e6 and smaller converge in 2 SQP iters).
+        _UH = 1e8    # constraint upper bound (>> max realistic dist^2, incl. far-park)
+        _USH = 1e6   # slack upper bound (>> max keep-out violation)
         ocp.constraints.lh = np.zeros(num_obstacles)
-        ocp.constraints.uh = np.full(num_obstacles, 1e15)
+        ocp.constraints.uh = np.full(num_obstacles, _UH)
         ocp.constraints.lh_e = np.zeros(num_obstacles)
-        ocp.constraints.uh_e = np.full(num_obstacles, 1e15)
+        ocp.constraints.uh_e = np.full(num_obstacles, _UH)
 
         ocp.constraints.idxsh = np.arange(num_obstacles, dtype=int)
         ocp.constraints.idxsh_e = np.arange(num_obstacles, dtype=int)
         ocp.constraints.lsh = np.zeros(num_obstacles)
-        ocp.constraints.ush = np.full(num_obstacles, 1e15)
+        ocp.constraints.ush = np.full(num_obstacles, _USH)
         ocp.constraints.lsh_e = np.zeros(num_obstacles)
-        ocp.constraints.ush_e = np.full(num_obstacles, 1e15)
+        ocp.constraints.ush_e = np.full(num_obstacles, _USH)
 
         # Linear slack cost on lower slack only (zu=0: h>=0 cannot be violated from above).
         # TODO: expose Zl/Zl_e for quadratic penalty if stronger penalization is needed.
@@ -346,6 +361,42 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         ocp.cost.zu_e = np.zeros(num_obstacles)
         ocp.cost.Zl_e = np.zeros(num_obstacles)
         ocp.cost.Zu_e = np.zeros(num_obstacles)
+
+    # Soft input-rate (slew) constraint at the initial shooting node. acados forms
+    # nonlinear constraints per stage and u_prev is a single parameter (the command
+    # applied on the previous tick), so a rate bound is physically meaningful only at
+    # stage 0: u0 is the command that reaches the actuator this tick and |u0 - u_prev|
+    # is its per-period slew. Interior-stage rate is shaped by the Rd cost instead (a
+    # true per-stage rate bound would require augmenting the state with the inputs).
+    # Softened with slack so a tight limit degrades the solution rather than making the
+    # QP infeasible — parity with the CasADi backend's slacked input-rate bound. Bounds
+    # are per-step: rate_max * dt, with dt = Tf / N.
+    _rate_rows = []
+    _rate_lb = []
+    _rate_ub = []
+    _dt_step = Tf / N
+    if jerk_max is not None and jerk_max > 0.0:
+        _rate_rows.append(model.u[0] - u_prev[0])   # acceleration rate (jerk)
+        _rate_lb.append(-jerk_max * _dt_step)
+        _rate_ub.append(jerk_max * _dt_step)
+    if steer_rate_max is not None and steer_rate_max > 0.0:
+        _rate_rows.append(model.u[1] - u_prev[1])   # steering rate
+        _rate_lb.append(-steer_rate_max * _dt_step)
+        _rate_ub.append(steer_rate_max * _dt_step)
+    if _rate_rows:
+        _n_rate = len(_rate_rows)
+        ocp.model.con_h_expr_0 = casadi.vertcat(*_rate_rows)
+        ocp.constraints.lh_0 = np.array(_rate_lb)
+        ocp.constraints.uh_0 = np.array(_rate_ub)
+        # All rate rows soft (two-sided). Linear + quadratic penalty on both slacks so
+        # the band is nearly hard yet never a source of infeasibility.
+        ocp.constraints.idxsh_0 = np.arange(_n_rate, dtype=int)
+        ocp.constraints.lsh_0 = np.zeros(_n_rate)
+        ocp.constraints.ush_0 = np.zeros(_n_rate)
+        ocp.cost.zl_0 = input_rate_slack_weight * np.ones(_n_rate)
+        ocp.cost.zu_0 = input_rate_slack_weight * np.ones(_n_rate)
+        ocp.cost.Zl_0 = input_rate_slack_weight * np.ones(_n_rate)
+        ocp.cost.Zu_0 = input_rate_slack_weight * np.ones(_n_rate)
 
     # setting constraints
     ocp.constraints.constr_type = 'BGH'  # b: box/decision variables, g: dynamics, h:nonlinear constraints
