@@ -10,6 +10,7 @@ from typing import Optional
 
 import numpy as np
 from scipy import interpolate
+from scipy.spatial import distance
 
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
@@ -226,6 +227,11 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('safe_distance', 0.5)
         self.declare_parameter('obstacle_topic', 'fake_obstacles/object_array')
         self.declare_parameter('obstacle_collision_avoidance_method', 'euclidean')
+        # Propagate each obstacle over the horizon at the constant velocity reported in
+        # its twist, so stage k keeps out of where it will be rather than where it was.
+        # A zero/absent twist reduces this exactly to a static fill; turn it off when a
+        # perception feed reports velocities too noisy to extrapolate.
+        self.declare_parameter('predict_obstacle_motion', True)
         self.declare_parameter('actuator_feedback_topic', '')
         self.declare_parameter('delay_compensation_enabled', False)
         self.declare_parameter('delay_compensation_method', 'forward_simulation')
@@ -309,6 +315,7 @@ class BaseTrajectoryTracker(Node, ABC):
         self.smooth_yaw = self._gp('smooth_yaw')
         self.debug = self._gp('debug')
         self._num_obstacles = self._gp('num_obstacles')
+        self._predict_obstacle_motion = self._gp('predict_obstacle_motion')
         self.dt = self.sample_time = 1.0 / self.control_rate
         if not self.prediction_time:
             self.prediction_time = self.sample_time * self.horizon
@@ -365,6 +372,13 @@ class BaseTrajectoryTracker(Node, ABC):
         self.obstacles: list = []
         self.n_obstacle_states: int = 3
         self.obstacle_states: Optional[np.ndarray] = None
+        # Per-obstacle go-around side memory for the keep-out reference projection.
+        # Head-on, the shortest-way arc side is knife-edge and flips tick-to-tick
+        # without this, and the vehicle chases an alternating left/right target.
+        # Keyed by obstacle id rather than by position in the selected list: the
+        # selection order shifts as the vehicle moves, and a positional list would
+        # hand one obstacle's committed side to another.
+        self._keepout_side_hints: dict = {}
 
         self.trajectory = Trajectory(
             search_index_number=10,
@@ -725,6 +739,13 @@ class BaseTrajectoryTracker(Node, ABC):
             return self.x, self.y, self.speed, self.yaw, self.omega
 
     def _obstacle_callback(self, data: 'ObjectArray'):
+        """Parse and cache every reported obstacle; ranking happens at the point of use.
+
+        Deliberately does no ranking: relevance is measured against the reference
+        horizon, which only exists inside the control loop, so ``_select_obstacles``
+        scores these per tick. Keeping this callback free of ego state also keeps it
+        free of the state mutex.
+        """
         obstacles = []
         for obj in data.objects:
             pos = [obj.pose.position.x, obj.pose.position.y, obj.pose.position.z]
@@ -744,11 +765,158 @@ class BaseTrajectoryTracker(Node, ABC):
             else:
                 continue
 
-            # todo: acquire the thread lock to prevent race conditions
-            dist = np.linalg.norm(np.array(pos[:2]) - np.array([self.x, self.y]))
-            obstacles.append({'state': [pos[0], pos[1], radius], 'distance': dist})
+            obstacles.append({
+                'id': int(obj.id),
+                'state': [pos[0], pos[1], radius],
+                'velocity': [obj.twist.linear.x, obj.twist.linear.y],
+            })
 
-        self.obstacles = sorted(obstacles, key=lambda o: o['distance'])
+        self.obstacles = obstacles
+
+    def effective_ego_radius(self) -> float:
+        """Ego collision radius, resolving the ``<= 0`` sentinel to the default.
+
+        Shared by the solver adapters (which bake it into the OCP) and the keep-out
+        reference projection, so the radius the constraint enforces and the radius the
+        reference is swept out of can never disagree.
+        """
+        return trajectory_utils.resolve_ego_radius(self._gp('ego_radius'))
+
+    def _solver_has_obstacle_constraints(self) -> bool:
+        """Whether the active backend actually constrains obstacles.
+
+        ``update_obstacles`` is the adapter-side marker for a backend that feeds
+        obstacle states into its OCP (acados, CasADi). do-mpc has no obstacle
+        constraints at all, so bending its reference around an obstacle would fake
+        avoidance the solver cannot enforce — reference shaping is only sound when a
+        constraint backs it.
+        """
+        return hasattr(self._solver, 'update_obstacles')
+
+    def _keepout_radii(self, obstacles: list) -> np.ndarray:
+        """Keep-out radius per obstacle: ``ego_radius + obstacle_radius + safe_distance``.
+
+        The single definition shared by the relevance ranking, the reference projection
+        and the OCP constraint, so the three cannot disagree on the geometry.
+        """
+        radii = np.array([o['state'][2] for o in obstacles], dtype=float)
+        return self.effective_ego_radius() + radii + float(self._gp('safe_distance'))
+
+    def _obstacles_are_active(self) -> bool:
+        """Whether obstacle handling should run at all this tick."""
+        return (self._num_obstacles > 0 and self._solver is not None
+                and self._solver_has_obstacle_constraints())
+
+    def _select_obstacles(self, xref: np.ndarray, ego_xy) -> list:
+        """Rank detections by relevance to this solve; return at most ``num_obstacles``.
+
+        Relevance is measured against the point set ``{ego} + xref[0..N]`` rather than
+        against the vehicle alone, because that is the set the solve can actually act
+        on: the OCP constrains stages 0..N and the keep-out projection bends those same
+        reference points, so an obstacle far from all of them cannot influence the
+        result. Ranking by distance-to-ego instead lets an obstacle behind the vehicle
+        evict the one ahead — at ``num_obstacles: 1`` it takes the only slot. The window
+        spans ``v * prediction_time``, so it scales with speed for free, and "behind"
+        needs no heading test: the horizon only runs forward.
+
+        Ego joins the point set because ``xref[:, 0]`` is anchored ``distance_tolerance``
+        *ahead* of the vehicle, leaving the vehicle's own position uncovered — during an
+        avoidance swerve the car is off-reference by construction, and an obstacle on top
+        of it must not rank as irrelevant.
+
+        Obstacles whose keep-out actually bites somewhere on the window sort first, by
+        the earliest stage at which it bites; the rest follow by distance to the window.
+        Ordering intruders by *when* rather than by how deeply matters when two obstacles
+        both sit on the reference: the reference runs through both, so a plain minimum
+        distance scores both ~0 and breaks the tie arbitrarily — which can pick the
+        farther one and reinstate the very bug this ranking removes.
+        """
+        if not self._obstacles_are_active() or not self.obstacles:
+            return []
+
+        centres = np.array([o['state'][:2] for o in self.obstacles], dtype=float)
+        keepout = self._keepout_radii(self.obstacles)
+        points = np.column_stack([np.r_[ego_xy[0], xref[0, :]],
+                                  np.r_[ego_xy[1], xref[1, :]]])  # (N+2, 2)
+
+        dist = distance.cdist(centres, points)      # (n_detected, N+2)
+        intrudes = dist < keepout[:, None]
+        bites = intrudes.any(axis=1)
+        # argmax on a boolean row gives the first True — the earliest constraining
+        # stage. Ego is column 0, so an obstacle already on the vehicle sorts first.
+        first_stage = intrudes.argmax(axis=1)
+        closest = dist.min(axis=1)
+
+        keys = [(0, int(first_stage[i]), 0.0) if bites[i] else (1, 0, float(closest[i]))
+                for i in range(len(self.obstacles))]
+        order = sorted(range(len(self.obstacles)), key=keys.__getitem__)
+        return [self.obstacles[i] for i in order[:self._num_obstacles]]
+
+    def _pack_obstacle_states(self, selected: list) -> None:
+        """Fill the ``(3 * num_obstacles, N+1)`` obstacle block and hand it to the solver.
+
+        Slots beyond the selected set are parked far away so their constraint row exists
+        but never activates. With ``predict_obstacle_motion`` the keep-out tracks where
+        each obstacle will be at stage k rather than where it was reported; a zero twist
+        makes that identical to a static fill.
+        """
+        if not self._obstacles_are_active():
+            return
+
+        n_obs = self._num_obstacles
+        n_stages = self.horizon + 1
+        selected = selected[:n_obs]
+
+        # Unused slots: far-away centre with a nominal radius, so the constraint is
+        # structurally present but slack at every stage.
+        packed = np.tile(np.array([1000.0, 1000.0, 1.0]), (n_obs, 1))
+        velocity = np.zeros((n_obs, 2))
+        if selected:
+            packed[:len(selected)] = [o['state'] for o in selected]
+            if self._predict_obstacle_motion:
+                velocity[:len(selected)] = [o['velocity'] for o in selected]
+
+        elapsed = np.arange(n_stages) * self.sample_time            # (n_stages,)
+        states = np.empty((n_obs, self.n_obstacle_states, n_stages))
+        states[:, 0, :] = packed[:, 0:1] + velocity[:, 0:1] * elapsed
+        states[:, 1, :] = packed[:, 1:2] + velocity[:, 1:2] * elapsed
+        states[:, 2, :] = packed[:, 2:3]                            # radius is constant
+        self.obstacle_states = states.reshape(self.n_obstacle_states * n_obs, n_stages)
+
+        self._solver.update_obstacles(self.obstacle_states)  # type: ignore[attr-defined]
+
+    def _project_reference_out_of_keepouts(self, xref: np.ndarray,
+                                           selected: list) -> np.ndarray:
+        """Sweep reference points that fall inside an obstacle keep-out onto its boundary.
+
+        A reference threading a keep-out hands the tracking cost a target the
+        constraints forbid; the closest feasible answer is then to park at the bubble
+        edge, where at v=0 steering has no yaw authority and the optimizer cannot see
+        the detour. Projecting turns that target into a go-around arc.
+
+        Backend-agnostic and applied once per tick here rather than inside a single
+        adapter, so every backend with obstacle constraints benefits and the keep-out
+        geometry is defined in exactly one place. Takes the same selected set the OCP
+        was given, so the reference is only bent around obstacles a constraint backs.
+        Returns the caller's array untouched when there is nothing to do; otherwise
+        returns a projected copy, leaving ``self.xref`` (and so the reference debug
+        topic) as the raw reference.
+        """
+        if not selected:
+            return xref
+
+        obstacles = np.array([o['state'] for o in selected], dtype=float)
+        # Carry each obstacle's committed go-around side across ticks by id: the
+        # projection takes hints positionally, but the selection order shifts as the
+        # vehicle moves, so a positional store would leak one obstacle's side to
+        # another. Obstacles that drop out are forgotten, matching the projection's own
+        # "negotiation over, next encounter re-decides" reset.
+        hints = [self._keepout_side_hints.get(o['id'], 0) for o in selected]
+        xref, _, hints = trajectory_utils.project_reference_out_of_keepouts(
+            xref.copy(), obstacles[:, :2], self._keepout_radii(selected),
+            side_hints=hints)
+        self._keepout_side_hints = {o['id']: h for o, h in zip(selected, hints)}
+        return xref
 
     # ------------------------------------------------------------------
     # Main control loop
@@ -810,6 +978,20 @@ class BaseTrajectoryTracker(Node, ABC):
         # so it cannot fire at the start, where start ≈ goal on a closed loop;
         # cumulative_distance resets to 0 on every lap, so it doubles as a re-anchor
         # cooldown after a reset.
+        # A 'lost' projection also yields ref_traj is None, but means the opposite of
+        # end-of-path: the vehicle is nowhere near the path (localization jump, large
+        # disturbance) rather than done with it. Hold zero and keep trying to
+        # re-acquire — latching the final goal here would report the run complete and
+        # park. Only the arc-length path can tell them apart (status is None on the
+        # legacy gate, which preserves its treat-empty-as-end-of-path behaviour).
+        if self.trajectory.projection_status == 'lost':
+            self.get_logger().warn(
+                'Vehicle is farther than the search radius from every nearby waypoint '
+                '(lost the path?); holding zero command until it re-acquires.',
+                throttle_duration_sec=2.0)
+            self._publish_zero_command()
+            return
+
         end_of_path = ref_traj is None
         past_grace = self.cumulative_distance >= 3.0 * self.distance_tolerance
         at_goal = past_grace and self.trajectory.is_goal_reached(x, y, vel, self.final_goal)
@@ -850,14 +1032,27 @@ class BaseTrajectoryTracker(Node, ABC):
                 f'{np.round(x0_raw, 4)} -> {np.round(x0, 4)}',
                 throttle_duration_sec=5.0)
 
-        result: SolverResult = self._solver.solve(x0, xref, u_prev_snapshot.flatten())
-        self._log_solver_stats(result)
+        # Obstacles are ranked against this tick's reference and handed to the OCP, then
+        # the same selected set is swept out of the reference — one selection feeding
+        # both, so the constraint and the target can never disagree about what is there.
+        selected = self._select_obstacles(xref, (x, y))
+        self._pack_obstacle_states(selected)
+
+        result: SolverResult = self._solver.solve(
+            x0, self._project_reference_out_of_keepouts(xref, selected),
+            u_prev_snapshot.flatten())
 
         # 11. Track consecutive failures. On an isolated suboptimal solve, hold the
         #     last good command instead of applying the (possibly saturated/garbage)
         #     iterate; zero-command safety after N=5.
+        #     The counter is updated before the stats log so each row carries its own
+        #     tick's count (not the previous tick's), and logged before the >= 5 early
+        #     return below so the tick that trips the zero-command fallback is in the log.
+        self._consecutive_failures = (
+            0 if result.is_optimal else self._consecutive_failures + 1)
+        self._log_solver_stats(result)
+
         if result.is_optimal:
-            self._consecutive_failures = 0
             if not self._u_prev_from_echo:
                 with self.mutex:
                     self.u_prev[:, 0] = result.u_prev
@@ -878,7 +1073,6 @@ class BaseTrajectoryTracker(Node, ABC):
             except ValueError:
                 pass  # shape mismatch on first call if horizon changed
         else:
-            self._consecutive_failures += 1
             err_suffix = f', error={result.error}' if result.error else ''
             self.get_logger().warn(
                 f'Solver suboptimal (status={result.status}, '

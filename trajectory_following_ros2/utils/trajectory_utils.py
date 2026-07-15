@@ -23,6 +23,22 @@ import pandas as pd  # todo: remove
 
 import trajectory_following_ros2.utils.filters as filters
 
+# Ego collision radius used when the ``ego_radius`` parameter is left at its
+# non-positive sentinel: a Carla Model 3 bounding sphere, deflated by 1.3 to approximate
+# the rear-axle-referenced footprint rather than the full diagonal.
+DEFAULT_EGO_RADIUS = 2.731977273419954 / 1.3
+
+
+def resolve_ego_radius(ego_radius):
+    """Resolve the ``ego_radius`` parameter's ``<= 0`` sentinel to the default radius.
+
+    Shared by the controller (which bakes the radius into the OCP keep-out and sweeps
+    the reference out of it) and the visualizer (which draws it). Both must resolve the
+    sentinel identically, or the drawn keep-out silently disagrees with the enforced one.
+    """
+    ego_radius = float(ego_radius)
+    return DEFAULT_EGO_RADIUS if ego_radius <= 0.0 else ego_radius
+
 
 def get_distance(node1, node2, metric='euclidean'):
     """

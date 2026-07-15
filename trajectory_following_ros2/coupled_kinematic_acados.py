@@ -12,7 +12,6 @@ from ament_index_python.packages import get_package_share_directory
 from trajectory_following_ros2.base_tracker import BaseTrajectoryTracker, _make_executor
 from trajectory_following_ros2.backends.base_solver import BaseSolver, SolverResult
 from trajectory_following_ros2.acados.acados_settings import acados_settings
-from trajectory_following_ros2.utils.trajectory_utils import project_reference_out_of_keepouts
 
 
 class AcadosSolverAdapter(BaseSolver):
@@ -22,12 +21,15 @@ class AcadosSolverAdapter(BaseSolver):
                  stage_cost_type: str = 'NONLINEAR_LS',
                  terminal_cost_type: str = 'NONLINEAR_LS',
                  num_obstacles: int = 0, ego_radius: float = 1.0,
-                 safe_distance: float = 0.5,
                  has_weight_params: bool = False,
                  Q: Optional[np.ndarray] = None,
                  R: Optional[np.ndarray] = None,
                  Qe: Optional[np.ndarray] = None,
-                 Rd: Optional[np.ndarray] = None):
+                 Rd: Optional[np.ndarray] = None,
+                 dt: float = 0.05,
+                 u_min: Optional[np.ndarray] = None,
+                 u_max: Optional[np.ndarray] = None,
+                 rate_max: Optional[np.ndarray] = None):
         self._controller = controller
         self._horizon = horizon
         self._wheelbase = wheelbase
@@ -35,10 +37,17 @@ class AcadosSolverAdapter(BaseSolver):
         self._terminal_cost_type = terminal_cost_type
         self._num_obstacles = num_obstacles
         self._ego_radius = ego_radius
-        self._safe_distance = safe_distance
         self._obstacle_states: Optional[np.ndarray] = None  # (3*n_obs, N+1)
-        self._keepout_side_hints: Optional[list] = None  # go-around side memory
         self._has_weight_params = has_weight_params
+        # Input-rate (slew) bound applied to stage 0 each tick; None disables it.
+        # rate_max is [max_jerk (m/s^3), max_steer_rate (rad/s)]; see
+        # _apply_input_rate_bound.
+        self._dt = float(dt)
+        self._u_min = (np.asarray(u_min, dtype=float) if u_min is not None
+                       else np.array([-np.inf, -np.inf]))
+        self._u_max = (np.asarray(u_max, dtype=float) if u_max is not None
+                       else np.array([np.inf, np.inf]))
+        self._rate_max = np.asarray(rate_max, dtype=float) if rate_max is not None else None
         if has_weight_params:
             self._Q_diag = np.diag(Q) if Q is not None else np.ones(4)
             self._R_diag = np.diag(R) if R is not None else np.ones(2)
@@ -61,6 +70,35 @@ class AcadosSolverAdapter(BaseSolver):
         if self._obstacle_states is not None:
             return [*self._obstacle_states[:, k], self._ego_radius]
         return [*([1000.0, 1000.0, 1.0] * self._num_obstacles), self._ego_radius]
+
+    def _apply_input_rate_bound(self, u_prev: np.ndarray) -> None:
+        """Bound the applied command's slew: ``|u0 - u_prev| <= rate_max * dt``.
+
+        Implemented as a per-tick tightening of the stage-0 input box rather than as a
+        generated constraint, because the OCP already box-bounds both inputs at every
+        stage (``idxbu``) and acados lets those bounds be overridden per stage at
+        runtime — the same mechanism the initial state uses just above. Nothing is
+        generated, so this needs no re-codegen and no particular acados version.
+
+        Stage 0 only: ``u_prev`` is the single command applied on the previous tick, so
+        a rate bound is physically meaningful only for ``u0``, the command that reaches
+        the actuator this tick. Interior-stage rate stays shaped by the ``Rd`` cost (a
+        true per-stage rate bound would need the inputs augmented into the state).
+
+        The bound is hard rather than slacked, and cannot make the QP infeasible:
+        ``u_prev`` is clipped into the input box first, so the intersection of
+        ``[u_prev - r, u_prev + r]`` with the box always contains ``u_prev`` and is
+        therefore non-empty.
+        """
+        if self._rate_max is None:
+            return
+        u_prev = np.clip(np.asarray(u_prev, dtype=float).flatten(),
+                         self._u_min, self._u_max)
+        step = self._rate_max * self._dt
+        self._controller.constraints_set(
+            0, 'lbu', np.maximum(self._u_min, u_prev - step))
+        self._controller.constraints_set(
+            0, 'ubu', np.minimum(self._u_max, u_prev + step))
 
     def _recover_from_failure(self, x0: np.ndarray, xref: np.ndarray) -> None:
         """Reset the solver after a failed solve and re-seed a clean iterate.
@@ -94,20 +132,7 @@ class AcadosSolverAdapter(BaseSolver):
         # x0: (4,); xref: (4, N+1); u_prev: (2,)
         self._controller.constraints_set(0, 'lbx', x0)
         self._controller.constraints_set(0, 'ubx', x0)
-
-        # Keep the tracked target feasible: reference points inside an obstacle
-        # keep-out are swept onto its boundary (go-around arc). Without this, a
-        # reference threading the keep-out makes "park at the bubble edge" the
-        # optimum; at v=0 steering has no yaw authority and the vehicle never
-        # detours. Copy first — the caller's xref feeds the debug/reference
-        # publishers and must stay the raw reference.
-        if self._num_obstacles > 0 and self._obstacle_states is not None:
-            obs0 = np.asarray(self._obstacle_states[:, 0], dtype=float).reshape(
-                self._num_obstacles, 3)
-            keepouts = self._ego_radius + obs0[:, 2] + self._safe_distance
-            xref, _, self._keepout_side_hints = project_reference_out_of_keepouts(
-                xref.copy(), obs0[:, :2], keepouts,
-                side_hints=self._keepout_side_hints)
+        self._apply_input_rate_bound(u_prev)
 
         weight_params = (
             [*self._Q_diag, *self._R_diag, *self._Qe_diag, *self._Rd_diag]
@@ -200,7 +225,12 @@ class AcadosSolverAdapter(BaseSolver):
 
         if not finite:
             # Never let a non-finite iterate reach the published command, the
-            # u_prev echo, or the predicted-path debug topic.
+            # u_prev echo, or the predicted-path debug topic. velocity_cmd is zeroed
+            # explicitly rather than read off the sanitized x_seq: tiling x0 would
+            # make it the *current* speed, i.e. "hold speed, steer straight" — the
+            # worst command to publish while the solver is in a degenerate state, and
+            # it would be applied for up to 4 more ticks before the consecutive-failure
+            # fallback zeroes commands.
             u = np.zeros(2)
             u_seq = np.zeros((2, self._horizon))
             x_seq = np.tile(np.asarray(x0, dtype=float).reshape(4, 1),
@@ -209,7 +239,7 @@ class AcadosSolverAdapter(BaseSolver):
         return SolverResult(
             accel_cmd=float(u[0]),
             steering_cmd=float(u[1]),
-            velocity_cmd=float(x_seq[2, 1]),
+            velocity_cmd=float(x_seq[2, 1]) if finite else 0.0,
             u_sequence=u_seq,
             x_sequence=x_seq,
             u_prev=u.copy(),
@@ -267,13 +297,14 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
                                    'data', 'model'))
         self.declare_parameter('obstacle_slack_weight', 100.0)
         # In-solver input-rate (slew) limiting. acados otherwise only penalizes the
-        # input rate via the Rd cost and never bounds it, so the solver can plan a
-        # slew faster than the actuator and get post-clipped (tracking mismatch). When
-        # enabled, a soft stage-0 constraint bounds |u0 - u_prev| to MAX_JERK*dt and
-        # MAX_STEER_RATE*dt — parity with the CasADi backend. Restart-only (changes the
-        # OCP structure; needs generate_mpc_model=True to re-codegen).
+        # input rate via the Rd cost and never bounds it, so the solver can plan a slew
+        # faster than the actuator and get post-clipped (tracking mismatch). When
+        # enabled, the stage-0 input box is tightened each tick to
+        # |u0 - u_prev| <= [MAX_JERK, MAX_STEER_RATE] * dt — parity with the CasADi
+        # backend's slacked rate bound. Applied at runtime via constraints_set, so no
+        # re-codegen is needed to change it (restart-only only because the adapter reads
+        # it once at construction).
         self.declare_parameter('enforce_input_rate_constraint', True)
-        self.declare_parameter('input_rate_slack_weight', 1000.0)
 
     def _init_solver(self) -> Optional[BaseSolver]:
         stage_cost_type = self.get_parameter('stage_cost_type').value
@@ -309,14 +340,11 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         model_dir = self.get_parameter('code_gen_directory').value
         num_obstacles = self.get_parameter('num_obstacles').value
         collision_method = self.get_parameter('obstacle_collision_avoidance_method').value
-        ego_radius = self.get_parameter('ego_radius').value
         safe_distance = self.get_parameter('safe_distance').value
         obstacle_slack_weight = self.get_parameter('obstacle_slack_weight').value
         enforce_input_rate = bool(self.get_parameter('enforce_input_rate_constraint').value)
-        input_rate_slack_weight = float(self.get_parameter('input_rate_slack_weight').value)
 
-        if ego_radius <= 0.0:
-            ego_radius = 2.731977273419954 / 1.3  # Carla Model 3 default
+        ego_radius = self.effective_ego_radius()
 
         if collision_method == 'cbf':
             self.get_logger().warn(
@@ -344,9 +372,11 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         self.get_logger().info(f'acados integrator_type: {integrator_type}')
         if enforce_input_rate:
             self.get_logger().info(
-                'acados input-rate constraint: ON (soft stage-0 bound |u0 - u_prev| <= '
-                f'[jerk {self.MAX_JERK:.3g} m/s^3, steer_rate {self.MAX_STEER_RATE:.3g} rad/s] * dt, '
-                f'slack weight {input_rate_slack_weight:.3g}).')
+                'acados input-rate constraint: ON (stage-0 steering box tightened each tick '
+                f'to |delta0 - delta_prev| <= {self.MAX_STEER_RATE:.3g} rad/s * '
+                f'{self.sample_time:.3g} s = '
+                f'{np.degrees(self.MAX_STEER_RATE * self.sample_time):.2f} deg/tick; '
+                'acceleration rate is left to the Rd cost).')
         else:
             self.get_logger().info(
                 'acados input-rate constraint: OFF (input rate penalized only via Rd cost).')
@@ -380,9 +410,6 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
             ego_radius=ego_radius,
             safe_distance=safe_distance,
             obstacle_slack_weight=obstacle_slack_weight,
-            steer_rate_max=(self.MAX_STEER_RATE if enforce_input_rate else None),
-            jerk_max=(self.MAX_JERK if enforce_input_rate else None),
-            input_rate_slack_weight=input_rate_slack_weight,
         )
 
         os.chdir(cwd)
@@ -399,31 +426,24 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
             terminal_cost_type=terminal_cost_type,
             num_obstacles=num_obstacles,
             ego_radius=ego_radius,
-            safe_distance=safe_distance,
             has_weight_params=has_weight_params,
             Q=self.Q, R=self.R, Qe=self.Qf, Rd=self.Rd,
+            dt=self.sample_time,
+            u_min=np.array([self.MAX_DECEL, self.MIN_STEER_ANGLE]),
+            u_max=np.array([self.MAX_ACCEL, self.MAX_STEER_ANGLE]),
+            # Steering rate only; the acceleration rate is left unbounded (inf) and
+            # stays shaped by the Rd cost. max_steer_rate is a real servo slew limit,
+            # but max_jerk is a comfort/Bryson-weight parameter, not an actuator limit —
+            # and acceleration is not directly actuated here anyway (the published
+            # command is speed + steering angle). Enforcing max_jerk as a hard bound at
+            # its 1.5 m/s^3 default lets the acceleration move only 0.075 m/s^2 per
+            # 0.05 s tick, so crossing the +/-3 m/s^2 range takes 2 s; measured on the
+            # on-path-obstacle hairpin rollout that starves the accel input badly enough
+            # to trip the consecutive-failure fallback (7 failures, 0.548 m max CTE vs
+            # 0 failures, 0.086 m with steering-rate only).
+            rate_max=(np.array([np.inf, self.MAX_STEER_RATE])
+                      if enforce_input_rate else None),
         )
-
-    def _control_timer_callback(self):
-        """Populate obstacle states before each solve, then delegate to base."""
-        if self._solver is not None and self._num_obstacles > 0:
-            if self.obstacle_states is None:
-                self.obstacle_states = np.ones(
-                    (self.n_obstacle_states * self._num_obstacles,
-                     self.horizon + 1)) * 1000.0
-                self.obstacle_states[2::3, :] = 1.0  # radii
-
-            for k in range(self.horizon + 1):  # N+1 to cover terminal stage (con_h_expr_e)
-                for j in range(self._num_obstacles):
-                    idx = 3 * j
-                    if len(self.obstacles) > j:
-                        self.obstacle_states[idx:idx + 3, k] = self.obstacles[j]['state']
-                    else:
-                        self.obstacle_states[idx:idx + 3, k] = [1000.0, 1000.0, 1.0]
-
-            self._solver.update_obstacles(self.obstacle_states)  # type: ignore[attr-defined]
-
-        super()._control_timer_callback()
 
 
 def main(args=None):

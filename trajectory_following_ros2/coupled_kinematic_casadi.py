@@ -300,13 +300,16 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
                 return None
             if len(vals) == 1:
                 return vals * num_obstacles
+            if len(vals) != num_obstacles:
+                raise ValueError(
+                    f"{param_name} has {len(vals)} entries but num_obstacles={num_obstacles}; "
+                    f"pass either 1 value (broadcast to every obstacle) or exactly "
+                    f"{num_obstacles}.")
             return vals
         slack_weights_obs = _size_obstacle_slack('slack_weights_obstacle_avoidance')
         slack_ub_obs = _size_obstacle_slack('slack_upper_bound_obstacle_avoidance')
 
-        ego_radius = self.get_parameter('ego_radius').value
-        if ego_radius <= 0.0:
-            ego_radius = 2.731977273419954 / 1.3  # Carla Model 3 default
+        ego_radius = self.effective_ego_radius()
         safe_distance = self.get_parameter('safe_distance').value
 
         model_type = 'continuous' if 'continuous' in ode_type else 'discrete'
@@ -412,27 +415,6 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
             n_obstacle_states=3,
             solver=solver,
             vel_bound=(self.MIN_SPEED, self.MAX_SPEED))
-
-    def _control_timer_callback(self):
-        """Update obstacle states before each solve, then delegate to base."""
-        if self._solver is not None and self._num_obstacles > 0:
-            if self.obstacle_states is None:
-                self.obstacle_states = np.ones(
-                    (self.n_obstacle_states * self._num_obstacles,
-                     self.horizon + 1)) * 1000.0
-                self.obstacle_states[2::3, :] = 1.0  # radii
-
-            for k in range(self.horizon + 1):  # N+1 to fill terminal column used by Euclidean k=N
-                for j in range(self._num_obstacles):
-                    idx = 3 * j
-                    if len(self.obstacles) > j:
-                        self.obstacle_states[idx:idx + 3, k] = self.obstacles[j]['state']
-                    else:
-                        self.obstacle_states[idx:idx + 3, k] = [1000.0, 1000.0, 1.0]
-
-            self._solver.update_obstacles(self.obstacle_states)  # type: ignore[attr-defined]
-
-        super()._control_timer_callback()
 
 
 def main(args=None):
