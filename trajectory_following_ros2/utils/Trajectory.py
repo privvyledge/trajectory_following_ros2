@@ -114,6 +114,24 @@ class Trajectory(object):
         # projection cannot leap to end-of-path points that sit physically near the
         # start on a closed loop; must be < loop length and > one tick's travel.
         self.projection_window = 5.0
+        # Outcome of the last arc-length projection: 'ok' | 'end_of_path' | 'lost',
+        # or None on the legacy distance-gate path (which cannot tell them apart).
+        # 'end_of_path' and 'lost' both yield an empty index array but mean opposite
+        # things — the owning node must branch on this, not on emptiness, or a
+        # vehicle that lost the path will report the run complete. See
+        # trajectory_utils.project_index_and_lookahead.
+        self.projection_status = None
+        # Anchor-ratchet guard state (see project_index_and_lookahead's
+        # max_advance note): the per-tick advance of previous_index is gated by a
+        # signed along-track progress budget — each call accrues
+        # (position delta)·(local path tangent) and consumes the arc actually
+        # advanced. Oscillation nets to ~0 accrual, so a vehicle thrashing or
+        # parked at an obstacle standoff cannot ratchet the anchor onto a later
+        # pass of a path that revisits the same physical neighbourhood (the
+        # sliding window alone allows exactly that, and no window SIZE prevents
+        # it — the window moves with the anchor).
+        self._anchor_advance_budget = 0.0
+        self._previous_projection_position = None  # None => ungated first call
 
     def calc_nearest_index(self, waypoints=None, state=None, current_index=None, num_neighbours=10,
                            min_search_radius=0.0, max_search_radius=30.0, use_euclidean_distance=True, workers=1):
@@ -145,14 +163,56 @@ class Trajectory(object):
                 cum_dist = self.trajectory[:, self.trajectory_key_to_column['cum_dist']]
             else:
                 cum_dist = trajectory_utils.cumulative_distance_along_path(waypoints[:, :2])
-            indices, distances, proj_index = trajectory_utils.project_index_and_lookahead(
+
+            # Anchor-ratchet guard: gate this tick's anchor advance by the signed
+            # along-track progress budget (accrued below, consumed after the
+            # projection). First call (or after reset_progress) stays ungated so
+            # initial acquisition near the route start is unaffected.
+            pos = np.asarray(state, dtype=float).reshape(-1)[:2]
+            max_advance = np.inf
+            if self._previous_projection_position is not None:
+                tangent = trajectory_utils.local_path_tangent(waypoints[:, :2], self.previous_index)
+                if tangent is not None:
+                    disp = pos - self._previous_projection_position
+                    # The 1.5 gain on the ACCRUAL gives persistent catch-up
+                    # headroom (closes an anchor lag at ~0.5x vehicle speed) and
+                    # absorbs the chord-vs-arc under-measurement on curves. It
+                    # must sit on the accrual, not on the gate: a gate-side gain
+                    # is eaten by waypoint quantization (advance rounds down to
+                    # the spacing) and a lag then never closes. The small
+                    # positive cap bounds the surplus a normally-driving vehicle
+                    # can bank, so arriving at a standoff never carries more
+                    # than ~0.5 m of spendable ratchet allowance.
+                    self._anchor_advance_budget += 1.5 * float(disp @ tangent)
+                    self._anchor_advance_budget = float(np.clip(
+                        self._anchor_advance_budget, -self.projection_window, 0.5))
+                max_advance = max(0.0, self._anchor_advance_budget)
+
+            prev_floor = self.previous_index
+            indices, distances, proj_index, status = trajectory_utils.project_index_and_lookahead(
                 waypoints[:, :2], cum_dist, state,
                 floor_index=self.previous_index,
                 lookahead_distance=min_search_radius,
                 projection_window=self.projection_window,
-                max_search_radius=max_search_radius)
+                max_search_radius=max_search_radius,
+                max_advance=max_advance)
+
+            advance = float(cum_dist[proj_index] - cum_dist[prev_floor])
+            if advance > max_advance + 1e-9:
+                # the helper's re-acquisition escape fired (vehicle genuinely far
+                # off its local arc): start the budget fresh at the new anchor
+                # instead of booking the jump as consumption, which would freeze
+                # the anchor for metres of travel after a legitimate re-acquire.
+                self._anchor_advance_budget = 0.0
+            else:
+                self._anchor_advance_budget -= advance
+            self._previous_projection_position = pos.copy()
+
             self.previous_index = proj_index  # feed back as next tick's floor
+            self.projection_status = status
             return indices, distances
+
+        self.projection_status = None  # legacy gate cannot distinguish lost from end-of-path
 
         indices, distances = trajectory_utils.find_closest_waypoints(waypoints[:, :2], state,
                                                                      current_index=current_index,
@@ -327,6 +387,10 @@ class Trajectory(object):
         self.previous_index = 0
         self.current_index = 0
         self.goal_index = 0
+        # anchor-ratchet guard: forget progress accounting so the next
+        # projection re-acquires ungated at the new start
+        self._anchor_advance_budget = 0.0
+        self._previous_projection_position = None
 
     def is_goal_reached(self, x, y, vel, goal=None):
         """True when the vehicle is at the final goal: within goal_tolerance of

@@ -106,9 +106,38 @@ def find_closest_waypoints(waypoints, position, num_neighbours=10,
     return eligible_indices, eligible_distances
 
 
+def local_path_tangent(waypoints, index, max_scan=20):
+    """Unit tangent of the path at ``index``.
+
+    Taken toward the first geometrically distinct waypoint scanning up to
+    ``max_scan`` points forward, then backward — recorded routes can pile
+    near-duplicate points (e.g. a parked tail), where a single-neighbour
+    difference is numerically zero. Returns ``None`` when no distinct
+    neighbour exists in range (direction locally undefined).
+
+    :param waypoints: (N, 2) path x/y.
+    :param index: waypoint index at which to evaluate the tangent.
+    :param max_scan: how many neighbours to scan in each direction.
+    :return: (2,) unit vector, or ``None``.
+    """
+    n = len(waypoints)
+    p = waypoints[index]
+    for j in range(index + 1, min(index + 1 + max_scan, n)):
+        d = waypoints[j] - p
+        norm = np.linalg.norm(d)
+        if norm > 1e-9:
+            return d / norm
+    for j in range(index - 1, max(index - 1 - max_scan, -1), -1):
+        d = p - waypoints[j]
+        norm = np.linalg.norm(d)
+        if norm > 1e-9:
+            return d / norm
+    return None
+
+
 def project_index_and_lookahead(waypoints, cum_dist, position, floor_index=0,
                                 lookahead_distance=0.0, projection_window=5.0,
-                                max_search_radius=np.inf):
+                                max_search_radius=np.inf, max_advance=np.inf):
     """Along-track (arc-length) reference-index advance.
 
     An alternative to the Euclidean distance-gate in ``find_closest_waypoints``
@@ -152,12 +181,40 @@ def project_index_and_lookahead(waypoints, cum_dist, position, floor_index=0,
         its own start, and comfortably longer than one tick's along-track travel.
     :param max_search_radius: extra sanity cap on the vehicle-to-waypoint distance
         considered (a point local in arc but implausibly far in space is dropped).
-    :return: ``(target_indices, distances, proj_index)`` where ``target_indices``
-        is a 1-element array with the look-ahead target (or empty when the
-        projection is within ``lookahead_distance`` of the path end — the caller
-        treats empty as end-of-path), ``distances`` the matching vehicle
-        distances, and ``proj_index`` the projection to feed back as the next
-        ``floor_index``.
+    :param max_advance: cap (m of arc) on how far past ``floor_index`` this call's
+        projection may land — the **anchor-ratchet guard**. The window above slides
+        with the anchor, so no fixed ``projection_window`` protects a path that
+        revisits the same physical neighbourhood (multiple passes a few metres of
+        arc apart): a vehicle held laterally off its local segment (an obstacle
+        standoff) can make a *later-pass* point the nearest candidate at the
+        window's far edge, and the monotonic anchor then ratchets forward tick
+        after tick with no real progress, cascades pass to pass, and reports a
+        false end-of-path. Callers gate this with an along-track progress budget
+        (accrue displacement·tangent, consume actual advance — see
+        ``Trajectory.calc_nearest_index``), so oscillation nets to zero and a
+        stationary vehicle cannot ratchet. ``np.inf`` (default) preserves the
+        ungated behaviour. **Escape hatch:** when the gate is active but the best
+        gated candidate is farther from the vehicle than ``projection_window``
+        itself, the vehicle is not merely off-line near its local segment — it has
+        genuinely moved away (localization jump) — and the projection falls back
+        to the full ungated window so it can re-acquire; a ratchet capture cannot
+        trigger this, since there the local segment is the nearest candidate.
+    :return: ``(target_indices, distances, proj_index, status)`` where
+        ``target_indices`` is a 1-element array with the look-ahead target (empty
+        unless ``status`` is ``'ok'``), ``distances`` the matching vehicle
+        distances, ``proj_index`` the projection to feed back as the next
+        ``floor_index``, and ``status`` one of:
+
+        - ``'ok'``: a look-ahead target was found.
+        - ``'end_of_path'``: the projection is within ``lookahead_distance`` of the
+          path end — the run is complete.
+        - ``'lost'``: every candidate in the window is farther than
+          ``max_search_radius`` from the vehicle, i.e. the vehicle is nowhere near
+          the path (bad localization jump, large disturbance, stale replan). This
+          is emphatically NOT end-of-path: both yield an empty index array, but
+          treating 'lost' as end-of-path makes a vehicle that lost the path report
+          the run complete and park. Callers must branch on ``status``, not on
+          emptiness.
     """
     n = len(waypoints)
     indices = np.arange(n)
@@ -167,17 +224,34 @@ def project_index_and_lookahead(waypoints, cum_dist, position, floor_index=0,
     s_floor = cum_dist[floor_index]
 
     # forward-only, SHORT-arc-length projection window (the short span is the
-    # closed-loop-leap guard — see the projection_window note above)
+    # closed-loop-leap guard — see the projection_window note above), further
+    # capped by this tick's advance budget (the anchor-ratchet guard — see the
+    # max_advance note above)
+    span = min(projection_window, max_advance)
     window_mask = ((indices >= floor_index)
-                   & ((cum_dist - s_floor) <= projection_window)
+                   & ((cum_dist - s_floor) <= span)
                    & (distances <= max_search_radius))
     window_indices = indices[window_mask]
     if len(window_indices) == 0:
-        # nothing ahead within range (end of path, or pushed beyond the radius)
-        return np.array([], dtype=int), np.array([]), floor_index
+        # floor_index itself always satisfies the index and arc-length terms, so an
+        # empty window means only one thing: every local candidate is beyond
+        # max_search_radius. The vehicle is off the path, not at the end of it.
+        return np.array([], dtype=int), np.array([]), floor_index, 'lost'
 
     # projection = nearest waypoint in the window (ignores lateral offset)
     proj_index = int(window_indices[np.argmin(distances[window_indices])])
+
+    # re-acquisition escape (see the max_advance note above): gate active but the
+    # best gated candidate is farther than the whole projection window -> the
+    # vehicle genuinely moved away from its local arc; re-project ungated.
+    if (max_advance < projection_window) and (distances[proj_index] > projection_window):
+        window_mask = ((indices >= floor_index)
+                       & ((cum_dist - s_floor) <= projection_window)
+                       & (distances <= max_search_radius))
+        window_indices = indices[window_mask]
+        if len(window_indices) == 0:
+            return np.array([], dtype=int), np.array([]), floor_index, 'lost'
+        proj_index = int(window_indices[np.argmin(distances[window_indices])])
 
     # look-ahead target: first index >= proj_index at least lookahead_distance
     # of arc length ahead of the projection
@@ -186,10 +260,11 @@ def project_index_and_lookahead(waypoints, cum_dist, position, floor_index=0,
     ahead_indices = indices[ahead_mask]
     if len(ahead_indices) == 0:
         # projection is within lookahead_distance of the path end -> end of path
-        return np.array([], dtype=int), np.array([]), proj_index
+        return np.array([], dtype=int), np.array([]), proj_index, 'end_of_path'
 
     target_index = int(ahead_indices[0])
-    return np.array([target_index], dtype=int), distances[[target_index]], proj_index
+    return (np.array([target_index], dtype=int), distances[[target_index]],
+            proj_index, 'ok')
 
 
 def find_closest_waypoints_kdtree(waypoints_kd_tree, position, num_neighbours=1,

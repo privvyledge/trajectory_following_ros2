@@ -995,6 +995,22 @@ class BaseTrajectoryTracker(Node, ABC):
         end_of_path = ref_traj is None
         past_grace = self.cumulative_distance >= 3.0 * self.distance_tolerance
         at_goal = past_grace and self.trajectory.is_goal_reached(x, y, vel, self.final_goal)
+        if end_of_path and not at_goal:
+            # end_of_path comes from arc-length bookkeeping alone; require the
+            # vehicle to be physically near the final waypoint before trusting it.
+            # An index that ran ahead of the vehicle (e.g. captured by a later
+            # pass of a path that revisits the same neighbourhood) would otherwise
+            # latch a false "final goal reached" mid-course and park the vehicle
+            # at full authority. Hold zero instead — same posture as 'lost'.
+            goal_gate = max(3.0 * self.distance_tolerance, 0.5)
+            dist_to_goal = float(np.hypot(x - self.final_goal[0], y - self.final_goal[1]))
+            if dist_to_goal > goal_gate:
+                self.get_logger().warn(
+                    f'Reference reports end-of-path but the vehicle is {dist_to_goal:.2f} m '
+                    f'from the final waypoint (> {goal_gate:.2f} m gate); not latching the '
+                    f'goal — holding zero command.', throttle_duration_sec=2.0)
+                self._publish_zero_command()
+                return
         if end_of_path or at_goal:
             if self._advance_lap():
                 # Another lap: return and let the KD-tree re-anchor on the next tick.
