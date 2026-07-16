@@ -18,6 +18,7 @@ from launch.actions import DeclareLaunchArgument, GroupAction
 from launch.conditions import IfCondition, LaunchConfigurationEquals
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node, PushRosNamespace, SetParametersFromFile, SetParameter
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -46,6 +47,7 @@ def generate_launch_description():
     wheelbase = LaunchConfiguration('wheelbase')
     ode_type = LaunchConfiguration('ode_type')
     use_opti = LaunchConfiguration('use_opti')
+    num_obstacles = LaunchConfiguration('num_obstacles')
     discrete_model_type = LaunchConfiguration('discrete_model_type')
     discrete_integration_method = LaunchConfiguration('discrete_integration_method')
     load_waypoints = LaunchConfiguration('load_waypoints')
@@ -224,6 +226,16 @@ def generate_launch_description():
                         'instead of the function-based NLP. Restart-only. Applied AFTER the '
                         'platform/weights overlays so the launch arg is authoritative (it is a '
                         'formulation selector, not a weight).'
+    )
+    num_obstacles_la = DeclareLaunchArgument(
+            'num_obstacles',
+            default_value='0',
+            description='Number of obstacle keep-out constraints to bake into the OCP. '
+                        'Restart-only (sizes the solver). Applied AFTER the platform/weights '
+                        'overlays so the launch arg is authoritative — it is a structural '
+                        'launch-time choice, not a weight, so a weights file must not silently '
+                        'override the requested count. Obstacle runs also need '
+                        'generate_mpc_model:=true.'
     )
     discrete_model_type_la = DeclareLaunchArgument(
             'discrete_model_type',
@@ -530,7 +542,7 @@ def generate_launch_description():
              platform_la, weights_la,
              robot_frame_la, global_frame_la,
              frequency_la, publish_twist_topic_la, wheelbase_la, ode_type_la,
-             use_opti_la,
+             use_opti_la, num_obstacles_la,
              discrete_model_type_la, discrete_integration_method_la,
              load_waypoints_la, waypoints_csv_la,
              saturate_input_la, allow_reversing_la, max_speed_la, min_speed_la, max_accel_la, max_decel_la,
@@ -766,7 +778,8 @@ def generate_launch_description():
                 SetParameter(name='speedup_first_lookup', value=True, condition=IfCondition(load_params_from_args)),
 
                 # Obstacle Avoidance parameters
-                SetParameter(name='num_obstacles', value=0, condition=IfCondition(load_params_from_args)),
+                # NOTE: num_obstacles is set AFTER the overlays (see below) so the launch
+                # arg wins; it must not be pinned here or in a weights file.
                 SetParameter(name='ego_radius', value=1.0, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='obstacle_topic', value='fake_obstacles/object_array', condition=IfCondition(load_params_from_args)),
                 SetParameter(name='obstacle_collision_avoidance_method', value="euclidean", condition=IfCondition(load_params_from_args)),
@@ -806,6 +819,12 @@ def generate_launch_description():
                 # Formulation selector applied LAST so the `use_opti:=...` launch arg is
                 # authoritative over any overlay (mirrors closed_loop_sim.launch.py).
                 SetParameter(name='use_opti', value=use_opti, condition=IfCondition(load_params_from_args)),
+                # num_obstacles sizes the OCP (restart-only). Also applied LAST so an
+                # explicit `num_obstacles:=N` wins over a weights file that would otherwise
+                # pin the count (value_type=int coerces the launch-arg string to integer).
+                SetParameter(name='num_obstacles',
+                             value=ParameterValue(num_obstacles, value_type=int),
+                             condition=IfCondition(load_params_from_args)),
 
                 # Load nodes
                 waypoint_loader_node,

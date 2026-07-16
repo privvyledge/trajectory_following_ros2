@@ -32,7 +32,8 @@
     # constraint about the per-stage operating point). Slacked so the linearized
     # constraint stays feasible when the operating point is inside the inflated
     # obstacle. Scalars are broadcast to num_obstacles at read time.
-    num_obstacles: 1
+    # num_obstacles is NOT set here — it is a launch arg applied after this overlay so it
+    # stays authoritative. Pass num_obstacles:=N (default 0) + generate_mpc_model:=true.
     obstacle_collision_avoidance_method: euclidean
     # Keep-out from an obstacle centre = ego_radius + obstacle_radius + safe_distance.
     # F1/10 is ~0.3 m wide, so ego_radius 0.15 (half-width) is right. The old

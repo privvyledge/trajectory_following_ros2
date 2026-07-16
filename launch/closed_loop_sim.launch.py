@@ -267,7 +267,9 @@ def generate_launch_description():
             description='Number of obstacles the controller constrains against (casadi/acados). '
                         '0 disables obstacle avoidance. Requires an ObjectArray publisher on '
                         'the obstacle_topic (e.g. the fake_obstacle_publisher node). Applied '
-                        'before the weights overlay, so a weights file may override it.'),
+                        'AFTER the weights overlay, so the launch arg is authoritative — it '
+                        'sizes the OCP and a weights file must not silently override the count. '
+                        'Obstacle runs also need generate_mpc_model:=true.'),
         DeclareLaunchArgument(
             'integrator_type', default_value='ERK',
             description='acados only: OCP integrator. ERK (default) | DISCRETE. '
@@ -498,19 +500,19 @@ def generate_launch_description():
         'solver_type': solver_type,
         'solver': solver,
         'max_iter': max_iter,
-        'num_obstacles': num_obstacles,
     }
-    # `use_opti` is a FORMULATION selector, not a weight, so it is applied in the
-    # tail_dict (AFTER the platform/weights overlays) — an explicit `use_opti:=...`
-    # launch arg must win. (The other solver knobs above stay before the overlays
-    # so a per-backend weights file can still tune solver_type/solver/max_iter/
-    # discrete_* on purpose.)
+    # `use_opti` and `num_obstacles` are structural launch-time choices, not weights,
+    # so they are applied in the tail_dict (AFTER the platform/weights overlays) — an
+    # explicit `use_opti:=...` / `num_obstacles:=...` launch arg must win. num_obstacles
+    # sizes the OCP (its parameter block and keep-out constraint count), so a weights
+    # file must not be able to silently override the requested count. (The other solver
+    # knobs above stay before the overlays so a per-backend weights file can still tune
+    # solver_type/solver/max_iter/discrete_* on purpose.)
     acados_solver_params = {
         'integrator_type': integrator_type,
         'stage_cost_type': stage_cost_type,
         'terminal_cost_type': terminal_cost_type,
         'max_iter': max_iter,
-        'num_obstacles': num_obstacles,
     }
     do_mpc_solver_params = {
         'max_iter': max_iter,
@@ -556,7 +558,7 @@ def generate_launch_description():
                 parameters=_params(
                     casadi_solver_params,
                     {**sim_controller_params, 'code_gen_directory': code_gen_directory,
-                     'use_opti': use_opti}),
+                     'use_opti': use_opti, 'num_obstacles': num_obstacles}),
             ),
             Node(
                 condition=LaunchConfigurationEquals('mpc_toolbox', 'acados'),
@@ -566,7 +568,8 @@ def generate_launch_description():
                 output='screen',
                 parameters=_params(
                     acados_solver_params,
-                    {**sim_controller_params, 'code_gen_directory': code_gen_directory}),
+                    {**sim_controller_params, 'code_gen_directory': code_gen_directory,
+                     'num_obstacles': num_obstacles}),
             ),
             Node(
                 condition=LaunchConfigurationEquals('mpc_toolbox', 'do_mpc'),

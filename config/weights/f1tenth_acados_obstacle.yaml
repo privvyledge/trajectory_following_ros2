@@ -27,9 +27,10 @@
     # single ticks the near-converged iterate absorbs). Costs a few ms only on hard ticks.
     max_iter: 40
 
-    # Obstacle avoidance (exact nonlinear con_h; num_obstacles may also be given as a
-    # launch arg — both work, restart-only either way).
-    num_obstacles: 1
+    # Obstacle avoidance (exact nonlinear con_h). num_obstacles is NOT set here — it is
+    # a launch arg applied after this overlay so it stays authoritative (a weights pin
+    # would silently cap the count a `num_obstacles:=N` asked for). Pass num_obstacles:=N
+    # (default 0) + generate_mpc_model:=true on the launch command.
     obstacle_collision_avoidance_method: euclidean
     # Keep-out = ego_radius + obstacle_radius + safe_distance = 0.15 + r_obs + 0.15.
     # An obstacle exactly ON the line is supported: the adapter projects in-keep-out

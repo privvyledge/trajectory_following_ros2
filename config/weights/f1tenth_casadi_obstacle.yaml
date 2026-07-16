@@ -27,7 +27,8 @@
     slack_objective_is_quadratic: True
 
     # Obstacle avoidance (Euclidean, EXACT squared distance on the quad path).
-    num_obstacles: 1
+    # num_obstacles is NOT set here — it is a launch arg applied after this overlay so it
+    # stays authoritative. Pass num_obstacles:=N (default 0) + generate_mpc_model:=true.
     obstacle_collision_avoidance_method: euclidean
     # Keep-out from an obstacle centre = ego_radius + obstacle_radius + safe_distance
     # = 0.15 + r_obs + 0.15. NOTE: on the small F1/10 loop a 0.6 m keep-out already
