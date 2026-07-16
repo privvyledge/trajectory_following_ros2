@@ -40,6 +40,26 @@ def two_pass_path(step=0.02, length=2.0, separation=0.5):
     return wp, cum, len(pass1) + len(turn)
 
 
+def noisy_start_path(pile=200, jitter=0.001, creep=0.2, step=0.02, length=5.0, seed=0):
+    """A recorded route that begins barely-moving: a creeping, jittering start.
+
+    Models how a real recording opens — the logger is armed before the vehicle is
+    really underway, so the first stretch of route inches forward (~1 mm per point)
+    while sensor noise of the same order scatters each sample. The per-point drift
+    and the jitter being comparable is the whole point: it makes the offset between
+    neighbouring points noise rather than heading, while the stretch still lies
+    along the route the vehicle drives, so its points stay the nearest candidates
+    as the vehicle sets off. Returns (waypoints (N,2), cum_dist (N,), route_start).
+    """
+    rng = np.random.default_rng(seed)
+    drift = np.stack([np.linspace(0.0, creep, pile), np.zeros(pile)], axis=1)
+    parked = drift + rng.normal(0.0, jitter, size=(pile, 2))
+    xs = np.arange(creep + step, length + 1e-9, step)
+    route = np.stack([xs, np.zeros_like(xs)], axis=1)
+    wp = np.concatenate([parked, route], axis=0)
+    return wp, trajectory_utils.cumulative_distance_along_path(wp), pile
+
+
 def project(wp, cum, pos, floor, **kw):
     return trajectory_utils.project_index_and_lookahead(
         wp, cum, np.array([pos], dtype=float), floor_index=floor, **kw)
@@ -149,8 +169,40 @@ class TestTrajectoryBudget:
         # nowhere near the ~1.76 m of arc to the later pass
         assert cum[anchor] - 1.0 < 1.0
 
+    def test_noisy_parked_start_pulls_away(self):
+        """A route that opens parked must not strand the anchor inside the pile.
+
+        No local direction exists in the pile, so no along-track progress can be
+        measured there; gating on it anyway pins the anchor and the vehicle drives
+        past a reference that never advances.
+        """
+        wp, cum, route_start = noisy_start_path()
+        t = self.make_traj()
+        anchor = self.tick(t, wp, (0.0, 0.0))
+        for x in np.arange(0.04, 1.0 + 1e-9, 0.04):
+            anchor = self.tick(t, wp, (x, 0.0))
+        assert anchor >= route_start, 'anchor stranded in the parked start pile'
+        assert abs(cum[anchor] - cum[route_start] - 1.0) < 0.3, (
+            'anchor did not track progress along the route')
+
+    def test_gating_resumes_after_the_parked_start(self):
+        """Crossing the pile ungated must not hand gating a drained budget.
+
+        Booking the pile crossing as consumption would leave the budget deeply
+        negative, re-freezing the anchor once the direction becomes well defined.
+        """
+        wp, _, route_start = noisy_start_path()
+        t = self.make_traj()
+        for x in np.arange(0.0, 1.0 + 1e-9, 0.04):
+            self.tick(t, wp, (x, 0.0))
+        assert t._anchor_advance_budget >= 0.0, 'budget arrived drained past the pile'
+        anchor_before = t.previous_index
+        for _ in range(50):  # now parked on a well-defined stretch: must not ratchet
+            anchor = self.tick(t, wp, (1.0, 0.0))
+        assert anchor - anchor_before < 20, 'gate did not resume after the pile'
+
     def test_offline_forward_progress_still_advances(self):
-        """bug-090 non-regression: lateral offset must not freeze the index."""
+        """Non-regression: lateral offset must not freeze the index."""
         wp, cum, pass2_start = two_pass_path()
         t = self.make_traj()
         self.tick(t, wp, (0.0, 0.0))
@@ -208,6 +260,23 @@ class TestLocalPathTangent:
     def test_all_duplicates_returns_none(self):
         wp = np.tile([[1.0, 2.0]], (50, 1))
         assert trajectory_utils.local_path_tangent(wp, 25) is None
+
+    def test_noise_pile_returns_none(self):
+        """A recorded pile jitters rather than repeating: still no direction."""
+        wp, _, _ = noisy_start_path()
+        assert trajectory_utils.local_path_tangent(wp, 100) is None
+
+    def test_noise_pile_reports_a_false_direction_without_a_baseline(self):
+        """Discrimination twin: mm jitter clears a numerical-zero threshold easily.
+
+        Proves the pile fixture detects the failure — with the baseline removed the
+        tangent is confident and arbitrary, rather than the route's +x direction.
+        """
+        wp, _, _ = noisy_start_path()
+        tangent = trajectory_utils.local_path_tangent(wp, 100, min_baseline=1e-9)
+        assert tangent is not None
+        assert abs(float(tangent @ np.array([1.0, 0.0]))) < 0.9, (
+            'fixture cannot detect the failure: jitter happened to align with the route')
 
 
 if __name__ == '__main__':

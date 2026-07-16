@@ -926,7 +926,7 @@ class BaseTrajectoryTracker(Node, ABC):
         """MPC control loop — called at control_rate Hz.
         Non-MPC subclasses (e.g. Pure Pursuit) should override this entirely."""
 
-        # 1. Stale-odometry guard (Bug 3 fix)
+        # 1. Stale-odometry guard
         if not self._odom_is_fresh():
             if self.initial_pose_received:
                 self.get_logger().warn(

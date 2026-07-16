@@ -28,6 +28,12 @@ import trajectory_following_ros2.utils.filters as filters
 # the rear-axle-referenced footprint rather than the full diagonal.
 DEFAULT_EGO_RADIUS = 2.731977273419954 / 1.3
 
+# Separation a waypoint must have from a reference point before the offset between them
+# counts as a direction rather than as recording noise. A stationary vehicle still
+# records a pile of points that jitter by ~1 mm (up to ~13 mm observed), so the baseline
+# sits well above that while staying far below the scale of any real route feature.
+TANGENT_MIN_BASELINE = 0.05  # metres
+
 
 def resolve_ego_radius(ego_radius):
     """Resolve the ``ego_radius`` parameter's ``<= 0`` sentinel to the default radius.
@@ -106,18 +112,22 @@ def find_closest_waypoints(waypoints, position, num_neighbours=10,
     return eligible_indices, eligible_distances
 
 
-def local_path_tangent(waypoints, index, max_scan=20):
+def local_path_tangent(waypoints, index, max_scan=20, min_baseline=TANGENT_MIN_BASELINE):
     """Unit tangent of the path at ``index``.
 
-    Taken toward the first geometrically distinct waypoint scanning up to
-    ``max_scan`` points forward, then backward — recorded routes can pile
-    near-duplicate points (e.g. a parked tail), where a single-neighbour
-    difference is numerically zero. Returns ``None`` when no distinct
-    neighbour exists in range (direction locally undefined).
+    Taken toward the first waypoint at least ``min_baseline`` away, scanning up
+    to ``max_scan`` points forward, then backward. Where a route is stationary
+    (a parked start or tail) the recorded points are not identical, they are a
+    pile of sensor noise a millimetre or so wide; the direction to the nearest
+    such point is that noise, not the route. Requiring a real baseline keeps a
+    noise pile from reporting a confident, arbitrary heading. Returns ``None``
+    when no neighbour in range clears the baseline — the direction is genuinely
+    undefined there, and callers must treat that as "unknown", not as a value.
 
     :param waypoints: (N, 2) path x/y.
     :param index: waypoint index at which to evaluate the tangent.
     :param max_scan: how many neighbours to scan in each direction.
+    :param min_baseline: metres of separation required to define a direction.
     :return: (2,) unit vector, or ``None``.
     """
     n = len(waypoints)
@@ -125,12 +135,12 @@ def local_path_tangent(waypoints, index, max_scan=20):
     for j in range(index + 1, min(index + 1 + max_scan, n)):
         d = waypoints[j] - p
         norm = np.linalg.norm(d)
-        if norm > 1e-9:
+        if norm >= min_baseline:
             return d / norm
     for j in range(index - 1, max(index - 1 - max_scan, -1), -1):
         d = p - waypoints[j]
         norm = np.linalg.norm(d)
-        if norm > 1e-9:
+        if norm >= min_baseline:
             return d / norm
     return None
 

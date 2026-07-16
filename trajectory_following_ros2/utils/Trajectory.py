@@ -170,8 +170,16 @@ class Trajectory(object):
             # initial acquisition near the route start is unaffected.
             pos = np.asarray(state, dtype=float).reshape(-1)[:2]
             max_advance = np.inf
+            gated = False
             if self._previous_projection_position is not None:
                 tangent = trajectory_utils.local_path_tangent(waypoints[:, :2], self.previous_index)
+                # A stationary stretch of the route (a parked start or tail) has no local
+                # direction, so there is no such thing as along-track progress to measure
+                # there and the guard has nothing to judge with. Leave the advance ungated
+                # rather than gating on a budget the tick cannot inform: clamping it to
+                # zero strands the anchor inside the pile, and the vehicle then drives
+                # past a reference that never advances. The projection window still bounds
+                # how far an ungated tick may move the anchor.
                 if tangent is not None:
                     disp = pos - self._previous_projection_position
                     # The 1.5 gain on the ACCRUAL gives persistent catch-up
@@ -186,7 +194,8 @@ class Trajectory(object):
                     self._anchor_advance_budget += 1.5 * float(disp @ tangent)
                     self._anchor_advance_budget = float(np.clip(
                         self._anchor_advance_budget, -self.projection_window, 0.5))
-                max_advance = max(0.0, self._anchor_advance_budget)
+                    max_advance = max(0.0, self._anchor_advance_budget)
+                    gated = True
 
             prev_floor = self.previous_index
             indices, distances, proj_index, status = trajectory_utils.project_index_and_lookahead(
@@ -198,11 +207,13 @@ class Trajectory(object):
                 max_advance=max_advance)
 
             advance = float(cum_dist[proj_index] - cum_dist[prev_floor])
-            if advance > max_advance + 1e-9:
-                # the helper's re-acquisition escape fired (vehicle genuinely far
-                # off its local arc): start the budget fresh at the new anchor
-                # instead of booking the jump as consumption, which would freeze
-                # the anchor for metres of travel after a legitimate re-acquire.
+            if not gated or advance > max_advance + 1e-9:
+                # Either the helper's re-acquisition escape fired (vehicle genuinely far
+                # off its local arc) or this tick was ungated: start the budget fresh at
+                # the new anchor instead of booking the advance as consumption, which
+                # would freeze the anchor for metres of travel afterwards — on the
+                # ungated path it would hand gating back a budget already drained by
+                # every metre crossed while the direction was undefined.
                 self._anchor_advance_budget = 0.0
             else:
                 self._anchor_advance_budget -= advance
