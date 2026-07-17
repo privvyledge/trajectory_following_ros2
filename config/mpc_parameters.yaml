@@ -13,6 +13,14 @@
     saturate_input: True
     allow_reversing: True
 
+    # Solver failure policy. 'zero' stops on the first failure. 'hold_last' may
+    # bridge only while every enabled gate passes; 0 disables that individual gate.
+    # With both gates disabled, hold_last fails safe to zero (never holds unbounded).
+    solver_failure_mode: 'hold_last'
+    solver_failure_hold_count: 1
+    solver_failure_hold_time: 0.1  # wall seconds since the last successful publish
+    solver_failure_zero_on_saturation: True
+
     max_speed: 1.5
     min_speed: -1.5
     max_accel: 3.0

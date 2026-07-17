@@ -107,6 +107,8 @@ class BaseTrajectoryTracker(Node, ABC):
                 'wall_time', 'ref_idx', 'solve_time_ms', 'status', 'is_optimal',
                 'consecutive_failures', 'accel_cmd', 'steering_cmd', 'velocity_cmd', 'error',
                 'n_selected', 'sel_id', 'sel_side', 'sel_min_clearance',
+                'tick_interval_ms', 'reference_ms', 'obstacle_ms', 'solver_wall_ms',
+                'pre_log_ms', 'previous_log_write_ms',
             ])
             self._solver_log_fh.flush()
             self.get_logger().info(f'Solver stats logging to {path}')
@@ -144,12 +146,16 @@ class BaseTrajectoryTracker(Node, ABC):
                 min_clear = float('nan')
         return n_sel, sel_id, sel_side, min_clear
 
-    def _log_solver_stats(self, result: SolverResult, selected: list = None) -> None:
+    def _log_solver_stats(self, result: SolverResult, selected: list = None,
+                          timing: Optional[dict] = None) -> None:
         """Append one CSV row for this solve (no-op when logging is disabled)."""
         if self._solver_log_writer is None:
             return
         try:
+            timing = timing or {}
             n_sel, sel_id, sel_side, sel_clear = self._obstacle_diag(result, selected or [])
+            previous_log_ms = self._last_solver_log_ms
+            log_started = time.monotonic()
             self._solver_log_writer.writerow([
                 f'{time.time():.6f}',
                 getattr(self, 'current_idx', -1),
@@ -165,8 +171,15 @@ class BaseTrajectoryTracker(Node, ABC):
                 sel_id,
                 sel_side,
                 f'{sel_clear:.6f}',
+                f"{timing.get('tick_interval_ms', float('nan')):.4f}",
+                f"{timing.get('reference_ms', float('nan')):.4f}",
+                f"{timing.get('obstacle_ms', float('nan')):.4f}",
+                f"{timing.get('solver_wall_ms', float('nan')):.4f}",
+                f"{timing.get('pre_log_ms', float('nan')):.4f}",
+                f'{previous_log_ms:.4f}',
             ])
             self._solver_log_fh.flush()
+            self._last_solver_log_ms = (time.monotonic() - log_started) * 1e3
         except (OSError, ValueError):
             pass  # never let logging disturb the control loop
 
@@ -190,6 +203,25 @@ class BaseTrajectoryTracker(Node, ABC):
         # to a path, one row per solve tick is appended (backend-agnostic: works for
         # every MPC backend since it logs the returned SolverResult). Restart-only.
         self.declare_parameter('solver_log_file', '')
+        self.declare_parameter(
+            'solver_failure_mode', 'hold_last',
+            ParameterDescriptor(description=(
+                "Solver failure action: 'zero' publishes a zero command immediately; "
+                "'hold_last' may bridge a failure subject to the count/time/saturation gates.")))
+        self.declare_parameter(
+            'solver_failure_hold_count', 1,
+            ParameterDescriptor(description=(
+                'Maximum consecutive failures allowed to hold the last command. '
+                '0 disables the count gate.')))
+        self.declare_parameter(
+            'solver_failure_hold_time', 0.1,
+            ParameterDescriptor(description=(
+                'Maximum wall time in seconds since the last successful command publication '
+                'during which hold_last may bridge a failure. 0 disables the time gate.')))
+        self.declare_parameter(
+            'solver_failure_zero_on_saturation', True,
+            ParameterDescriptor(description=(
+                'When true, never hold a command at an accel, steering, or speed limit.')))
         self.declare_parameter('distance_tolerance', 0.2)
         self.declare_parameter('speed_tolerance', 0.5)
         self.declare_parameter('wheelbase', 0.256)
@@ -296,6 +328,24 @@ class BaseTrajectoryTracker(Node, ABC):
         self.global_frame = self._gp('global_frame')
         self.control_rate = self._gp('control_rate')
         self.debug_frequency = self._gp('debug_frequency')
+        self.solver_failure_mode = str(self._gp('solver_failure_mode')).strip().lower()
+        if self.solver_failure_mode not in ('zero', 'hold_last'):
+            self.get_logger().warn(
+                f"Invalid solver_failure_mode='{self.solver_failure_mode}'; "
+                "falling back to the fail-safe 'zero' mode.")
+            self.solver_failure_mode = 'zero'
+        self.solver_failure_hold_count = max(
+            0, int(self._gp('solver_failure_hold_count')))
+        self.solver_failure_hold_time = max(
+            0.0, float(self._gp('solver_failure_hold_time')))
+        self.solver_failure_zero_on_saturation = bool(
+            self._gp('solver_failure_zero_on_saturation'))
+        if (self.solver_failure_mode == 'hold_last'
+                and self.solver_failure_hold_count == 0
+                and self.solver_failure_hold_time == 0.0):
+            self.get_logger().warn(
+                'solver_failure_mode=hold_last has both hold gates disabled; '
+                'failures will publish zero commands rather than hold without a bound.')
         self.distance_tolerance = self._gp('distance_tolerance')
         self.speed_tolerance = self._gp('speed_tolerance')
         self.WHEELBASE = self._gp('wheelbase')
@@ -401,6 +451,9 @@ class BaseTrajectoryTracker(Node, ABC):
         self.solution_status = False
         self.warmstart_variables = {}
         self._consecutive_failures = 0
+        self._last_successful_command_monotonic: Optional[float] = None
+        self._last_control_tick_monotonic: Optional[float] = None
+        self._last_solver_log_ms = float('nan')
 
         self._last_odom_stamp = None
 
@@ -953,6 +1006,53 @@ class BaseTrajectoryTracker(Node, ABC):
         self._keepout_side_hints = {o['id']: h for o, h in zip(selected, hints)}
         return xref
 
+    def _last_command_is_saturated(self, atol: float = 1e-6) -> bool:
+        """Return whether the last applied command sits on any configured limit."""
+        limits = (
+            (self.acc_cmd, self.MAX_DECEL, self.MAX_ACCEL),
+            (self.delta_cmd, self.MIN_STEER_ANGLE, self.MAX_STEER_ANGLE),
+            (self.velocity_cmd, self.MIN_SPEED, self.MAX_SPEED),
+        )
+        return any(
+            math.isclose(value, lower, rel_tol=0.0, abs_tol=atol)
+            or math.isclose(value, upper, rel_tol=0.0, abs_tol=atol)
+            for value, lower, upper in limits
+        )
+
+    def _failure_hold_decision(self, now: Optional[float] = None) -> tuple[bool, str]:
+        """Decide whether a failed solve may re-publish the last good command.
+
+        Count and wall-time gates are independent: a zero value disables that gate;
+        when both are enabled, both must pass. An unbounded hold (both gates disabled)
+        is deliberately rejected. The return reason is suitable for a throttled log.
+        """
+        if self.solver_failure_mode == 'zero':
+            return False, 'solver_failure_mode=zero'
+
+        count_enabled = self.solver_failure_hold_count > 0
+        time_enabled = self.solver_failure_hold_time > 0.0
+        if not (count_enabled or time_enabled):
+            return False, 'no failure-hold gate is enabled'
+
+        if (self.solver_failure_zero_on_saturation
+                and self._last_command_is_saturated()):
+            return False, 'last good command is saturated'
+
+        if (count_enabled
+                and self._consecutive_failures > self.solver_failure_hold_count):
+            return False, 'failure count exceeded the hold limit'
+
+        if time_enabled:
+            if self._last_successful_command_monotonic is None:
+                return False, 'no successful command has been published'
+            if now is None:
+                now = time.monotonic()
+            age = max(0.0, now - self._last_successful_command_monotonic)
+            if age > self.solver_failure_hold_time:
+                return False, 'last good command exceeded the hold-time limit'
+
+        return True, 'within configured failure-hold gates'
+
     # ------------------------------------------------------------------
     # Main control loop
     # ------------------------------------------------------------------
@@ -960,6 +1060,13 @@ class BaseTrajectoryTracker(Node, ABC):
     def _control_timer_callback(self):
         """MPC control loop — called at control_rate Hz.
         Non-MPC subclasses (e.g. Pure Pursuit) should override this entirely."""
+
+        tick_started = time.monotonic()
+        tick_interval_ms = float('nan')
+        if self._last_control_tick_monotonic is not None:
+            tick_interval_ms = (
+                tick_started - self._last_control_tick_monotonic) * 1e3
+        self._last_control_tick_monotonic = tick_started
 
         # 1. Stale-odometry guard
         if not self._odom_is_fresh():
@@ -1086,22 +1193,33 @@ class BaseTrajectoryTracker(Node, ABC):
         # Obstacles are ranked against this tick's reference and handed to the OCP, then
         # the same selected set is swept out of the reference — one selection feeding
         # both, so the constraint and the target can never disagree about what is there.
+        reference_ms = (time.monotonic() - tick_started) * 1e3
+        obstacle_started = time.monotonic()
         selected = self._select_obstacles(xref, (x, y))
         self._pack_obstacle_states(selected)
+        projected_xref = self._project_reference_out_of_keepouts(xref, selected)
+        obstacle_ms = (time.monotonic() - obstacle_started) * 1e3
 
+        solve_started = time.monotonic()
         result: SolverResult = self._solver.solve(
-            x0, self._project_reference_out_of_keepouts(xref, selected),
-            u_prev_snapshot.flatten())
+            x0, projected_xref, u_prev_snapshot.flatten())
+        solver_wall_ms = (time.monotonic() - solve_started) * 1e3
 
-        # 11. Track consecutive failures. On an isolated suboptimal solve, hold the
-        #     last good command instead of applying the (possibly saturated/garbage)
-        #     iterate; zero-command safety after N=5.
+        # 11. Track consecutive failures. A failed solve never applies its returned
+        #     iterate. The configured failure policy either zeroes immediately or
+        #     permits the last good command to bridge bounded count/time windows.
         #     The counter is updated before the stats log so each row carries its own
-        #     tick's count (not the previous tick's), and logged before the >= 5 early
-        #     return below so the tick that trips the zero-command fallback is in the log.
+        #     tick's count (not the previous tick's), and logged before the policy can
+        #     return early so the row that trips zero-command fallback is preserved.
         self._consecutive_failures = (
             0 if result.is_optimal else self._consecutive_failures + 1)
-        self._log_solver_stats(result, selected)
+        self._log_solver_stats(result, selected, timing={
+            'tick_interval_ms': tick_interval_ms,
+            'reference_ms': reference_ms,
+            'obstacle_ms': obstacle_ms,
+            'solver_wall_ms': solver_wall_ms,
+            'pre_log_ms': (time.monotonic() - tick_started) * 1e3,
+        })
 
         if result.is_optimal:
             if not self._u_prev_from_echo:
@@ -1129,15 +1247,16 @@ class BaseTrajectoryTracker(Node, ABC):
                 f'Solver suboptimal (status={result.status}, '
                 f'consecutive={self._consecutive_failures}{err_suffix})',
                 throttle_duration_sec=1.0)
-            if self._consecutive_failures >= 5:
+            hold_last, policy_reason = self._failure_hold_decision()
+            if not hold_last:
                 self.get_logger().error(
-                    f'{self._consecutive_failures} consecutive solver failures — zeroing commands.',
+                    f'Solver failure policy zeroing commands: {policy_reason}.',
                     throttle_duration_sec=1.0)
                 self._publish_zero_command()
                 return
-            # Hold last good command: fall through to re-publish self.{acc,delta,velocity}_cmd
-            # unchanged. A single 395 ms IPOPT spike once emitted delta=27° + hard brake here,
-            # poisoning the loop into a reverse; bridging the spike avoids that cascade.
+            self.get_logger().warn(
+                f'Holding last good command: {policy_reason}.',
+                throttle_duration_sec=1.0)
 
         self.solution_time = result.solve_time
         self.solution_status = result.is_optimal
@@ -1147,6 +1266,8 @@ class BaseTrajectoryTracker(Node, ABC):
             self._input_saturation()
 
         self._publish_command()
+        if result.is_optimal:
+            self._last_successful_command_monotonic = time.monotonic()
 
         if self.publish_twist_topic:
             lat_vel = 0.0
@@ -1523,6 +1644,7 @@ class BaseTrajectoryTracker(Node, ABC):
                                 'R': self.NU, 'Rd': self.NU}
         weight_overrides = {}
         weights_changed = False
+        failure_policy_changed = False
         for param in params:
             success = True
             if param.name == 'robot_frame':
@@ -1563,6 +1685,35 @@ class BaseTrajectoryTracker(Node, ABC):
                 self.desired_speed = param.value
             elif param.name == 'loop':
                 self.loop = int(param.value)
+            elif param.name == 'solver_failure_mode':
+                mode = str(param.value).strip().lower()
+                if mode not in ('zero', 'hold_last'):
+                    success = False
+                    self.get_logger().error(
+                        f"Rejected solver_failure_mode='{param.value}': "
+                        "expected 'zero' or 'hold_last'.")
+                else:
+                    self.solver_failure_mode = mode
+                    failure_policy_changed = True
+            elif param.name == 'solver_failure_hold_count':
+                if int(param.value) < 0:
+                    success = False
+                    self.get_logger().error(
+                        'Rejected solver_failure_hold_count: expected an integer >= 0.')
+                else:
+                    self.solver_failure_hold_count = int(param.value)
+                    failure_policy_changed = True
+            elif param.name == 'solver_failure_hold_time':
+                if float(param.value) < 0.0:
+                    success = False
+                    self.get_logger().error(
+                        'Rejected solver_failure_hold_time: expected seconds >= 0.')
+                else:
+                    self.solver_failure_hold_time = float(param.value)
+                    failure_policy_changed = True
+            elif param.name == 'solver_failure_zero_on_saturation':
+                self.solver_failure_zero_on_saturation = bool(param.value)
+                failure_policy_changed = True
             elif param.name in _weight_names:
                 exp = _weight_expected_len.get(param.name)
                 if exp is not None and len(param.value) != exp:
@@ -1585,6 +1736,12 @@ class BaseTrajectoryTracker(Node, ABC):
             self._recompute_weights(overrides=weight_overrides)
             if self._solver is not None:
                 self._solver.set_weights(self.Q, self.R, self.Rd, self.Qf)
+        if (failure_policy_changed and result.successful
+                and self.solver_failure_mode == 'hold_last'
+                and self.solver_failure_hold_count == 0
+                and self.solver_failure_hold_time == 0.0):
+            self.get_logger().warn(
+                'Both solver failure hold gates are disabled; failures will publish zero.')
         return result
 
     @staticmethod

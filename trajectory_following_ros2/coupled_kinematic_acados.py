@@ -1,3 +1,4 @@
+import logging
 import os
 import sys
 import time
@@ -29,7 +30,9 @@ class AcadosSolverAdapter(BaseSolver):
                  dt: float = 0.05,
                  u_min: Optional[np.ndarray] = None,
                  u_max: Optional[np.ndarray] = None,
-                 rate_max: Optional[np.ndarray] = None):
+                 rate_max: Optional[np.ndarray] = None,
+                 failure_dump_file: str = '',
+                 solver_config_file: str = ''):
         self._controller = controller
         self._horizon = horizon
         self._wheelbase = wheelbase
@@ -48,6 +51,16 @@ class AcadosSolverAdapter(BaseSolver):
         self._u_max = (np.asarray(u_max, dtype=float) if u_max is not None
                        else np.array([np.inf, np.inf]))
         self._rate_max = np.asarray(rate_max, dtype=float) if rate_max is not None else None
+        self._failure_dump_file = os.path.expanduser(str(failure_dump_file).strip())
+        if self._failure_dump_file and not self._failure_dump_file.endswith('.npz'):
+            self._failure_dump_file += '.npz'
+        self._failure_dump_attempted = False
+        self._failure_dump_written = False
+        self._solver_config_file = os.path.abspath(
+            os.path.expanduser(str(solver_config_file).strip())
+        ) if solver_config_file else ''
+        self._stage0_lbu = self._u_min.copy()
+        self._stage0_ubu = self._u_max.copy()
         if has_weight_params:
             self._Q_diag = np.diag(Q) if Q is not None else np.ones(4)
             self._R_diag = np.diag(R) if R is not None else np.ones(2)
@@ -90,15 +103,88 @@ class AcadosSolverAdapter(BaseSolver):
         ``[u_prev - r, u_prev + r]`` with the box always contains ``u_prev`` and is
         therefore non-empty.
         """
+        self._stage0_lbu = self._u_min.copy()
+        self._stage0_ubu = self._u_max.copy()
         if self._rate_max is None:
             return
         u_prev = np.clip(np.asarray(u_prev, dtype=float).flatten(),
                          self._u_min, self._u_max)
         step = self._rate_max * self._dt
+        self._stage0_lbu = np.maximum(self._u_min, u_prev - step)
+        self._stage0_ubu = np.minimum(self._u_max, u_prev + step)
         self._controller.constraints_set(
-            0, 'lbu', np.maximum(self._u_min, u_prev - step))
+            0, 'lbu', self._stage0_lbu)
         self._controller.constraints_set(
-            0, 'ubu', np.minimum(self._u_max, u_prev + step))
+            0, 'ubu', self._stage0_ubu)
+
+    def _solver_stat(self, name: str) -> np.ndarray:
+        """Read one acados statistic without letting diagnostics affect control."""
+        try:
+            value = self._controller.get_stats(name)
+            return np.asarray(value) if value is not None else np.array([])
+        except Exception:
+            return np.array([])
+
+    def _dump_failure(self, x0: np.ndarray, xref: np.ndarray, u_prev: np.ndarray,
+                      status, finite: bool, u: np.ndarray, x_seq: np.ndarray,
+                      seed_x: np.ndarray, seed_u: np.ndarray) -> None:
+        """Write the first hard-failure inputs and solver statistics for offline replay."""
+        if not self._failure_dump_file or self._failure_dump_attempted:
+            return
+        self._failure_dump_attempted = True
+
+        payload = {
+            'x0': np.asarray(x0, dtype=float),
+            'xref': np.asarray(xref, dtype=float),
+            'u_prev': np.asarray(u_prev, dtype=float),
+            'stage0_lbu': self._stage0_lbu,
+            'stage0_ubu': self._stage0_ubu,
+            'u_min': self._u_min,
+            'u_max': self._u_max,
+            'rate_max': (self._rate_max if self._rate_max is not None else np.array([])),
+            'obstacle_states': (
+                self._obstacle_states if self._obstacle_states is not None else np.array([])),
+            'returned_u': np.asarray(u, dtype=float),
+            'returned_x': np.asarray(x_seq, dtype=float),
+            'seed_x': np.asarray(seed_x, dtype=float),
+            'seed_u': np.asarray(seed_u, dtype=float),
+            'status': np.array([str(status)]),
+            'finite': np.array([int(finite)]),
+            'horizon': np.array([self._horizon]),
+            'wheelbase': np.array([self._wheelbase]),
+            'ego_radius': np.array([self._ego_radius]),
+            'dt': np.array([self._dt]),
+            'stage_cost_type': np.array([self._stage_cost_type]),
+            'terminal_cost_type': np.array([self._terminal_cost_type]),
+            'solver_config_file': np.array([self._solver_config_file]),
+            'num_obstacles': np.array([self._num_obstacles]),
+            'has_weight_params': np.array([int(self._has_weight_params)]),
+            'residuals': self._solver_stat('residuals'),
+            'qp_stat': self._solver_stat('qp_stat'),
+            'sqp_iter': self._solver_stat('sqp_iter'),
+            'time_tot': self._solver_stat('time_tot'),
+        }
+        if self._has_weight_params:
+            payload.update({
+                'Q_diag': self._Q_diag,
+                'R_diag': self._R_diag,
+                'Qe_diag': self._Qe_diag,
+                'Rd_diag': self._Rd_diag,
+            })
+
+        try:
+            parent = os.path.dirname(self._failure_dump_file)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            np.savez_compressed(self._failure_dump_file, **payload)
+            self._failure_dump_written = True
+            logging.getLogger(__name__).warning(
+                'Saved first acados hard-failure replay dump to %s',
+                self._failure_dump_file)
+        except (OSError, TypeError, ValueError) as exc:
+            logging.getLogger(__name__).warning(
+                'Could not save acados failure replay dump to %s: %s',
+                self._failure_dump_file, exc)
 
     def _recover_from_failure(self, x0: np.ndarray, xref: np.ndarray) -> None:
         """Reset the solver after a failed solve and re-seed a clean iterate.
@@ -185,6 +271,22 @@ class AcadosSolverAdapter(BaseSolver):
             p_N = [*p_N, *weight_params]
         self._controller.set(self._horizon, 'p', np.array(p_N))
 
+        seed_x = np.array([])
+        seed_u = np.array([])
+        if self._failure_dump_file and not self._failure_dump_attempted:
+            try:
+                seed_x = np.array([
+                    self._controller.get(i, 'x')
+                    for i in range(self._horizon + 1)]).T
+                seed_u = np.array([
+                    self._controller.get(i, 'u')
+                    for i in range(self._horizon)]).T
+            except Exception:
+                # The primary x0/xref/u_prev snapshot is still useful on older wrappers
+                # that cannot expose the current primal warm-start iterate.
+                seed_x = np.array([])
+                seed_u = np.array([])
+
         t0 = time.process_time()
         status = self._controller.solve()
         solve_time_cpu = time.process_time() - t0
@@ -212,6 +314,8 @@ class AcadosSolverAdapter(BaseSolver):
         is_optimal = finite and status in (0, 2)
 
         if not is_optimal:
+            self._dump_failure(
+                x0, xref, u_prev, status, finite, u, x_seq, seed_x, seed_u)
             # A failed solve can leave a degenerate iterate in the solver memory
             # (worst case NaN after an inner-QP failure). acados warm-starts every
             # solve from that memory, so without a reset each later solve
@@ -305,6 +409,8 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         # re-codegen is needed to change it (restart-only only because the adapter reads
         # it once at construction).
         self.declare_parameter('enforce_input_rate_constraint', True)
+        # Optional one-shot .npz dump of the first hard failure, written before reset.
+        self.declare_parameter('acados_failure_dump_file', '')
 
     def _init_solver(self) -> Optional[BaseSolver]:
         stage_cost_type = self.get_parameter('stage_cost_type').value
@@ -343,6 +449,7 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         safe_distance = self.get_parameter('safe_distance').value
         obstacle_slack_weight = self.get_parameter('obstacle_slack_weight').value
         enforce_input_rate = bool(self.get_parameter('enforce_input_rate_constraint').value)
+        failure_dump_file = self.get_parameter('acados_failure_dump_file').value
 
         ego_radius = self.effective_ego_radius()
 
@@ -443,6 +550,8 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
             # 0 failures, 0.086 m with steering-rate only).
             rate_max=(np.array([np.inf, self.MAX_STEER_RATE])
                       if enforce_input_rate else None),
+            failure_dump_file=failure_dump_file,
+            solver_config_file=config_path,
         )
 
 

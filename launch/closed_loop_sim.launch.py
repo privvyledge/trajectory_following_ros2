@@ -79,7 +79,7 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, OpaqueFunction
-from launch.conditions import LaunchConfigurationEquals
+from launch.conditions import IfCondition, LaunchConfigurationEquals
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.descriptions import ParameterValue
@@ -144,6 +144,12 @@ def generate_launch_description():
     estimated_delay = LaunchConfiguration('estimated_delay')
     delay_compensation_method = LaunchConfiguration('delay_compensation_method')
     solver_log_file = LaunchConfiguration('solver_log_file')
+    solver_failure_mode = LaunchConfiguration('solver_failure_mode')
+    solver_failure_hold_count = LaunchConfiguration('solver_failure_hold_count')
+    solver_failure_hold_time = LaunchConfiguration('solver_failure_hold_time')
+    solver_failure_zero_on_saturation = LaunchConfiguration(
+        'solver_failure_zero_on_saturation')
+    acados_failure_dump_file = LaunchConfiguration('acados_failure_dump_file')
 
     obstacle_topic = LaunchConfiguration('obstacle_topic')
     footprint_topic = LaunchConfiguration('footprint_topic')
@@ -154,8 +160,8 @@ def generate_launch_description():
     vehicle_height = LaunchConfiguration('vehicle_height')
     footprint_rear_axle_offset = LaunchConfiguration('footprint_rear_axle_offset')
 
-
     viz_backend = LaunchConfiguration('viz_backend')
+    launch_visualizer = LaunchConfiguration('launch_visualizer')
     viz_spawn_viewer = LaunchConfiguration('viz_spawn_viewer')
     viz_recording_path = LaunchConfiguration('viz_recording_path')
     viz_video_path = LaunchConfiguration('viz_video_path')
@@ -293,6 +299,9 @@ def generate_launch_description():
             'viz_backend', default_value='native',
             description="Visualization backend: native | rerun | both."),
         DeclareLaunchArgument(
+            'launch_visualizer', default_value='true',
+            description='Launch trajectory_visualizer. Set false for cadence isolation.'),
+        DeclareLaunchArgument(
             'viz_spawn_viewer', default_value='true',
             description='Spawn the rerun viewer window (set false on headless WSL; use viz_recording_path).'),
         DeclareLaunchArgument(
@@ -375,6 +384,24 @@ def generate_launch_description():
             description='If set, append one per-solve stats row (status, commands, '
                         'obstacle selection/side/clearance) to this CSV path '
                         '(empty = disabled).'),
+        DeclareLaunchArgument(
+            'solver_failure_mode', default_value='hold_last',
+            description="Solver failure action: 'zero' or bounded 'hold_last'."),
+        DeclareLaunchArgument(
+            'solver_failure_hold_count', default_value='1',
+            description='Maximum consecutive failures allowed to hold the last command; '
+                        '0 disables the count gate.'),
+        DeclareLaunchArgument(
+            'solver_failure_hold_time', default_value='0.1',
+            description='Maximum wall seconds since the last successful command publication '
+                        'for hold_last; 0 disables the time gate.'),
+        DeclareLaunchArgument(
+            'solver_failure_zero_on_saturation', default_value='true',
+            description='Never hold a command at an accel, steering, or speed limit.'),
+        DeclareLaunchArgument(
+            'acados_failure_dump_file', default_value='',
+            description='acados only: write the first hard-failure inputs and solver stats '
+                        'to this .npz file before recovery reset (empty = disabled).'),
     ]
 
     # ---- 1. Static transform: map -> odom (identity) ------------------------
@@ -441,6 +468,7 @@ def generate_launch_description():
     # is merged on top of the sim's own param dict, which keeps its frames/topics/
     # initial pose (the platform sets none of the physical keys the sim would then
     # need to re-assert).
+
     def _make_simulator_nodes(context, *_args, **_kwargs):
         import yaml
         physical_keys = {
@@ -551,9 +579,21 @@ def generate_launch_description():
             'delay_compensation_method': delay_compensation_method,
             'solver_log_file': solver_log_file,
         }
+        # Safety/diagnostic flags are explicit launch choices and therefore follow
+        # platform/weight overlays rather than being silently overridden by them.
+        failure_policy_params = {
+            'solver_failure_mode': solver_failure_mode,
+            'solver_failure_hold_count': ParameterValue(
+                solver_failure_hold_count, value_type=int),
+            'solver_failure_hold_time': ParameterValue(
+                solver_failure_hold_time, value_type=float),
+            'solver_failure_zero_on_saturation': ParameterValue(
+                solver_failure_zero_on_saturation, value_type=bool),
+        }
 
         def _params(solver_dict, tail_dict):
-            return [params_file, reference_params, solver_dict] + overlays + [tail_dict]
+            return ([params_file, reference_params, solver_dict] + overlays
+                    + [failure_policy_params, tail_dict])
 
         return [
             Node(
@@ -576,7 +616,8 @@ def generate_launch_description():
                 parameters=_params(
                     acados_solver_params,
                     {**sim_controller_params, 'code_gen_directory': code_gen_directory,
-                     'num_obstacles': num_obstacles}),
+                     'num_obstacles': num_obstacles,
+                     'acados_failure_dump_file': acados_failure_dump_file}),
             ),
             Node(
                 condition=LaunchConfigurationEquals('mpc_toolbox', 'do_mpc'),
@@ -635,5 +676,7 @@ def generate_launch_description():
         waypoint_loader_node,
         OpaqueFunction(function=_make_simulator_nodes),
         OpaqueFunction(function=_make_controller_nodes),
-        OpaqueFunction(function=_make_visualizer_node),
+        OpaqueFunction(
+            function=_make_visualizer_node,
+            condition=IfCondition(launch_visualizer)),
     ])
