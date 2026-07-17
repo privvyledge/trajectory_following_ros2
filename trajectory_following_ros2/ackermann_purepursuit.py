@@ -103,7 +103,8 @@ class AckermannPurePursuit(BaseTrajectoryTracker):
             state=None, trajectory=None, current_index=None,
             dt=self.sample_time, prediction_horizon=50,
             lookahead_time=1.0, lookahead=self.lookahead,
-            num_points_to_interpolate=50)
+            num_points_to_interpolate=50,
+            compute_auxiliary_waypoints=False)
 
         # Terminator (mirrors base_tracker): finished if no waypoints remain ahead
         # (end_of_path) OR the vehicle has come to rest at the final goal. The grace

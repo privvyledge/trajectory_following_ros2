@@ -266,7 +266,8 @@ class Trajectory(object):
         return intersections
 
     def calc_ref_trajectory(self, state, trajectory, current_index, dt, prediction_horizon, lookahead_time=1.0, lookahead=15.0,
-                            num_points_to_interpolate=0, target_speed=None):
+                            num_points_to_interpolate=0, target_speed=None,
+                            compute_auxiliary_waypoints=True):
         if state is None:
             state = self.state
 
@@ -298,6 +299,23 @@ class Trajectory(object):
             target_index = ind[0]  # returns None if at the end of the trajectory
         except IndexError:
             return current_index, None, None, None, None
+
+        # The controller paths consume only target_index and reference_trajectory.
+        # Preserve the legacy auxiliary outputs for external callers, but let the
+        # real-time control loop skip three full-path geometry scans plus a B-spline
+        # whose result is not used to construct the MPC reference.
+        if not compute_auxiliary_waypoints:
+            reference_trajectory = trajectory_utils.generate_reference_trajectory_by_interpolation(
+                    trajectory, state,
+                    target_index,
+                    self.trajectory_key_to_column,
+                    horizon=prediction_horizon,
+                    v_target=target_speed, dt=dt,
+                    a_lat_max=self.a_lat_max,
+                    use_speed_profile=self.use_speed_profile,
+                    v_min=self.min_reference_speed,
+                    v_max=self.max_reference_speed)
+            return target_index, reference_trajectory, None, None, None
 
         # find the next waypoint using the line intersection formula and compare to the above then pick one
         goal_waypoint0 = trajectory[target_index, [self.trajectory_key_to_column['x'], self.trajectory_key_to_column['y']]]  # trajectory[target_index, :]

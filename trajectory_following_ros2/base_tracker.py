@@ -1111,7 +1111,8 @@ class BaseTrajectoryTracker(Node, ABC):
             state=None, trajectory=None, current_index=None,
             dt=self.sample_time, prediction_horizon=self.horizon,
             lookahead_time=1.0, lookahead=30.0,
-            num_points_to_interpolate=self.horizon, target_speed=target_speed)
+            num_points_to_interpolate=self.horizon, target_speed=target_speed,
+            compute_auxiliary_waypoints=False)
 
         # Terminator (single path): the lap is finished if calc_ref_trajectory found no
         # waypoints ahead (ref_traj is None — the usual case on dense/closed paths,
