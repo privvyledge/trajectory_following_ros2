@@ -143,6 +143,7 @@ def generate_launch_description():
     delay_compensation_enabled = LaunchConfiguration('delay_compensation_enabled')
     estimated_delay = LaunchConfiguration('estimated_delay')
     delay_compensation_method = LaunchConfiguration('delay_compensation_method')
+    solver_log_file = LaunchConfiguration('solver_log_file')
 
     obstacle_topic = LaunchConfiguration('obstacle_topic')
     footprint_topic = LaunchConfiguration('footprint_topic')
@@ -369,6 +370,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'delay_compensation_method', default_value='forward_simulation',
             description='Delay-compensation method (currently forward_simulation).'),
+        DeclareLaunchArgument(
+            'solver_log_file', default_value='',
+            description='If set, append one per-solve stats row (status, commands, '
+                        'obstacle selection/side/clearance) to this CSV path '
+                        '(empty = disabled).'),
     ]
 
     # ---- 1. Static transform: map -> odom (identity) ------------------------
@@ -543,6 +549,7 @@ def generate_launch_description():
                 delay_compensation_enabled, value_type=bool),
             'estimated_delay': ParameterValue(estimated_delay, value_type=float),
             'delay_compensation_method': delay_compensation_method,
+            'solver_log_file': solver_log_file,
         }
 
         def _params(solver_dict, tail_dict):

@@ -106,6 +106,7 @@ class BaseTrajectoryTracker(Node, ABC):
             self._solver_log_writer.writerow([
                 'wall_time', 'ref_idx', 'solve_time_ms', 'status', 'is_optimal',
                 'consecutive_failures', 'accel_cmd', 'steering_cmd', 'velocity_cmd', 'error',
+                'n_selected', 'sel_id', 'sel_side', 'sel_min_clearance',
             ])
             self._solver_log_fh.flush()
             self.get_logger().info(f'Solver stats logging to {path}')
@@ -114,11 +115,41 @@ class BaseTrajectoryTracker(Node, ABC):
             self._solver_log_fh = None
             self._solver_log_writer = None
 
-    def _log_solver_stats(self, result: SolverResult) -> None:
+    def _obstacle_diag(self, result: SolverResult, selected: list):
+        """Per-tick obstacle diagnostics for the stats CSV.
+
+        Returns ``(n_selected, sel_id, sel_side, sel_min_clearance)`` for the
+        top-ranked selected obstacle: its id, its committed go-around side
+        (``self._keepout_side_hints`` after this tick's projection), and the minimum
+        clearance of the *planned* trajectory (``result.x_sequence``) to that
+        obstacle's keep-out boundary — negative means the plan threads inside the
+        keep-out. A weak detour shows clearance dipping negative with the side steady;
+        a side-hint flip shows ``sel_side`` changing sign tick to tick.
+        """
+        n_sel = len(selected) if selected else 0
+        if n_sel == 0:
+            return 0, -1, 0, float('nan')
+        obs = selected[0]
+        sel_id = obs.get('id', -1)
+        sel_side = self._keepout_side_hints.get(sel_id, 0)
+        min_clear = float('nan')
+        xseq = getattr(result, 'x_sequence', None)
+        if xseq is not None:
+            try:
+                centre = np.asarray(obs['state'][:2], dtype=float)
+                keepout = float(self._keepout_radii([obs])[0])
+                d = np.hypot(xseq[0, :] - centre[0], xseq[1, :] - centre[1])
+                min_clear = float(np.min(d) - keepout)
+            except (ValueError, IndexError, TypeError):
+                min_clear = float('nan')
+        return n_sel, sel_id, sel_side, min_clear
+
+    def _log_solver_stats(self, result: SolverResult, selected: list = None) -> None:
         """Append one CSV row for this solve (no-op when logging is disabled)."""
         if self._solver_log_writer is None:
             return
         try:
+            n_sel, sel_id, sel_side, sel_clear = self._obstacle_diag(result, selected or [])
             self._solver_log_writer.writerow([
                 f'{time.time():.6f}',
                 getattr(self, 'current_idx', -1),
@@ -130,6 +161,10 @@ class BaseTrajectoryTracker(Node, ABC):
                 f'{result.steering_cmd:.6f}',
                 f'{result.velocity_cmd:.6f}',
                 result.error or '',
+                n_sel,
+                sel_id,
+                sel_side,
+                f'{sel_clear:.6f}',
             ])
             self._solver_log_fh.flush()
         except (OSError, ValueError):
@@ -1066,7 +1101,7 @@ class BaseTrajectoryTracker(Node, ABC):
         #     return below so the tick that trips the zero-command fallback is in the log.
         self._consecutive_failures = (
             0 if result.is_optimal else self._consecutive_failures + 1)
-        self._log_solver_stats(result)
+        self._log_solver_stats(result, selected)
 
         if result.is_optimal:
             if not self._u_prev_from_echo:
