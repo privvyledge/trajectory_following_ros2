@@ -1,6 +1,8 @@
+import hashlib
 import logging
 import os
 import sys
+import tempfile
 import time
 from typing import Optional
 
@@ -444,6 +446,23 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
                 "(only 'ERK'/'DISCRETE'); falling back to 'ERK'.")
             integrator_type = 'ERK'
         model_dir = self.get_parameter('code_gen_directory').value
+        # acados' generated Cython Makefile does not quote paths, so a space anywhere in
+        # the code-generation directory breaks the build (`cython: error: unknown option
+        # -`) AND the runtime load (the generated .json and compiled .so carry absolute
+        # paths). Copying artifacts back into a spaced directory would only move the
+        # failure to load time, so redirect to a space-free mirror under the system temp
+        # dir and use it for both codegen and load. The mirror is deterministic (hashed
+        # from the original path) so the built model is reused across launches.
+        abs_model_dir = os.path.abspath(model_dir) if model_dir else os.getcwd()
+        if ' ' in abs_model_dir:
+            digest = hashlib.sha1(abs_model_dir.encode('utf-8')).hexdigest()[:12]
+            redirected = os.path.join(
+                tempfile.gettempdir(), f'trajectory_acados_codegen_{digest}')
+            self.get_logger().warn(
+                f"code_gen_directory '{abs_model_dir}' contains a space, which breaks "
+                f"acados Cython code generation; redirecting to '{redirected}'. Set a "
+                "space-free code_gen_directory to silence this.")
+            model_dir = redirected
         num_obstacles = self.get_parameter('num_obstacles').value
         collision_method = self.get_parameter('obstacle_collision_avoidance_method').value
         safe_distance = self.get_parameter('safe_distance').value
