@@ -219,9 +219,12 @@ class BaseTrajectoryTracker(Node, ABC):
                 'Maximum wall time in seconds since the last successful command publication '
                 'during which hold_last may bridge a failure. 0 disables the time gate.')))
         self.declare_parameter(
-            'solver_failure_zero_on_saturation', True,
+            'solver_failure_zero_on_saturation', False,
             ParameterDescriptor(description=(
-                'When true, never hold a command at an accel, steering, or speed limit.')))
+                'When true, never hold a command at an accel, steering, or speed limit. '
+                'Default False: a legitimately saturated last-good command (max steer '
+                'mid-corner, max-speed cruise) is safer to hold through a transient '
+                'failure than to zero.')))
         self.declare_parameter('distance_tolerance', 0.2)
         self.declare_parameter('speed_tolerance', 0.5)
         self.declare_parameter('wheelbase', 0.256)

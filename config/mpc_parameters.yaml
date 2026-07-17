@@ -19,7 +19,7 @@
     solver_failure_mode: 'hold_last'
     solver_failure_hold_count: 1
     solver_failure_hold_time: 0.1  # wall seconds since the last successful publish
-    solver_failure_zero_on_saturation: True
+    solver_failure_zero_on_saturation: False  # holding a legitimately saturated last-good command (max steer mid-corner, max-speed cruise) through a transient failure is safer than zeroing it
 
     max_speed: 1.5
     min_speed: -1.5

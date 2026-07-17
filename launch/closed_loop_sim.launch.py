@@ -396,8 +396,11 @@ def generate_launch_description():
             description='Maximum wall seconds since the last successful command publication '
                         'for hold_last; 0 disables the time gate.'),
         DeclareLaunchArgument(
-            'solver_failure_zero_on_saturation', default_value='true',
-            description='Never hold a command at an accel, steering, or speed limit.'),
+            'solver_failure_zero_on_saturation', default_value='false',
+            description='When true, never hold a command at an accel, steering, or speed '
+                        'limit. Default false: a legitimately saturated last-good command '
+                        '(max steer mid-corner, max-speed cruise) is safer to hold through '
+                        'a transient failure than to zero.'),
         DeclareLaunchArgument(
             'acados_failure_dump_file', default_value='',
             description='acados only: write the first hard-failure inputs and solver stats '
