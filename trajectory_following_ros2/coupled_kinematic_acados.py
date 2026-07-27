@@ -1,3 +1,4 @@
+import ctypes
 import hashlib
 import logging
 import os
@@ -5,6 +6,15 @@ import sys
 import tempfile
 import time
 from typing import Optional
+
+try:
+    # For flushing the C runtime's stdio buffers: the generated acados C code
+    # printf()s, and when stdout is a file/pipe those messages sit in the C buffer —
+    # they must be flushed while the fds still point at /dev/null or the "silenced"
+    # output simply appears after the redirect window closes.
+    _libc = ctypes.CDLL(None)
+except OSError:  # non-POSIX fallback: silencing degrades gracefully
+    _libc = None
 
 import numpy as np
 
@@ -34,8 +44,11 @@ class AcadosSolverAdapter(BaseSolver):
                  u_max: Optional[np.ndarray] = None,
                  rate_max: Optional[np.ndarray] = None,
                  failure_dump_file: str = '',
-                 solver_config_file: str = ''):
+                 solver_config_file: str = '',
+                 suppress_solver_output: bool = True,
+                 logger=None):
         self._controller = controller
+        self._ros_logger = logger
         self._horizon = horizon
         self._wheelbase = wheelbase
         self._stage_cost_type = stage_cost_type
@@ -63,6 +76,22 @@ class AcadosSolverAdapter(BaseSolver):
         ) if solver_config_file else ''
         self._stage0_lbu = self._u_min.copy()
         self._stage0_ubu = self._u_max.copy()
+        # Slow-solve diagnostics: any solve above 80% of the tick budget gets its SQP
+        # statistics logged (throttled), failure or not — an optimal 1 s solve breaks
+        # real time just as surely as a failed one.
+        self._slow_solve_threshold = 0.8 * self._dt
+        self._slow_solve_count = 0
+        self._slow_solve_worst = 0.0
+        self._slow_solve_last_log = 0.0
+        # The generated acados C code printf()s directly (e.g. 'ocp_nlp_sqp: maximum
+        # iterations reached' on every budget-limited solve), bypassing Python logging
+        # entirely — at an on-path obstacle that is 90+ identical lines. When
+        # suppressed, fds 1/2 are pointed at /dev/null for the duration of the C solve
+        # call only; the throttled status-2 summary in solve() keeps the condition
+        # diagnosable.
+        self._devnull_fd = os.open(os.devnull, os.O_WRONLY) if suppress_solver_output else None
+        self._budget_limited_count = 0
+        self._budget_limited_last_log = 0.0
         if has_weight_params:
             self._Q_diag = np.diag(Q) if Q is not None else np.ones(4)
             self._R_diag = np.diag(R) if R is not None else np.ones(2)
@@ -118,6 +147,48 @@ class AcadosSolverAdapter(BaseSolver):
             0, 'lbu', self._stage0_lbu)
         self._controller.constraints_set(
             0, 'ubu', self._stage0_ubu)
+
+    def _solve_raw(self):
+        """Run the C solve, silencing the solver's own fd-level prints when configured.
+
+        The redirect covers only the C call, but fds 1/2 are process-wide, so another
+        thread's output landing inside that ~ms window is swallowed too — an accepted
+        cost at 20 Hz. Python-side logging in this adapter happens outside the window.
+        """
+        if self._devnull_fd is None:
+            return self._controller.solve()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        if _libc is not None:
+            _libc.fflush(None)
+        saved_out, saved_err = os.dup(1), os.dup(2)
+        os.dup2(self._devnull_fd, 1)
+        os.dup2(self._devnull_fd, 2)
+        try:
+            return self._controller.solve()
+        finally:
+            # Flush the solver's buffered printf output into /dev/null BEFORE
+            # restoring the fds — C stdio is block-buffered on files/pipes, so
+            # without this the flood re-emerges on the restored fd later.
+            if _libc is not None:
+                _libc.fflush(None)
+            os.dup2(saved_out, 1)
+            os.dup2(saved_err, 2)
+            os.close(saved_out)
+            os.close(saved_err)
+
+    def _log(self, level: str, msg: str, *args) -> None:
+        """Emit adapter diagnostics, preferring the ROS node logger.
+
+        The module-level Python logger has no handler configured under ROS, so only
+        WARNING and above reach the root ``lastResort`` handler — an ``info()`` call
+        here is silently dropped. Route through the node logger when one was passed.
+        """
+        text = (msg % args) if args else msg
+        if self._ros_logger is not None:
+            getattr(self._ros_logger, 'warn' if level == 'warning' else level)(text)
+        else:
+            getattr(logging.getLogger(__name__), level)(text)
 
     def _solver_stat(self, name: str) -> np.ndarray:
         """Read one acados statistic without letting diagnostics affect control."""
@@ -180,13 +251,53 @@ class AcadosSolverAdapter(BaseSolver):
                 os.makedirs(parent, exist_ok=True)
             np.savez_compressed(self._failure_dump_file, **payload)
             self._failure_dump_written = True
-            logging.getLogger(__name__).warning(
-                'Saved first acados hard-failure replay dump to %s',
+            self._log(
+                'warning', 'Saved first acados hard-failure replay dump to %s',
                 self._failure_dump_file)
         except (OSError, TypeError, ValueError) as exc:
-            logging.getLogger(__name__).warning(
-                'Could not save acados failure replay dump to %s: %s',
+            self._log(
+                'warning', 'Could not save acados failure replay dump to %s: %s',
                 self._failure_dump_file, exc)
+
+    def _log_slow_solve(self, status, solve_time: float,
+                        solve_time_cpu: float) -> None:
+        """Log SQP statistics for solves that blow the tick budget (throttled).
+
+        Aggregates between logs (at most one line per second) so a batch of slow
+        solves at an obstacle is reported, not turned into its own flood.
+        """
+        self._slow_solve_count += 1
+        self._slow_solve_worst = max(self._slow_solve_worst, solve_time)
+        now = time.monotonic()
+        if now - self._slow_solve_last_log < 1.0:
+            return
+        self._slow_solve_last_log = now
+
+        def _ms(name):
+            arr = self._solver_stat(name)
+            try:
+                return float(np.asarray(arr).flatten()[0]) * 1e3
+            except (IndexError, TypeError, ValueError):
+                return float('nan')
+
+        sqp_iter = self._solver_stat('sqp_iter')
+        residuals = self._solver_stat('residuals')
+        # cpu << wall on a slow solve means the process was descheduled (OS/CPU
+        # contention), not that the solver burned that much compute.
+        self._log(
+            'warning', 'Slow acados solve: %.1f ms wall / %.1f ms cpu (budget %.0f ms), '
+            'status=%s, sqp_iter=%s, time_qp=%.1f ms, time_lin=%.1f ms, '
+            'time_reg=%.1f ms, acados time_tot=%.1f ms, residuals=%s; '
+            '%d slow solve(s) since last report, worst %.1f ms',
+            solve_time * 1e3, solve_time_cpu * 1e3,
+            self._slow_solve_threshold * 1e3, status,
+            np.asarray(sqp_iter).flatten(), _ms('time_qp'), _ms('time_lin'),
+            _ms('time_reg'), _ms('time_tot'),
+            np.array2string(np.asarray(residuals, dtype=float),
+                                             precision=2),
+            self._slow_solve_count, self._slow_solve_worst * 1e3)
+        self._slow_solve_count = 0
+        self._slow_solve_worst = 0.0
 
     def _recover_from_failure(self, x0: np.ndarray, xref: np.ndarray) -> None:
         """Reset the solver after a failed solve and re-seed a clean iterate.
@@ -213,7 +324,7 @@ class AcadosSolverAdapter(BaseSolver):
             self._controller.set(i, 'u', np.zeros(2))
         self._controller.constraints_set(0, 'lbx', x0)
         self._controller.constraints_set(0, 'ubx', x0)
-        self._controller.solve()  # initial guess
+        self._solve_raw()  # initial guess
 
     def solve(self, x0: np.ndarray, xref: np.ndarray,
               u_prev: np.ndarray) -> SolverResult:
@@ -290,8 +401,25 @@ class AcadosSolverAdapter(BaseSolver):
                 seed_u = np.array([])
 
         t0 = time.process_time()
-        status = self._controller.solve()
+        t0_wall = time.monotonic()
+        status = self._solve_raw()
         solve_time_cpu = time.process_time() - t0
+        solve_time = time.monotonic() - t0_wall
+
+        if status == 2:
+            # Replaces the C-level per-solve 'maximum iterations reached' print with a
+            # throttled aggregate, so budget-limited batches stay visible without the
+            # 90-line flood.
+            self._budget_limited_count += 1
+            now = time.monotonic()
+            if now - self._budget_limited_last_log >= 5.0:
+                self._budget_limited_last_log = now
+                self._log(
+                    'info',
+                    '%d budget-limited acados solve(s) since last report (status=2: '
+                    'SQP hit max_iter; near-converged iterate applied, RTI-style)',
+                    self._budget_limited_count)
+                self._budget_limited_count = 0
 
         u = self._controller.get(0, 'u')
         x_seq = np.array(
@@ -299,10 +427,12 @@ class AcadosSolverAdapter(BaseSolver):
         u_seq = np.array(
             [self._controller.get(i, 'u') for i in range(self._horizon)]).T       # (2, N)
 
-        try:
-            solve_time = float(self._controller.get_stats('time_tot') or solve_time_cpu)
-        except Exception:
-            solve_time = solve_time_cpu
+        # solve_time is measured with time.monotonic() around the C call, not from
+        # acados' own 'time_tot': that statistic is taken from a settable clock, so a
+        # system-clock step (e.g. WSL2 time resync) makes it report absurd — even
+        # negative — durations. time_tot is still logged in the slow-solve line.
+        if solve_time > self._slow_solve_threshold:
+            self._log_slow_solve(status, solve_time, solve_time_cpu)
 
         # Real-time-iteration-style acceptance: status 2 (max SQP iterations) is a
         # budget-limited return, not a blow-up — near a nonconvex obstacle keep-out
@@ -413,6 +543,10 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         self.declare_parameter('enforce_input_rate_constraint', True)
         # Optional one-shot .npz dump of the first hard failure, written before reset.
         self.declare_parameter('acados_failure_dump_file', '')
+        # Silence the generated C code's per-solve printf flood (e.g. 'ocp_nlp_sqp:
+        # maximum iterations reached'); a throttled Python-side aggregate replaces it.
+        # Same name/default as the CasADi node's parameter.
+        self.declare_parameter('suppress_solver_output', True)
 
     def _init_solver(self) -> Optional[BaseSolver]:
         stage_cost_type = self.get_parameter('stage_cost_type').value
@@ -571,6 +705,9 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
                       if enforce_input_rate else None),
             failure_dump_file=failure_dump_file,
             solver_config_file=config_path,
+            suppress_solver_output=bool(
+                self.get_parameter('suppress_solver_output').value),
+            logger=self.get_logger(),
         )
 
 

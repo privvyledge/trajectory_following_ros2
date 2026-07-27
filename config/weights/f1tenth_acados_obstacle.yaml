@@ -20,12 +20,18 @@
 
     # Full SQP (SQP_RTI's single step is too weak near a corner + obstacle).
     nlp_solver_type: SQP
-    # 40 (not 20): with the obstacle con_h active, ~20 SQP iters leaves a short cluster
-    # of consecutive non-convergent solves while the obstacle first enters the horizon
-    # during the standstill launch (longest run 4 at 20 -> would approach base_tracker's
-    # >=5 zero-command gate); 40 breaks the cluster (remaining failures are isolated
-    # single ticks the near-converged iterate absorbs). Costs a few ms only on hard ticks.
-    max_iter: 40
+    # 20 (was 40): near the nonconvex keep-out the SQP limit-cycles on the
+    # stationarity residual and consumes ANY iteration budget — capped-solve counts
+    # are cap-invariant (169/150/143/156 at 20/40/60/100 on the on-path-obstacle
+    # rollout) while worst-case solve time scales with the cap (p99 32 ms at 20 vs
+    # 147 ms at 100; budget 50 ms). Tracking is unchanged (same course completion,
+    # 0 failures, CTE within run spread); the budget-limited status-2 iterate is
+    # accepted RTI-style, so capped solves are not failures. The old "40 breaks the
+    # launch failure cluster" rationale predates that acceptance policy and no
+    # longer applies. Globalization (MERIT_BACKTRACKING) and Levenberg
+    # regularization do NOT break the limit cycle either — don't re-try them as a
+    # substitute for the cap.
+    max_iter: 20
 
     # Obstacle avoidance (exact nonlinear con_h). num_obstacles is NOT set here — it is
     # a launch arg applied after this overlay so it stays authoritative (a weights pin
