@@ -652,6 +652,10 @@ def generate_launch_description():
             executable='trajectory_visualizer',
             name='trajectory_visualizer',
             output='screen',
+            # Visualization is best-effort: keep its CPU priority below the control
+            # loop so full-figure redraws cannot starve the 20 Hz controller tick on
+            # a core-limited box.
+            prefix='nice -n 10',
             additional_env=additional_env,
             parameters=[{
                 'viz_backend': viz_backend,
