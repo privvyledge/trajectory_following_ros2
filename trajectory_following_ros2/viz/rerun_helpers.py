@@ -10,6 +10,7 @@ ENTITY = {
     'world_axes':        'world/frame/axes',
     'vehicle_pos':       'world/vehicle/position',
     'vehicle_heading':   'world/vehicle/heading',
+    'vehicle_axes':      'world/vehicle/axes',
     'full_path':         'world/paths/full_reference',
     'ref_window':        'world/paths/mpc_reference_window',
     'predicted':         'world/paths/mpc_predicted',
@@ -53,6 +54,7 @@ COLORS = {
     'origin':     [230, 230, 230, 255],   # white-ish
     'axis_x':     [230,  40,  40, 255],   # red   — ROS +X (forward)
     'axis_y':     [40,  220,  40, 255],   # green — ROS +Y (left)
+    'axis_z':     [60,  120, 255, 255],   # blue  — ROS +Z (up)
     'vehicle':    [0,   200, 255, 255],   # cyan
     'full_path':  [120, 120, 120, 160],   # dim grey
     'ref_window': [255, 200,   0, 255],   # amber
@@ -61,11 +63,14 @@ COLORS = {
     'commanded':  [255, 140,   0, 255],   # orange
     'reference':  [100, 120, 255, 255],   # blue
     'feedback':   [200, 100, 255, 255],   # purple
-    'obstacle':          [255,   0,   0, 255],   # solid red
-    'obstacle_margin':   [255,   0,   0,  64],   # translucent red
+    'obstacle':          [255,   0,   0, 255],   # solid red — the body itself
+    # Keep-out outlines. Each must be a distinct *hue* from the shape it
+    # surrounds: the margin used to be translucent red like the obstacle, so
+    # only the (larger) margin was visible and the two read as one object.
+    'obstacle_margin':   [255, 200,  40, 255],   # yellow  — obstacle + keep-out
     'ego_footprint':     [0,   255, 150, 255],   # bright mint green
-    'ego_radius':        [180,  50, 255,  30],   # translucent purple
-    'safe_distance':     [255, 165,   0,  15],   # translucent orange
+    'ego_radius':        [190,  90, 255, 255],   # purple  — ego inflation
+    'safe_distance':     [255, 140,   0, 255],   # orange  — ego + safe distance
 }
 
 
@@ -79,11 +84,14 @@ def build_blueprint():
 
     Without a blueprint, Rerun auto-generates the layout: it dumps every scalar
     onto a single time-series view and (especially in the web viewer) splits the
-    ``Arrows2D`` heading entity into its own spatial view, detached from the
+    heading-arrow entity into its own spatial view, detached from the
     vehicle position and path. This pins:
 
-    - one 2-D spatial view rooted at ``world`` (pose + heading + paths + goal
-      share the same view and coordinate frame), and
+    - one 3-D spatial view rooted at ``world`` (pose + heading + paths + goal +
+      footprint prism share the same view and coordinate frame). It is a *3-D*
+      view, so every spatial entity must be logged with a 3-D archetype —
+      ``rerun_backend`` logs ground-plane data at z = 0 in the ROS frame, with
+      ViewCoordinates RIGHT_HAND_Z_UP on ``world`` to orient the camera; and
     - time-series views grouped by *physical quantity* so commanded / actual /
       reference signals of the same unit overlay on one axis.
 
@@ -130,7 +138,10 @@ def build_blueprint():
 
     return rrb.Blueprint(
         rrb.Horizontal(spatial, signals, column_shares=[1.0, 1.0]),
-        rrb.BlueprintPanel(state='collapsed'),
+        # 'collapsed' hides the entity/attribute toggles outright in the web
+        # viewer; 'hidden' would be worse. Left expandable so the entity tree
+        # and per-entity visibility toggles stay reachable.
+        rrb.BlueprintPanel(state='expanded'),
         rrb.SelectionPanel(state='collapsed'),
         rrb.TimePanel(state='collapsed'),
     )

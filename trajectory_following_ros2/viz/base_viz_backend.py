@@ -82,6 +82,13 @@ class BaseVizBackend(ABC):
     def log_footprint_polygon(self, pts: list, stamp=None) -> None:
         """Polygon coordinates (x, y) of the ego footprint. Default no-op."""
 
+    def set_keepout(self, ego_radius: float, safe_distance: float) -> None:
+        """Update the drawn ego/keep-out radii after startup.  Default no-op.
+
+        Called when the visualizer adopts the controller's live values, so the drawn
+        keep-out matches the one the solver actually enforces.
+        """
+
     # ------------------------------------------------------------------
     # Lifecycle
 

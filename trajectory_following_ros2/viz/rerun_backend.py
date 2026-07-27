@@ -74,41 +74,67 @@ class RerunBackend(BaseVizBackend):
     # ------------------------------------------------------------------
     # World frame
     # ------------------------------------------------------------------
-    # Rerun's 2-D view uses the image convention (+X right, +Y *down*), while
-    # ROS REP-103 is +X forward, +Y left, +Z up. We reconcile the two by
-    # negating Y on every spatial log: a ROS point at +Y (left) is logged at
-    # -Y, which Rerun then renders *up*. The result is a ROS-aligned view
-    # (X right, Y up, yaw CCW), matching RViz. All spatial logs below go
-    # through _xy() / _strip() so the convention is applied in exactly one place.
+    # The world view is a Rerun *3-D* view (the vehicle footprint is a prism),
+    # so every spatial entity must use a 3-D archetype — a 3-D view does not
+    # render Points2D/Arrows2D/LineStrips2D at all. Ground-plane data is logged
+    # at z = 0.
+    #
+    # Coordinates are logged **verbatim in the ROS REP-103 frame** (+X forward,
+    # +Y left, +Z up); the view is oriented by logging ViewCoordinates
+    # RIGHT_HAND_Z_UP on the `world` entity. An earlier version instead negated
+    # Y to fake an overhead screen layout — that mirrors the scene, which is
+    # invisible in a 2-D overhead view but makes a 3-D view left-handed: yaw
+    # renders backwards and no consistent Z axis can be drawn. All spatial logs
+    # go through _xy() / _strip() so the convention lives in one place.
 
     @staticmethod
-    def _xy(x: float, y: float) -> List[float]:
-        """ROS (x, y) → Rerun 2-D screen coordinates (negate Y)."""
-        return [x, -y]
+    def _xy(x: float, y: float, z: float = 0.0) -> List[float]:
+        """ROS (x, y) → Rerun 3-D world coordinates (ground plane at z)."""
+        return [x, y, z]
 
     @staticmethod
     def _strip(pts: List[Tuple[float, float]]) -> List[List[float]]:
-        """ROS polyline → Rerun 2-D screen coordinates (negate Y)."""
-        return [[px, -py] for px, py in pts]
+        """ROS polyline → Rerun 3-D world coordinates (ground plane)."""
+        return [[px, py, 0.0] for px, py in pts]
+
+    @staticmethod
+    def _ring(cx: float, cy: float, radius: float, z: float = 0.0,
+              segments: int = 64) -> List[List[float]]:
+        """Closed horizontal circle outline as a 3-D line strip.
+
+        Circles are drawn as outlines rather than Points3D with a large radius:
+        in a 3-D view a big point is a solid sphere that swallows whatever it
+        encloses (the obstacle inside its own margin, the vehicle inside its
+        keep-out), so nested radii are indistinguishable.
+        """
+        step = 2.0 * math.pi / segments
+        pts = [[cx + radius * math.cos(i * step),
+                cy + radius * math.sin(i * step), z]
+               for i in range(segments)]
+        pts.append(pts[0])
+        return pts
 
     def _log_world_axes(self) -> None:
-        """Static origin marker + X/Y axis arrows in the ROS frame.
+        """Static origin marker + X/Y/Z axis arrows in the ROS frame.
 
         Logged once as static data so the frame is visible at every point on
-        the timeline. Arrows are expressed directly in screen coordinates:
-        ROS +X (forward) points right, ROS +Y (left) points up.
+        the timeline. ViewCoordinates tells the 3-D view that Z is up, so the
+        default camera looks down on the ground plane with ROS +X forward and
+        +Y left, matching RViz.
         """
         axis_len = 1.0  # metres
+        rr.log('world', rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
         rr.log(ENTITY['world_origin'],
-               rr.Points2D([[0.0, 0.0]], colors=[COLORS['origin']], radii=0.06),
+               rr.Points3D([[0.0, 0.0, 0.0]], colors=[COLORS['origin']], radii=0.06),
                static=True)
         rr.log(ENTITY['world_axes'],
-               rr.Arrows2D(
-                   origins=[[0.0, 0.0], [0.0, 0.0]],
-                   # +X right, +Y up (screen). Y arrow is negated like all data.
-                   vectors=[[axis_len, 0.0], [0.0, -axis_len]],
-                   colors=[COLORS['axis_x'], COLORS['axis_y']],
-                   labels=['x', 'y']),
+               rr.Arrows3D(
+                   origins=[[0.0, 0.0, 0.0]] * 3,
+                   vectors=[[axis_len, 0.0, 0.0],
+                            [0.0, axis_len, 0.0],
+                            [0.0, 0.0, axis_len]],
+                   colors=[COLORS['axis_x'], COLORS['axis_y'], COLORS['axis_z']],
+                   labels=['x', 'y', 'z']),
                static=True)
 
     # ------------------------------------------------------------------
@@ -225,25 +251,39 @@ class RerunBackend(BaseVizBackend):
         if stamp is not None:
             self._set_time_from_stamp(stamp)
         rr.log(ENTITY['vehicle_pos'],
-               rr.Points2D([self._xy(x, y)], colors=[COLORS['vehicle']], radii=0.1))
+               rr.Points3D([self._xy(x, y)], colors=[COLORS['vehicle']], radii=0.1))
         arrow = 0.4
         rr.log(ENTITY['vehicle_heading'],
-               rr.Arrows2D(origins=[self._xy(x, y)],
+               rr.Arrows3D(origins=[self._xy(x, y)],
                            vectors=[self._xy(math.cos(yaw) * arrow,
                                              math.sin(yaw) * arrow)],
                            colors=[COLORS['vehicle']]))
+        # Body-frame triad at the rear-axle reference point: x forward, y left,
+        # z up — the same colour code as the world axes, so the vehicle's own
+        # orientation is readable without inferring it from the heading arrow.
+        body = 0.3
+        rr.log(ENTITY['vehicle_axes'],
+               rr.Arrows3D(
+                   origins=[self._xy(x, y)] * 3,
+                   vectors=[[math.cos(yaw) * body, math.sin(yaw) * body, 0.0],
+                            [-math.sin(yaw) * body, math.cos(yaw) * body, 0.0],
+                            [0.0, 0.0, body]],
+                   colors=[COLORS['axis_x'], COLORS['axis_y'], COLORS['axis_z']]))
         rr.log(ENTITY['speed_actual'], rr.Scalar(speed))
         rr.log(ENTITY['heading_deg'],  rr.Scalar(math.degrees(yaw)))
 
-        # 1. Log Ego Radius Circle (translucent Points2D)
+        # 1. Ego radius (circle outline — see _ring on why not a filled sphere)
         if self._ego_radius > 0.0:
             rr.log(ENTITY['ego_radius'],
-                   rr.Points2D([self._xy(x, y)], colors=[COLORS['ego_radius']], radii=self._ego_radius))
+                   rr.LineStrips3D([self._ring(x, y, self._ego_radius)],
+                                   colors=[COLORS['ego_radius']], radii=0.012))
 
-        # 2. Log Safe Distance Circle (radius = ego_radius + safe_distance)
+        # 2. Keep-out circle (radius = ego_radius + safe_distance)
         if self._safe_distance > 0.0 or self._ego_radius > 0.0:
             rr.log(ENTITY['safe_distance'],
-                   rr.Points2D([self._xy(x, y)], colors=[COLORS['safe_distance']], radii=self._ego_radius + self._safe_distance))
+                   rr.LineStrips3D(
+                       [self._ring(x, y, self._ego_radius + self._safe_distance)],
+                       colors=[COLORS['safe_distance']], radii=0.012))
 
         # 3. Log Footprint (Nav2 polygon prism or default 3D box)
         if self._footprint_poly:
@@ -254,13 +294,13 @@ class RerunBackend(BaseVizBackend):
             cx = x + self._footprint_rear_axle_offset * cos_y
             cy = y + self._footprint_rear_axle_offset * sin_y
             cz = self._vehicle_height / 2.0
-            q_neg = [0.0, 0.0, math.sin(-yaw / 2), math.cos(-yaw / 2)]
+            quat = [0.0, 0.0, math.sin(yaw / 2), math.cos(yaw / 2)]
 
             rr.log(ENTITY['vehicle_footprint'],
                    rr.Boxes3D(
-                       centers=[[cx, -cy, cz]],
+                       centers=[[cx, cy, cz]],
                        half_sizes=[[self._vehicle_length / 2.0, self._vehicle_width / 2.0, self._vehicle_height / 2.0]],
-                       rotations=[q_neg],
+                       rotations=[quat],
                        colors=[COLORS['ego_footprint']]
                    ))
 
@@ -268,28 +308,28 @@ class RerunBackend(BaseVizBackend):
         if stamp is not None:
             self._set_time_from_stamp(stamp)
         rr.log(ENTITY['full_path'],
-               rr.LineStrips2D([self._strip(pts)], colors=[COLORS['full_path']],
+               rr.LineStrips3D([self._strip(pts)], colors=[COLORS['full_path']],
                                radii=0.02))
 
     def log_predicted_path(self, pts: List[Tuple[float, float]], stamp=None) -> None:
         if stamp is not None:
             self._set_time_from_stamp(stamp)
         rr.log(ENTITY['predicted'],
-               rr.LineStrips2D([self._strip(pts)], colors=[COLORS['predicted']],
+               rr.LineStrips3D([self._strip(pts)], colors=[COLORS['predicted']],
                                radii=0.03))
 
     def log_ref_window(self, pts: List[Tuple[float, float]], stamp=None) -> None:
         if stamp is not None:
             self._set_time_from_stamp(stamp)
         rr.log(ENTITY['ref_window'],
-               rr.LineStrips2D([self._strip(pts)], colors=[COLORS['ref_window']],
+               rr.LineStrips3D([self._strip(pts)], colors=[COLORS['ref_window']],
                                radii=0.03))
 
     def log_goal(self, x: float, y: float, stamp=None) -> None:
         if stamp is not None:
             self._set_time_from_stamp(stamp)
         rr.log(ENTITY['goal'],
-               rr.Points2D([self._xy(x, y)], colors=[COLORS['goal']], radii=0.12))
+               rr.Points3D([self._xy(x, y)], colors=[COLORS['goal']], radii=0.12))
 
     # ------------------------------------------------------------------
     # Time-series — commanded actions
@@ -349,8 +389,8 @@ class RerunBackend(BaseVizBackend):
         rr.log(ENTITY['speed_reference'],     rr.Scalar(speed))
 
     def _log_prism(self, entity_path: str, pts_2d: List[Tuple[float, float]], height: float, color: List[int]) -> None:
-        bottom_pts = [[p[0], -p[1], 0.0] for p in pts_2d]
-        top_pts = [[p[0], -p[1], height] for p in pts_2d]
+        bottom_pts = [[p[0], p[1], 0.0] for p in pts_2d]
+        top_pts = [[p[0], p[1], height] for p in pts_2d]
 
         if bottom_pts:
             bottom_pts.append(bottom_pts[0])
@@ -368,15 +408,19 @@ class RerunBackend(BaseVizBackend):
             self._set_time_from_stamp(stamp)
         self._footprint_poly = list(pts)
 
+    def set_keepout(self, ego_radius: float, safe_distance: float) -> None:
+        self._ego_radius = float(ego_radius)
+        self._safe_distance = float(safe_distance)
+
     def log_obstacles(self, obstacles: List[dict], margin_offset: float = 0.0, stamp=None) -> None:
         if stamp is not None:
             self._set_time_from_stamp(stamp)
 
         if not obstacles:
-            rr.log(ENTITY['obstacles_circles'], rr.Points2D([]))
-            rr.log(ENTITY['obstacles_margin_circles'], rr.Points2D([]))
-            rr.log(ENTITY['obstacles_boxes'], rr.LineStrips2D([]))
-            rr.log(ENTITY['obstacles_margin_boxes'], rr.LineStrips2D([]))
+            rr.log(ENTITY['obstacles_circles'], rr.Points3D([]))
+            rr.log(ENTITY['obstacles_margin_circles'], rr.LineStrips3D([]))
+            rr.log(ENTITY['obstacles_boxes'], rr.LineStrips3D([]))
+            rr.log(ENTITY['obstacles_margin_boxes'], rr.LineStrips3D([]))
             return
 
         circle_positions = []
@@ -410,7 +454,8 @@ class RerunBackend(BaseVizBackend):
                     (-dx, dy),
                     (dx, dy)
                 ]
-                strip = [[x + lx * cos_y - ly * sin_y, -(y + lx * sin_y + ly * cos_y)] for lx, ly in local_corners]
+                strip = [[x + lx * cos_y - ly * sin_y, y + lx * sin_y + ly * cos_y, 0.0]
+                         for lx, ly in local_corners]
                 box_strips.append(strip)
 
                 if margin_offset > 0.0:
@@ -423,30 +468,35 @@ class RerunBackend(BaseVizBackend):
                         (-mx, my),
                         (mx, my)
                     ]
-                    margin_strip = [[x + lx * cos_y - ly * sin_y, -(y + lx * sin_y + ly * cos_y)] for lx, ly in local_margin_corners]
+                    margin_strip = [[x + lx * cos_y - ly * sin_y, y + lx * sin_y + ly * cos_y, 0.0]
+                                    for lx, ly in local_margin_corners]
                     box_margin_strips.append(margin_strip)
 
         if circle_positions:
             rr.log(ENTITY['obstacles_circles'],
-                   rr.Points2D(circle_positions, radii=circle_radii, colors=[COLORS['obstacle']]))
+                   rr.Points3D(circle_positions, radii=circle_radii, colors=[COLORS['obstacle']]))
             if margin_offset > 0.0:
-                margin_radii = [r + margin_offset for r in circle_radii]
+                # Outline, not a filled sphere: a solid margin ball hides the
+                # obstacle it is drawn around (they also shared a colour before).
+                rings = [self._ring(p[0], p[1], r + margin_offset)
+                         for p, r in zip(circle_positions, circle_radii)]
                 rr.log(ENTITY['obstacles_margin_circles'],
-                       rr.Points2D(circle_positions, radii=margin_radii, colors=[COLORS['obstacle_margin']]))
+                       rr.LineStrips3D(rings, colors=[COLORS['obstacle_margin']],
+                                       radii=0.02))
             else:
-                rr.log(ENTITY['obstacles_margin_circles'], rr.Points2D([]))
+                rr.log(ENTITY['obstacles_margin_circles'], rr.LineStrips3D([]))
         else:
-            rr.log(ENTITY['obstacles_circles'], rr.Points2D([]))
-            rr.log(ENTITY['obstacles_margin_circles'], rr.Points2D([]))
+            rr.log(ENTITY['obstacles_circles'], rr.Points3D([]))
+            rr.log(ENTITY['obstacles_margin_circles'], rr.LineStrips3D([]))
 
         if box_strips:
             rr.log(ENTITY['obstacles_boxes'],
-                   rr.LineStrips2D(box_strips, colors=[COLORS['obstacle']], radii=0.03))
+                   rr.LineStrips3D(box_strips, colors=[COLORS['obstacle']], radii=0.03))
             if box_margin_strips:
                 rr.log(ENTITY['obstacles_margin_boxes'],
-                       rr.LineStrips2D(box_margin_strips, colors=[COLORS['obstacle_margin']], radii=0.015))
+                       rr.LineStrips3D(box_margin_strips, colors=[COLORS['obstacle_margin']], radii=0.015))
             else:
-                rr.log(ENTITY['obstacles_margin_boxes'], rr.LineStrips2D([]))
+                rr.log(ENTITY['obstacles_margin_boxes'], rr.LineStrips3D([]))
         else:
-            rr.log(ENTITY['obstacles_boxes'], rr.LineStrips2D([]))
-            rr.log(ENTITY['obstacles_margin_boxes'], rr.LineStrips2D([]))
+            rr.log(ENTITY['obstacles_boxes'], rr.LineStrips3D([]))
+            rr.log(ENTITY['obstacles_margin_boxes'], rr.LineStrips3D([]))

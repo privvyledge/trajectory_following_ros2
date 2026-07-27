@@ -12,6 +12,7 @@ non-empty):
 """
 import math
 import threading
+from functools import partial
 
 import rclpy
 from rclpy.node import Node
@@ -21,7 +22,10 @@ from std_msgs.msg import Float32
 from geometry_msgs.msg import PointStamped, AccelWithCovarianceStamped, PolygonStamped
 from nav_msgs.msg import Odometry, Path
 from ackermann_msgs.msg import AckermannDriveStamped
+from rcl_interfaces.srv import GetParameters
 import tf_transformations
+
+from trajectory_following_ros2.utils.trajectory_utils import resolve_ego_radius
 
 try:
     OBSTACLES_AVAILABLE = True
@@ -47,6 +51,7 @@ class VisualizerNode(Node):
         self._init_backends()
 
         self._setup_subscriptions()
+        self._setup_keepout_sync()
         self.get_logger().info('Trajectory visualizer started.')
 
     # ------------------------------------------------------------------
@@ -67,6 +72,12 @@ class VisualizerNode(Node):
         self.declare_parameter('reference_cmd_topic',     '')
         self.declare_parameter('obstacle_topic',          'fake_obstacles/object_array')
         self.declare_parameter('footprint_topic',          '')
+        # The drawn keep-out must match the one the solver enforces
+        # (ego_radius + obstacle_radius + safe_distance), so these are fetched from the
+        # controller at startup and the viz_* values below are only a fallback for when
+        # no controller is running. Empty ('') auto-discovers the controller among the
+        # running nodes, which the launch files rename per backend.
+        self.declare_parameter('controller_node_name',    '')
         self.declare_parameter('viz_ego_radius',          0.15)
         self.declare_parameter('viz_safe_distance',        0.15)
         self.declare_parameter('vehicle_length',          0.58)
@@ -90,6 +101,102 @@ class VisualizerNode(Node):
         self.declare_parameter('native_video_path', '')
         self.declare_parameter('native_video_fps',  10)
 
+    # ------------------------------------------------------------------
+    # Keep-out sync
+    # ------------------------------------------------------------------
+
+    _KEEPOUT_SYNC_PERIOD_S = 2.0
+    _KEEPOUT_SYNC_MAX_ATTEMPTS = 5
+
+    def _setup_keepout_sync(self):
+        """Adopt the controller's ego_radius/safe_distance so the drawn keep-out matches.
+
+        The keep-out the solver enforces is ego_radius + obstacle_radius +
+        safe_distance, all owned by the controller. Re-declaring them here would let the
+        drawn circle silently disagree with the enforced one (they default to F1/10
+        values, while a Carla controller resolves ego_radius to ~2.1 m), so the viz_*
+        params are only a fallback for running the visualizer without a controller.
+
+        Polled from a timer rather than resolved in __init__ because the controller may
+        not have started yet, and a node cannot spin its own service call during
+        construction.
+        """
+        self._keepout_attempts = 0
+        self._keepout_failed_nodes = set()
+        self._keepout_timer = self.create_timer(
+            self._KEEPOUT_SYNC_PERIOD_S, self._try_sync_keepout)
+
+    def _try_sync_keepout(self):
+        self._keepout_attempts += 1
+        for node_name in self._keepout_candidates():
+            if node_name in self._keepout_failed_nodes:
+                continue
+            client = self.create_client(GetParameters, f'{node_name}/get_parameters')
+            if not client.service_is_ready():
+                self.destroy_client(client)
+                continue
+            future = client.call_async(
+                GetParameters.Request(names=['ego_radius', 'safe_distance']))
+            future.add_done_callback(
+                partial(self._on_keepout_response, node_name, client))
+            self._keepout_timer.cancel()
+            return
+
+        if self._keepout_attempts >= self._KEEPOUT_SYNC_MAX_ATTEMPTS:
+            self._keepout_timer.cancel()
+            self.get_logger().warn(
+                f'No controller reported the keep-out after '
+                f'{self._keepout_attempts} attempts; drawing it from viz_ego_radius='
+                f'{self.viz_ego_radius} + viz_safe_distance={self.viz_safe_distance}, '
+                'which may not match what the solver enforces.')
+
+    def _keepout_candidates(self):
+        """Controller nodes to ask, most specific first.
+
+        Falls back to discovery because the launch files rename the controller per
+        backend (acados_mpc_node / casadi_mpc_node / do_mpc_node), so no single default
+        name is right. Simulator nodes are excluded: 'kinematic_dompc_simulator'
+        contains 'mpc' but owns no keep-out parameters.
+        """
+        configured = str(self.controller_node_name).strip()
+        if configured:
+            return [configured if configured.startswith('/') else f'/{configured}']
+        return [f'{ns.rstrip("/")}/{name}'
+                for name, ns in self.get_node_names_and_namespaces()
+                if name != self.get_name() and 'simulator' not in name
+                and ('mpc' in name or 'controller' in name)]
+
+    def _on_keepout_response(self, node_name, client, future):
+        try:
+            values = future.result().values
+            # An unset/undeclared name comes back as PARAMETER_NOT_SET (type 0).
+            if len(values) != 2 or any(v.type == 0 for v in values):
+                raise ValueError(f'{node_name} did not report ego_radius/safe_distance')
+            ego_radius = resolve_ego_radius(values[0].double_value)
+            safe_distance = float(values[1].double_value)
+        except Exception as exc:
+            # A node without the parameters will never gain them (declared at
+            # construction), so skip it permanently and resume the timer to try the
+            # remaining candidates; the final fallback warning fires only when every
+            # candidate has been ruled out.
+            self._keepout_failed_nodes.add(node_name)
+            self.get_logger().info(
+                f'Could not read the keep-out from {node_name} ({exc}); '
+                'trying other candidates.')
+            self._keepout_timer.reset()
+            return
+        finally:
+            self.destroy_client(client)
+
+        self.viz_ego_radius = ego_radius
+        self.viz_safe_distance = safe_distance
+        for backend in self._backends:
+            backend.set_keepout(ego_radius, safe_distance)
+        self.get_logger().info(
+            f'Keep-out adopted from {node_name}: ego_radius={ego_radius:.3f} m + '
+            f'safe_distance={safe_distance:.3f} m (drawn keep-out = that + each '
+            'obstacle radius).')
+
     def _read_parameters(self):
         gp = lambda n: self.get_parameter(n).value  # noqa: E731
         self.odom_topic = gp('odom_topic')
@@ -105,6 +212,9 @@ class VisualizerNode(Node):
         self.reference_cmd_topic = gp('reference_cmd_topic')
         self.obstacle_topic = gp('obstacle_topic')
         self.footprint_topic = gp('footprint_topic')
+        self.controller_node_name = gp('controller_node_name')
+        # Fallbacks only — _setup_keepout_sync replaces these with the controller's
+        # live values once it is reachable.
         self.viz_ego_radius = gp('viz_ego_radius')
         self.viz_safe_distance = gp('viz_safe_distance')
         self.vehicle_length = gp('vehicle_length')

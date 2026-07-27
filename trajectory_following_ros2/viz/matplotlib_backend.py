@@ -448,6 +448,12 @@ class MatplotlibBackend(BaseVizBackend):
             self._buf['steer_ref_deg'].append(steer_deg)
             self._buf['speed_ref'].append(speed)
 
+    def set_keepout(self, ego_radius: float, safe_distance: float) -> None:
+        with self._lock:
+            self._ego_radius = float(ego_radius)
+            self._safe_distance = float(safe_distance)
+            self._obstacles_dirty = True  # redraw the rings at the new radii
+
     def log_obstacles(self, obstacles: List[dict], margin_offset: float = 0.0, stamp=None) -> None:
         with self._lock:
             if self._obstacles != obstacles or self._margin_offset != margin_offset:
