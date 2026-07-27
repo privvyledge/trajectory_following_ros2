@@ -107,6 +107,7 @@ class BaseTrajectoryTracker(Node, ABC):
                 'wall_time', 'ref_idx', 'solve_time_ms', 'status', 'is_optimal',
                 'consecutive_failures', 'accel_cmd', 'steering_cmd', 'velocity_cmd', 'error',
                 'n_selected', 'sel_id', 'sel_side', 'sel_min_clearance',
+                'sel_ego_clearance',
                 'tick_interval_ms', 'reference_ms', 'obstacle_ms', 'solver_wall_ms',
                 'pre_log_ms', 'previous_log_write_ms',
             ])
@@ -117,43 +118,60 @@ class BaseTrajectoryTracker(Node, ABC):
             self._solver_log_fh = None
             self._solver_log_writer = None
 
-    def _obstacle_diag(self, result: SolverResult, selected: list):
+    def _obstacle_diag(self, result: SolverResult, selected: list, ego_xy=None):
         """Per-tick obstacle diagnostics for the stats CSV.
 
-        Returns ``(n_selected, sel_id, sel_side, sel_min_clearance)`` for the
-        top-ranked selected obstacle: its id, its committed go-around side
-        (``self._keepout_side_hints`` after this tick's projection), and the minimum
-        clearance of the *planned* trajectory (``result.x_sequence``) to that
-        obstacle's keep-out boundary — negative means the plan threads inside the
-        keep-out. A weak detour shows clearance dipping negative with the side steady;
-        a side-hint flip shows ``sel_side`` changing sign tick to tick.
+        Returns ``(n_selected, sel_id, sel_side, sel_min_clearance,
+        sel_ego_clearance)`` for the top-ranked selected obstacle: its id, its
+        committed go-around side (``self._keepout_side_hints`` after this tick's
+        projection), and two clearances to that obstacle's keep-out boundary, both
+        negative when inside the keep-out:
+
+        - ``sel_min_clearance`` — minimum over the *planned* trajectory
+          (``result.x_sequence``). The constraint is slacked, so a plan dipping
+          into the margin is expected and does not mean the vehicle went there.
+        - ``sel_ego_clearance`` — the *executed* clearance: where the vehicle
+          measurably was this tick. This is the one to judge encroachment by.
+
+        Both use the ego reference point against ``ego_radius + obstacle_radius +
+        safe_distance``, so they measure the disc the OCP enforces, not the vehicle
+        body — with a rear-axle reference point and an ``ego_radius`` smaller than
+        the front overhang, the body can clip an obstacle at positive clearance.
+
+        A weak detour shows clearance dipping negative with the side steady; a
+        side-hint flip shows ``sel_side`` changing sign tick to tick.
         """
         n_sel = len(selected) if selected else 0
         if n_sel == 0:
-            return 0, -1, 0, float('nan')
+            return 0, -1, 0, float('nan'), float('nan')
         obs = selected[0]
         sel_id = obs.get('id', -1)
         sel_side = self._keepout_side_hints.get(sel_id, 0)
         min_clear = float('nan')
-        xseq = getattr(result, 'x_sequence', None)
-        if xseq is not None:
-            try:
-                centre = np.asarray(obs['state'][:2], dtype=float)
-                keepout = float(self._keepout_radii([obs])[0])
+        ego_clear = float('nan')
+        try:
+            centre = np.asarray(obs['state'][:2], dtype=float)
+            keepout = float(self._keepout_radii([obs])[0])
+            xseq = getattr(result, 'x_sequence', None)
+            if xseq is not None:
                 d = np.hypot(xseq[0, :] - centre[0], xseq[1, :] - centre[1])
                 min_clear = float(np.min(d) - keepout)
-            except (ValueError, IndexError, TypeError):
-                min_clear = float('nan')
-        return n_sel, sel_id, sel_side, min_clear
+            if ego_xy is not None:
+                ego_clear = float(
+                    math.hypot(ego_xy[0] - centre[0], ego_xy[1] - centre[1]) - keepout)
+        except (ValueError, IndexError, TypeError):
+            pass
+        return n_sel, sel_id, sel_side, min_clear, ego_clear
 
     def _log_solver_stats(self, result: SolverResult, selected: list = None,
-                          timing: Optional[dict] = None) -> None:
+                          timing: Optional[dict] = None, ego_xy=None) -> None:
         """Append one CSV row for this solve (no-op when logging is disabled)."""
         if self._solver_log_writer is None:
             return
         try:
             timing = timing or {}
-            n_sel, sel_id, sel_side, sel_clear = self._obstacle_diag(result, selected or [])
+            n_sel, sel_id, sel_side, sel_clear, ego_clear = self._obstacle_diag(
+                result, selected or [], ego_xy)
             previous_log_ms = self._last_solver_log_ms
             log_started = time.monotonic()
             self._solver_log_writer.writerow([
@@ -171,6 +189,7 @@ class BaseTrajectoryTracker(Node, ABC):
                 sel_id,
                 sel_side,
                 f'{sel_clear:.6f}',
+                f'{ego_clear:.6f}',
                 f"{timing.get('tick_interval_ms', float('nan')):.4f}",
                 f"{timing.get('reference_ms', float('nan')):.4f}",
                 f"{timing.get('obstacle_ms', float('nan')):.4f}",
@@ -1223,7 +1242,7 @@ class BaseTrajectoryTracker(Node, ABC):
             'obstacle_ms': obstacle_ms,
             'solver_wall_ms': solver_wall_ms,
             'pre_log_ms': (time.monotonic() - tick_started) * 1e3,
-        })
+        }, ego_xy=(x, y))
 
         if result.is_optimal:
             if not self._u_prev_from_echo:
