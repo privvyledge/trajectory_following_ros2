@@ -1,0 +1,79 @@
+/**:
+  ros__parameters:
+    # ---------------------------------------------------------------------------
+    # CARLA × acados — obstacle avoidance (EXACT nonlinear keep-out constraint).
+    # Tracking weights/reference levers are the tuned carla_acados.yaml set
+    # (Town01 moving route); the obstacle block mirrors f1tenth_acados_obstacle
+    # scaled to the CARLA ego.
+    # Overlay (highest wins): weights > platforms/carla.yaml > base.
+    # Launch (obstacles REQUIRE EXTERNAL cost):
+    #   mpc_toolbox:=acados platform:=carla weights:=carla_acados_obstacle \
+    #       stage_cost_type:=EXTERNAL terminal_cost_type:=EXTERNAL \
+    #       num_obstacles:=N generate_mpc_model:=true
+    # ---------------------------------------------------------------------------
+    horizon: 25
+    sample_time: 0.05
+    prediction_time: 1.25
+    termination_condition: 0.1
+
+    # Full SQP; treat max_iter as a TIME BUDGET, not a convergence knob. Near a
+    # nonconvex keep-out the SQP limit-cycles on the stationarity residual and
+    # consumes any iteration budget; the budget-limited status-2 iterate is
+    # accepted RTI-style, so capped solves are not failures. (The no-obstacle
+    # carla_acados.yaml uses max_iter 200 / termination 1e-4 — that pairing burns
+    # the whole 200 every solve next to a keep-out.)
+    nlp_solver_type: SQP
+    max_iter: 20
+
+    # Obstacle avoidance (exact nonlinear con_h). num_obstacles is NOT set here —
+    # it is a launch arg applied after this overlay so it stays authoritative.
+    # Pass num_obstacles:=N (default 0) + generate_mpc_model:=true on launch.
+    obstacle_collision_avoidance_method: euclidean
+    # Keep-out = ego_radius + obstacle_radius + safe_distance, enforced at EACH
+    # ego collision disc. The default ros-bridge ego (Tesla Model 3-class) is
+    # ~4.69 x 1.85 m with roughly 1.0 m of rear overhang, so the body spans about
+    # [-1.0, +3.7] m along x from the rear-axle reference point. Two circles cover
+    # it: each half-rectangle (~2.35 x 1.85 m) has circumradius
+    # hypot(2.35, 1.85)/2 ~= 1.50 m, centred at ~+0.18 and ~+2.53 m.
+    # If your ego blueprint differs, recompute: with body span [x_rear, x_front]
+    # and width w, each half has length L = (x_front - x_rear)/2,
+    # radius = hypot(L, w)/2, centres at x_rear + L/2 and x_front - L/2.
+    #
+    # CHANGING ego_disc_offsets CHANGES THE NUMBER OF GENERATED CONSTRAINT ROWS,
+    # so it needs generate_mpc_model:=True, exactly like num_obstacles.
+    ego_radius: 1.5
+    ego_disc_offsets: [0.18, 2.53]
+    # Comfort margin on top of the disc radii. Vehicle-scale (the F1/10 uses
+    # 0.15 m); also the spendable band the braking envelope lets the solver use
+    # during recovery. Raise it to start detours earlier and carry more speed.
+    safe_distance: 0.8
+    # Slack penalties are restart-only generated-cost settings. The linear term
+    # keeps shallow margin use expensive; the quadratic term dominates deep
+    # penetration while retaining a recovery path if the initial state is already
+    # infeasible.
+    obstacle_slack_weight: 1000.0
+    obstacle_slack_quadratic_weight: 10000.0
+
+    # Tuned Town01 tracking set (see carla_acados.yaml for the derivation).
+    Q:  [5.0, 5.0, 15.0, 0.05]
+    R:  [0.5, 100.0]
+    Rd: [1.0, 1000.0]
+    Qf: [10.0, 10.0, 30.0, 0.1]
+    use_bryson_weights: false
+
+    use_speed_profile: True
+    max_lateral_accel: 1.0
+    min_reference_speed: 0.3
+
+    # Reference anchor distance (platform default 5.0 m over-anchors and cuts the
+    # R~12 m corners). acados SQP holds down to 2.0 (1.8 fails) — 2.5 keeps margin.
+    distance_tolerance: 2.5
+
+    # Per-solve CSV for post-run safety/clearance analysis (node param, not a
+    # launch arg). Uncomment and set a path to enable.
+    # solver_log_file: '/tmp/carla_obstacle_run.csv'
+
+    # acados C-code generation + Cython wrapper (regenerate when the obstacle
+    # structure / horizon changes).
+    generate_mpc_model: True
+    build_with_cython: True
