@@ -25,7 +25,8 @@ from ackermann_msgs.msg import AckermannDriveStamped
 from rcl_interfaces.srv import GetParameters
 import tf_transformations
 
-from trajectory_following_ros2.utils.trajectory_utils import resolve_ego_radius
+from trajectory_following_ros2.utils.trajectory_utils import (
+    resolve_ego_disc_offsets, resolve_ego_radius)
 
 try:
     OBSTACLES_AVAILABLE = True
@@ -80,6 +81,7 @@ class VisualizerNode(Node):
         self.declare_parameter('controller_node_name',    '')
         self.declare_parameter('viz_ego_radius',          0.15)
         self.declare_parameter('viz_safe_distance',        0.15)
+        self.declare_parameter('viz_ego_disc_offsets',     [0.0])
         self.declare_parameter('vehicle_length',          0.58)
         self.declare_parameter('vehicle_width',           0.31)
         self.declare_parameter('vehicle_height',          0.12)
@@ -95,6 +97,7 @@ class VisualizerNode(Node):
         self.declare_parameter('web_open_browser', True)
         # Backend selection
         self.declare_parameter('viz_backend',     'both')   # 'rerun'|'native'|'both'
+        self.declare_parameter('rerun_spatial_frequency', 5.0)
         self.declare_parameter('plot_buffer_size', 300)
         # Native (matplotlib) video recording. Empty = off. .gif uses Pillow,
         # any other extension (.mp4/.mkv/...) uses ffmpeg.
@@ -136,7 +139,8 @@ class VisualizerNode(Node):
                 self.destroy_client(client)
                 continue
             future = client.call_async(
-                GetParameters.Request(names=['ego_radius', 'safe_distance']))
+                GetParameters.Request(
+                    names=['ego_radius', 'safe_distance', 'ego_disc_offsets']))
             future.add_done_callback(
                 partial(self._on_keepout_response, node_name, client))
             self._keepout_timer.cancel()
@@ -170,10 +174,15 @@ class VisualizerNode(Node):
         try:
             values = future.result().values
             # An unset/undeclared name comes back as PARAMETER_NOT_SET (type 0).
-            if len(values) != 2 or any(v.type == 0 for v in values):
+            if len(values) < 2 or any(v.type == 0 for v in values[:2]):
                 raise ValueError(f'{node_name} did not report ego_radius/safe_distance')
             ego_radius = resolve_ego_radius(values[0].double_value)
             safe_distance = float(values[1].double_value)
+            # Disc offsets are optional: a controller predating them reports
+            # PARAMETER_NOT_SET, which resolves to the single reference-point disc.
+            offsets = resolve_ego_disc_offsets(
+                list(values[2].double_array_value)
+                if len(values) > 2 and values[2].type != 0 else None)
         except Exception as exc:
             # A node without the parameters will never gain them (declared at
             # construction), so skip it permanently and resume the timer to try the
@@ -190,12 +199,14 @@ class VisualizerNode(Node):
 
         self.viz_ego_radius = ego_radius
         self.viz_safe_distance = safe_distance
+        self.viz_ego_disc_offsets = offsets
         for backend in self._backends:
-            backend.set_keepout(ego_radius, safe_distance)
+            backend.set_keepout(ego_radius, safe_distance, offsets)
         self.get_logger().info(
             f'Keep-out adopted from {node_name}: ego_radius={ego_radius:.3f} m + '
-            f'safe_distance={safe_distance:.3f} m (drawn keep-out = that + each '
-            'obstacle radius).')
+            f'safe_distance={safe_distance:.3f} m at disc offsets '
+            f'[{", ".join(f"{o:.3f}" for o in offsets)}] m (drawn keep-out = that + '
+            'each obstacle radius).')
 
     def _read_parameters(self):
         gp = lambda n: self.get_parameter(n).value  # noqa: E731
@@ -217,6 +228,7 @@ class VisualizerNode(Node):
         # live values once it is reachable.
         self.viz_ego_radius = gp('viz_ego_radius')
         self.viz_safe_distance = gp('viz_safe_distance')
+        self.viz_ego_disc_offsets = resolve_ego_disc_offsets(gp('viz_ego_disc_offsets'))
         self.vehicle_length = gp('vehicle_length')
         self.vehicle_width = gp('vehicle_width')
         self.vehicle_height = gp('vehicle_height')
@@ -228,6 +240,7 @@ class VisualizerNode(Node):
         self.serve_web = gp('serve_web')
         self.web_port = gp('web_port')
         self.web_open_browser = gp('web_open_browser')
+        self.rerun_spatial_frequency = gp('rerun_spatial_frequency')
 
     def _init_backends(self):
         backend_choice = self.get_parameter('viz_backend').value
@@ -250,10 +263,12 @@ class VisualizerNode(Node):
                     open_browser=self.web_open_browser,
                     ego_radius=self.viz_ego_radius,
                     safe_distance=self.viz_safe_distance,
+                    ego_disc_offsets=self.viz_ego_disc_offsets,
                     vehicle_length=self.vehicle_length,
                     vehicle_width=self.vehicle_width,
                     vehicle_height=self.vehicle_height,
                     footprint_rear_axle_offset=self.footprint_rear_axle_offset,
+                    spatial_frequency=self.rerun_spatial_frequency,
                 )
                 self._backends.append(rb)
                 self.get_logger().info('Rerun backend active.')
@@ -271,6 +286,7 @@ class VisualizerNode(Node):
                     video_fps=self.get_parameter('native_video_fps').value,
                     ego_radius=self.viz_ego_radius,
                     safe_distance=self.viz_safe_distance,
+                    ego_disc_offsets=self.viz_ego_disc_offsets,
                     vehicle_length=self.vehicle_length,
                     vehicle_width=self.vehicle_width,
                     vehicle_height=self.vehicle_height,

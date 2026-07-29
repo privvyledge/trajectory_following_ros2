@@ -1,6 +1,27 @@
 """Abstract base class for visualization backends."""
 from abc import ABC, abstractmethod
+import time
 from typing import List, Tuple, Optional  # noqa: F401
+
+
+class StreamRateLimiter:
+    """Independent monotonic rate limits for best-effort visualization streams."""
+
+    def __init__(self, frequency_hz: float, time_fn=time.monotonic):
+        self._period = 0.0 if frequency_hz <= 0.0 else 1.0 / frequency_hz
+        self._time_fn = time_fn
+        self._last = {}
+
+    def allow(self, stream: str) -> bool:
+        """Return whether ``stream`` may emit now; non-positive frequency means unlimited."""
+        if self._period <= 0.0:
+            return True
+        now = self._time_fn()
+        previous = self._last.get(stream)
+        if previous is not None and now - previous < self._period:
+            return False
+        self._last[stream] = now
+        return True
 
 
 class BaseVizBackend(ABC):
@@ -82,11 +103,15 @@ class BaseVizBackend(ABC):
     def log_footprint_polygon(self, pts: list, stamp=None) -> None:
         """Polygon coordinates (x, y) of the ego footprint. Default no-op."""
 
-    def set_keepout(self, ego_radius: float, safe_distance: float) -> None:
-        """Update the drawn ego/keep-out radii after startup.  Default no-op.
+    def set_keepout(self, ego_radius: float, safe_distance: float,
+                    ego_disc_offsets=None) -> None:
+        """Update the drawn ego/keep-out geometry after startup.  Default no-op.
 
         Called when the visualizer adopts the controller's live values, so the drawn
-        keep-out matches the one the solver actually enforces.
+        keep-out matches the one the solver actually enforces — including where the
+        collision discs sit. ``ego_disc_offsets`` is one longitudinal offset (m, +
+        forward from the rear-axle reference point) per disc; ``None`` means the
+        single disc on the reference point.
         """
 
     # ------------------------------------------------------------------

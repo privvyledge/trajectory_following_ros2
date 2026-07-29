@@ -699,6 +699,16 @@ def generate_launch_description():
             executable='trajectory_visualizer',
             name='trajectory_visualizer_node',
             output='screen',
+            parameters=[{
+                'spawn_viewer': ParameterValue(viz_spawn_viewer, value_type=bool),
+                'recording_path': ParameterValue(viz_recording_path, value_type=str),
+                'serve_web': ParameterValue(viz_serve_web, value_type=bool),
+                'web_port': ParameterValue(viz_web_port, value_type=int),
+                'web_open_browser': ParameterValue(viz_web_open_browser, value_type=bool),
+                'actuator_feedback_topic': ParameterValue(
+                    viz_actuator_feedback_topic, value_type=str),
+                'reference_cmd_topic': ParameterValue(viz_reference_cmd_topic, value_type=str),
+            }],
             # Visualization is best-effort: keep its CPU priority below the control
             # loop so full-figure redraws cannot starve the controller tick.
             prefix='nice -n 10',
@@ -789,15 +799,6 @@ def generate_launch_description():
 
                 # Waypoint Parameters
                 SetParameter(name='file_path', value=waypoints_csv, condition=IfCondition(load_params_from_args)),
-
-                # Visualizer parameters (only affect trajectory_visualizer_node)
-                SetParameter(name='spawn_viewer', value=viz_spawn_viewer, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='recording_path', value=viz_recording_path, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='serve_web', value=viz_serve_web, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='web_port', value=viz_web_port, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='web_open_browser', value=viz_web_open_browser, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='actuator_feedback_topic', value=viz_actuator_feedback_topic, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='reference_cmd_topic', value=viz_reference_cmd_topic, condition=IfCondition(load_params_from_args)),
 
                 # # Remap common topics
                 # SetRemap(src='trajectory/path', dst=path_topic),

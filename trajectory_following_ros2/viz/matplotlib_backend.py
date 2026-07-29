@@ -26,6 +26,7 @@ except Exception as e:
 
 
 from trajectory_following_ros2.viz.base_viz_backend import BaseVizBackend
+from trajectory_following_ros2.utils.trajectory_utils import resolve_ego_disc_offsets
 
 
 class MatplotlibBackend(BaseVizBackend):
@@ -34,6 +35,7 @@ class MatplotlibBackend(BaseVizBackend):
     def __init__(self, buffer_size: int = 300,
                  video_path: str = '', video_fps: int = 10,
                  ego_radius: float = 0.0, safe_distance: float = 0.0,
+                 ego_disc_offsets=None,
                  vehicle_length: float = 0.58, vehicle_width: float = 0.31,
                  vehicle_height: float = 0.12, footprint_rear_axle_offset: float = 0.19):
         self._lock = threading.Lock()
@@ -81,6 +83,7 @@ class MatplotlibBackend(BaseVizBackend):
 
         self._ego_radius = ego_radius
         self._safe_distance = safe_distance
+        self._ego_disc_offsets = resolve_ego_disc_offsets(ego_disc_offsets)
         self._vehicle_length = vehicle_length
         self._vehicle_width = vehicle_width
         self._vehicle_height = vehicle_height
@@ -188,6 +191,7 @@ class MatplotlibBackend(BaseVizBackend):
 
                 viz_ego_radius = self._ego_radius
                 viz_safe_distance = self._safe_distance
+                disc_offsets = self._ego_disc_offsets
                 length = self._vehicle_length
                 width = self._vehicle_width
                 axle_offset = self._footprint_rear_axle_offset
@@ -272,15 +276,21 @@ class MatplotlibBackend(BaseVizBackend):
                     patch.remove()
                 self._ego_circles = []
 
-            if viz_ego_radius > 0.0:
-                c_ego = patches.Circle((vx, vy), viz_ego_radius, color='purple', fill=False, ls='-', lw=1.0, label='_ego_radius')
-                ax_map.add_patch(c_ego)
-                self._ego_circles.append(c_ego)
+            # One circle pair per collision disc: the discs sit along the heading at
+            # their configured offsets from the rear-axle reference point, so this
+            # draws exactly the circles the solver constrains.
+            for offset in disc_offsets:
+                dx = vx + offset * math.cos(vyaw)
+                dy = vy + offset * math.sin(vyaw)
+                if viz_ego_radius > 0.0:
+                    c_ego = patches.Circle((dx, dy), viz_ego_radius, color='purple', fill=False, ls='-', lw=1.0, label='_ego_radius')
+                    ax_map.add_patch(c_ego)
+                    self._ego_circles.append(c_ego)
 
-            if viz_ego_radius > 0.0 or viz_safe_distance > 0.0:
-                c_safe = patches.Circle((vx, vy), viz_ego_radius + viz_safe_distance, color='orange', fill=False, ls='-.', lw=1.0, label='_safe_distance')
-                ax_map.add_patch(c_safe)
-                self._ego_circles.append(c_safe)
+                if viz_ego_radius > 0.0 or viz_safe_distance > 0.0:
+                    c_safe = patches.Circle((dx, dy), viz_ego_radius + viz_safe_distance, color='orange', fill=False, ls='-.', lw=1.0, label='_safe_distance')
+                    ax_map.add_patch(c_safe)
+                    self._ego_circles.append(c_safe)
 
             if self._footprint_patches:
                 for patch in self._footprint_patches:
@@ -448,10 +458,12 @@ class MatplotlibBackend(BaseVizBackend):
             self._buf['steer_ref_deg'].append(steer_deg)
             self._buf['speed_ref'].append(speed)
 
-    def set_keepout(self, ego_radius: float, safe_distance: float) -> None:
+    def set_keepout(self, ego_radius: float, safe_distance: float,
+                    ego_disc_offsets=None) -> None:
         with self._lock:
             self._ego_radius = float(ego_radius)
             self._safe_distance = float(safe_distance)
+            self._ego_disc_offsets = resolve_ego_disc_offsets(ego_disc_offsets)
             self._obstacles_dirty = True  # redraw the rings at the new radii
 
     def log_obstacles(self, obstacles: List[dict], margin_offset: float = 0.0, stamp=None) -> None:

@@ -137,6 +137,7 @@ def generate_launch_description():
     integrator_type = LaunchConfiguration('integrator_type')
     stage_cost_type = LaunchConfiguration('stage_cost_type')
     terminal_cost_type = LaunchConfiguration('terminal_cost_type')
+    generate_mpc_model = LaunchConfiguration('generate_mpc_model')
     code_gen_directory = LaunchConfiguration('code_gen_directory')
     arclength_index_advance = LaunchConfiguration('arclength_index_advance')
     projection_window = LaunchConfiguration('projection_window')
@@ -168,6 +169,7 @@ def generate_launch_description():
     viz_serve_web = LaunchConfiguration('viz_serve_web')
     viz_web_port = LaunchConfiguration('viz_web_port')
     viz_web_open_browser = LaunchConfiguration('viz_web_open_browser')
+    rerun_spatial_frequency = LaunchConfiguration('rerun_spatial_frequency')
     vulkan_icd = LaunchConfiguration('vulkan_icd')
 
     initial_x = LaunchConfiguration('initial_x')
@@ -291,6 +293,11 @@ def generate_launch_description():
             description='acados only: terminal cost module. EXTERNAL (default) | NONLINEAR_LS | '
                         'LINEAR_LS. Keep it EXTERNAL alongside stage_cost_type for the Rd penalty.'),
         DeclareLaunchArgument(
+            'generate_mpc_model', default_value='true',
+            description='acados only: regenerate and compile the OCP model. Required after '
+                        'changing structural settings such as num_obstacles, horizon, or '
+                        'ego_disc_offsets. Set false to reuse an already-built compatible model.'),
+        DeclareLaunchArgument(
             'code_gen_directory',
             default_value=os.path.join(pkg_prefix, 'data', 'casadi_codegen'),
             description='Directory for CasADi JIT artifacts (jit_tmp.c, tmp_*.o/.so). '
@@ -330,6 +337,10 @@ def generate_launch_description():
             'viz_web_open_browser', default_value='true',
             description='Auto-open the system browser at the web viewer URL '
                         '(used when viz_serve_web:=true).'),
+        DeclareLaunchArgument(
+            'rerun_spatial_frequency', default_value='5.0',
+            description='Maximum per-stream Rerun spatial logging rate in Hz. Time-series '
+                        'logging is not throttled; set <=0 to disable the spatial cap.'),
         DeclareLaunchArgument(
             'vulkan_icd', default_value='',
             description='Path to a Vulkan ICD JSON to force for the rerun viewer. '
@@ -620,6 +631,8 @@ def generate_launch_description():
                     acados_solver_params,
                     {**sim_controller_params, 'code_gen_directory': code_gen_directory,
                      'num_obstacles': num_obstacles,
+                     'generate_mpc_model': ParameterValue(
+                         generate_mpc_model, value_type=bool),
                      'acados_failure_dump_file': acados_failure_dump_file}),
             ),
             Node(
@@ -666,6 +679,8 @@ def generate_launch_description():
                 'serve_web': viz_serve_web,
                 'web_port': viz_web_port,
                 'web_open_browser': viz_web_open_browser,
+                'rerun_spatial_frequency': ParameterValue(
+                    rerun_spatial_frequency, value_type=float),
                 'obstacle_topic': obstacle_topic,
                 'footprint_topic': footprint_topic,
                 'viz_ego_radius': viz_ego_radius,

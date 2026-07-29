@@ -7,7 +7,8 @@ import rerun as rr
 
 from trajectory_following_ros2.viz.rerun_helpers import (
     ENTITY, COLORS, ros_stamp_to_nanos, build_blueprint)
-from trajectory_following_ros2.viz.base_viz_backend import BaseVizBackend
+from trajectory_following_ros2.viz.base_viz_backend import BaseVizBackend, StreamRateLimiter
+from trajectory_following_ros2.utils.trajectory_utils import resolve_ego_disc_offsets
 
 
 # Multi-sink ("tee") — streaming to a live viewer AND a .rrd file at the same
@@ -37,8 +38,10 @@ class RerunBackend(BaseVizBackend):
                  serve_web: bool = False, web_port=None,
                  open_browser: bool = True,
                  ego_radius: float = 0.0, safe_distance: float = 0.0,
+                 ego_disc_offsets=None,
                  vehicle_length: float = 0.58, vehicle_width: float = 0.31,
-                 vehicle_height: float = 0.12, footprint_rear_axle_offset: float = 0.19):
+                 vehicle_height: float = 0.12, footprint_rear_axle_offset: float = 0.19,
+                 spatial_frequency: float = 5.0):
         """
         stamp_fn — zero-argument callable returning the current ROS stamp.
                    Signature: () -> builtin_interfaces.msg.Time
@@ -65,11 +68,13 @@ class RerunBackend(BaseVizBackend):
 
         self._ego_radius = ego_radius
         self._safe_distance = safe_distance
+        self._ego_disc_offsets = resolve_ego_disc_offsets(ego_disc_offsets)
         self._vehicle_length = vehicle_length
         self._vehicle_width = vehicle_width
         self._vehicle_height = vehicle_height
         self._footprint_rear_axle_offset = footprint_rear_axle_offset
         self._footprint_poly = []
+        self._spatial_rate = StreamRateLimiter(spatial_frequency)
 
     # ------------------------------------------------------------------
     # World frame
@@ -248,6 +253,8 @@ class RerunBackend(BaseVizBackend):
 
     def log_vehicle_pose(self, x: float, y: float, yaw: float, speed: float,
                          stamp=None) -> None:
+        if not self._spatial_rate.allow('vehicle_pose'):
+            return
         if stamp is not None:
             self._set_time_from_stamp(stamp)
         rr.log(ENTITY['vehicle_pos'],
@@ -272,17 +279,23 @@ class RerunBackend(BaseVizBackend):
         rr.log(ENTITY['speed_actual'], rr.Scalar(speed))
         rr.log(ENTITY['heading_deg'],  rr.Scalar(math.degrees(yaw)))
 
-        # 1. Ego radius (circle outline — see _ring on why not a filled sphere)
+        # 1/2. One ego-radius ring and one keep-out ring per collision disc (circle
+        # outlines — see _ring on why not filled spheres). The discs sit along the
+        # heading at their configured offsets from the rear-axle reference point, so
+        # what is drawn is exactly the set of circles the solver constrains.
+        disc_x = [x + off * math.cos(yaw) for off in self._ego_disc_offsets]
+        disc_y = [y + off * math.sin(yaw) for off in self._ego_disc_offsets]
         if self._ego_radius > 0.0:
             rr.log(ENTITY['ego_radius'],
-                   rr.LineStrips3D([self._ring(x, y, self._ego_radius)],
+                   rr.LineStrips3D([self._ring(cx, cy, self._ego_radius)
+                                    for cx, cy in zip(disc_x, disc_y)],
                                    colors=[COLORS['ego_radius']], radii=0.012))
 
-        # 2. Keep-out circle (radius = ego_radius + safe_distance)
         if self._safe_distance > 0.0 or self._ego_radius > 0.0:
             rr.log(ENTITY['safe_distance'],
                    rr.LineStrips3D(
-                       [self._ring(x, y, self._ego_radius + self._safe_distance)],
+                       [self._ring(cx, cy, self._ego_radius + self._safe_distance)
+                        for cx, cy in zip(disc_x, disc_y)],
                        colors=[COLORS['safe_distance']], radii=0.012))
 
         # 3. Log Footprint (Nav2 polygon prism or default 3D box)
@@ -312,6 +325,8 @@ class RerunBackend(BaseVizBackend):
                                radii=0.02))
 
     def log_predicted_path(self, pts: List[Tuple[float, float]], stamp=None) -> None:
+        if not self._spatial_rate.allow('predicted_path'):
+            return
         if stamp is not None:
             self._set_time_from_stamp(stamp)
         rr.log(ENTITY['predicted'],
@@ -319,6 +334,8 @@ class RerunBackend(BaseVizBackend):
                                radii=0.03))
 
     def log_ref_window(self, pts: List[Tuple[float, float]], stamp=None) -> None:
+        if not self._spatial_rate.allow('reference_path'):
+            return
         if stamp is not None:
             self._set_time_from_stamp(stamp)
         rr.log(ENTITY['ref_window'],
@@ -326,6 +343,8 @@ class RerunBackend(BaseVizBackend):
                                radii=0.03))
 
     def log_goal(self, x: float, y: float, stamp=None) -> None:
+        if not self._spatial_rate.allow('goal'):
+            return
         if stamp is not None:
             self._set_time_from_stamp(stamp)
         rr.log(ENTITY['goal'],
@@ -408,11 +427,15 @@ class RerunBackend(BaseVizBackend):
             self._set_time_from_stamp(stamp)
         self._footprint_poly = list(pts)
 
-    def set_keepout(self, ego_radius: float, safe_distance: float) -> None:
+    def set_keepout(self, ego_radius: float, safe_distance: float,
+                    ego_disc_offsets=None) -> None:
         self._ego_radius = float(ego_radius)
         self._safe_distance = float(safe_distance)
+        self._ego_disc_offsets = resolve_ego_disc_offsets(ego_disc_offsets)
 
     def log_obstacles(self, obstacles: List[dict], margin_offset: float = 0.0, stamp=None) -> None:
+        if not self._spatial_rate.allow('obstacles'):
+            return
         if stamp is not None:
             self._set_time_from_stamp(stamp)
 
