@@ -148,6 +148,23 @@ class KinematicMPCCasadiOpti(object):
                 u0 = u0.flatten().tolist()
             self.update_previous_input(u0[0], u0[1])
 
+        # The SQP tuning knobs exist only so this class accepts the same kwargs as the
+        # function-based NLP formulation (the node passes one set to whichever class it
+        # builds). The Opti stack hands its problem straight to the solver and has no
+        # sqpmethod layer to tune, so they cannot be honoured here — say so rather than
+        # swallowing them, or a user tuning around an Opti stall gets silence and
+        # concludes the knob does not help.
+        _ignored = [f'{name}={value!r}' for name, value, default in (
+            ('sqp_convexify_strategy', sqp_convexify_strategy, 'regularize'),
+            ('sqp_hessian_approximation', sqp_hessian_approximation, 'exact'),
+            ('qp_inner_max_iter', qp_inner_max_iter, 0),
+        ) if value != default]
+        if _ignored:
+            logger.warning(
+                'Opti formulation ignores sqpmethod-only options (%s): the Opti stack has '
+                'no SQP layer to configure. Set use_opti=False to use them.',
+                ', '.join(_ignored))
+
         # suppress_ipopt_output is the legacy per-solver override; None means "defer to
         # the unified suppress_solver_output flag". A non-None value keeps overriding.
         effective_suppress = suppress_solver_output if suppress_ipopt_output is None else suppress_ipopt_output
