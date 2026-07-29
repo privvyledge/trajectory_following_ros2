@@ -19,7 +19,6 @@ from scipy.spatial.transform import Rotation
 from scipy.spatial.distance import cdist
 from scipy.signal import filtfilt
 from scipy.interpolate import splprep, splev, interp1d, CubicSpline
-import pandas as pd  # todo: remove
 
 import trajectory_following_ros2.utils.filters as filters
 
@@ -1432,6 +1431,10 @@ def project_reference_out_of_keepouts(xref, obstacles, keepout_radii, margin=0.0
 
 
 if __name__ == '__main__':
+    # Imported here, not at module level: this demo block is the only consumer, and
+    # importing pandas would otherwise be a runtime cost for every control node.
+    import pandas as pd
+
     # Load waypoints
     waypoints_path = '../../data/carla_waypoints.csv'
     # trajectory_keys = ['x', 'y', 'speed', 'yaw', 'omega', 'dt', 'total_time_elapsed']

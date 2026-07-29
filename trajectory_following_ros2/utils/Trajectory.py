@@ -51,7 +51,6 @@ Todo:
 from copy import deepcopy
 import math
 
-import matplotlib.pyplot as plt
 import numpy as np
 from scipy import interpolate, signal, fft, ndimage, spatial
 
