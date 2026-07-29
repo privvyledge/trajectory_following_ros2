@@ -3,6 +3,8 @@ import numpy as np
 import casadi
 from abc import ABC, abstractmethod
 
+from trajectory_following_ros2.utils import trajectory_utils
+
 
 class KinematicMPCBase(ABC):
     """Shared constructor logic and utility methods for CasADi MPC solvers.
@@ -36,7 +38,7 @@ class KinematicMPCBase(ABC):
                  slack_objective_is_quadratic=False,
                  code_gen_mode='jit',
                  num_obstacles=0, collision_avoidance_scheme='euclidean',
-                 ego_radius=None, safe_distance=0.5,
+                 ego_radius=None, safe_distance=0.5, ego_disc_offsets=None,
                  slack_weights_obstacle_avoidance=None,
                  slack_upper_bound_obstacle_avoidance=None):
 
@@ -165,6 +167,10 @@ class KinematicMPCBase(ABC):
         self.obstacle_distances = None
         self.obstacle_distances_value = np.ones((self.n_obstacles, horizon + 1)) * np.inf
         self.safe_distance = safe_distance
+        # Longitudinal offsets (m, + forward from the rear-axle reference point) of the
+        # ego collision discs; each carries ego_radius. Defaults to the single disc on
+        # the reference point, which is the legacy one-circle keep-out.
+        self.ego_disc_offsets = trajectory_utils.resolve_ego_disc_offsets(ego_disc_offsets)
         # Regularizes the distance norm when linearizing the obstacle constraint about
         # an operating point (the QP/LTV path). Keeps the gradient finite if an
         # operating point ever coincides with an obstacle centre (norm derivative 0/0).

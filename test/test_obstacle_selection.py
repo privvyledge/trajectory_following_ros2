@@ -16,6 +16,9 @@ EGO_RADIUS = 0.15
 SAFE_DISTANCE = 0.15
 OBSTACLE_RADIUS = 0.3
 # Keep-out = 0.15 + 0.3 + 0.15 = 0.6 m
+# Single collision disc on the rear-axle reference point: these tests are about the
+# ranking, so the disc geometry is kept at the identity case. See test_ego_discs.py.
+DISC_OFFSETS = [0.0]
 
 
 class _RecordingSolver:
@@ -40,9 +43,19 @@ def _make_tracker(obstacles, num_obstacles=1, predict_motion=True, solver=None):
     tracker._solver = _RecordingSolver() if solver is None else solver
     tracker.horizon = HORIZON
     tracker.sample_time = SAMPLE_TIME
+    tracker.MAX_DECEL = -3.0
     tracker.n_obstacle_states = 3
     tracker._keepout_side_hints = {}
-    tracker._gp = {'ego_radius': EGO_RADIUS, 'safe_distance': SAFE_DISTANCE}.__getitem__
+
+    class _NullLogger:
+        def info(self, *a, **k):
+            pass
+
+        def warn(self, *a, **k):
+            pass
+    tracker.get_logger = _NullLogger
+    tracker._gp = {'ego_radius': EGO_RADIUS, 'safe_distance': SAFE_DISTANCE,
+                   'ego_disc_offsets': DISC_OFFSETS}.__getitem__
     return tracker
 
 
@@ -68,7 +81,7 @@ def test_obstacle_ahead_beats_obstacle_behind():
     ahead = _obstacle(2, 1.5, 0.0)
     tracker = _make_tracker([behind, ahead], num_obstacles=1)
 
-    selected = tracker._select_obstacles(_straight_xref(), ego_xy=(0.0, 0.0))
+    selected = tracker._select_obstacles(_straight_xref(), ego_pose=(0.0, 0.0, 0.0))
 
     assert [o['id'] for o in selected] == [2], 'obstacle ahead on the path must win the slot'
 
@@ -85,7 +98,7 @@ def test_nearer_of_two_on_path_obstacles_wins():
     far = _obstacle(2, 1.2, 0.0)
     tracker = _make_tracker([far, near], num_obstacles=1)  # far listed first
 
-    selected = tracker._select_obstacles(_straight_xref(), ego_xy=(0.0, 0.0))
+    selected = tracker._select_obstacles(_straight_xref(), ego_pose=(0.0, 0.0, 0.0))
 
     assert [o['id'] for o in selected] == [1], 'the sooner-constraining obstacle must win'
 
@@ -97,7 +110,7 @@ def test_obstacle_on_the_vehicle_is_not_evicted_when_off_reference():
     on_path_far = _obstacle(2, 1.8, 0.0)     # on the reference, further along
     tracker = _make_tracker([on_path_far, on_ego], num_obstacles=1)
 
-    selected = tracker._select_obstacles(_straight_xref(), ego_xy=(0.2, 2.0))
+    selected = tracker._select_obstacles(_straight_xref(), ego_pose=(0.2, 2.0, 0.0))
 
     assert [o['id'] for o in selected] == [1], 'obstacle on the vehicle must not be evicted'
 
@@ -108,7 +121,7 @@ def test_obstacle_far_from_everything_ranks_last():
     on_path = _obstacle(2, 1.0, 0.0)
     tracker = _make_tracker([far, on_path], num_obstacles=2)
 
-    selected = tracker._select_obstacles(_straight_xref(), ego_xy=(0.0, 0.0))
+    selected = tracker._select_obstacles(_straight_xref(), ego_pose=(0.0, 0.0, 0.0))
 
     assert [o['id'] for o in selected] == [2, 1]
 
@@ -118,7 +131,7 @@ def test_selection_is_empty_when_backend_has_no_obstacle_constraints():
     that no constraint enforces."""
     tracker = _make_tracker([_obstacle(1, 1.0, 0.0)], solver=object())
 
-    assert tracker._select_obstacles(_straight_xref(), ego_xy=(0.0, 0.0)) == []
+    assert tracker._select_obstacles(_straight_xref(), ego_pose=(0.0, 0.0, 0.0)) == []
 
 
 def _legacy_pack(obstacles, num_obstacles, horizon):
@@ -178,6 +191,109 @@ def test_moving_obstacle_is_propagated_over_the_horizon():
     assert np.all(states[2, :] == OBSTACLE_RADIUS)
 
 
+def test_obstacle_braking_envelope_triggers_for_fast_closing_vehicle():
+    obstacle = _obstacle(1, 1.0, 0.0)
+    tracker = _make_tracker([obstacle])
+
+    diag = tracker._obstacle_safety_check(
+        [obstacle], ego_pose=(0.0, 0.0, 0.0), speed=1.5,
+        tick_interval_ms=100.0)
+
+    assert diag['stop']
+    assert diag['obstacle_id'] == 1
+    # Physical clearance excludes safe_distance: 1.0 - 0.15 - 0.3 = 0.55 m.
+    assert diag['physical_clearance'] == pytest.approx(0.55)
+    assert diag['closing_speed'] == pytest.approx(1.5)
+    lag = BaseTrajectoryTracker._ENVELOPE_ACTUATION_LAG_S
+    assert diag['stopping_room'] == pytest.approx(1.5 * (0.1 + lag) + 1.5**2 / 6.0)
+
+
+def test_obstacle_braking_envelope_allows_stationary_or_departing_vehicle():
+    obstacle = _obstacle(1, 1.0, 0.0)
+    tracker = _make_tracker([obstacle])
+
+    assert not tracker._obstacle_safety_check(
+        [obstacle], ego_pose=(0.0, 0.0, 0.0), speed=0.0,
+        tick_interval_ms=100.0)['stop']
+    assert not tracker._obstacle_safety_check(
+        [obstacle], ego_pose=(0.0, 0.0, np.pi), speed=1.5,
+        tick_interval_ms=100.0)['stop']
+
+
+def test_obstacle_braking_envelope_is_quiet_far_from_the_obstacle():
+    """Diagnostics are reported on every tick, so a non-firing tick must still say
+    how much margin it had — that is what makes intervention chatter auditable."""
+    obstacle = _obstacle(1, 20.0, 0.0)
+    tracker = _make_tracker([obstacle])
+
+    diag = tracker._obstacle_safety_check(
+        [obstacle], ego_pose=(0.0, 0.0, 0.0), speed=1.5, tick_interval_ms=50.0)
+
+    assert not diag['stop']
+    assert diag['obstacle_id'] == 1
+    assert diag['physical_clearance'] == pytest.approx(19.55)
+    assert diag['margin'] > 0.0
+
+
+def test_obstacle_braking_envelope_uses_relative_closing_speed():
+    """An obstacle fleeing at the vehicle's own speed is not being closed on, so the
+    same geometry that fires against a static obstacle must not fire against it."""
+    static = _obstacle(1, 1.0, 0.0)
+    fleeing = _obstacle(1, 1.0, 0.0, velocity=(1.5, 0.0))
+    tracker = _make_tracker([static])
+
+    assert tracker._obstacle_safety_check(
+        [static], ego_pose=(0.0, 0.0, 0.0), speed=1.5, tick_interval_ms=50.0)['stop']
+    departing = tracker._obstacle_safety_check(
+        [fleeing], ego_pose=(0.0, 0.0, 0.0), speed=1.5, tick_interval_ms=50.0)
+    assert not departing['stop']
+    assert departing['closing_speed'] == pytest.approx(0.0)
+
+
+def test_delayed_tick_widens_the_braking_envelope():
+    """The reaction term uses the *observed* tick interval, so a cadence stall must
+    trip the envelope at a distance a healthy tick would clear."""
+    obstacle = _obstacle(1, 1.6, 0.0)
+    tracker = _make_tracker([obstacle])
+
+    healthy = tracker._obstacle_safety_check(
+        [obstacle], ego_pose=(0.0, 0.0, 0.0), speed=1.5, tick_interval_ms=50.0)
+    stalled = tracker._obstacle_safety_check(
+        [obstacle], ego_pose=(0.0, 0.0, 0.0), speed=1.5, tick_interval_ms=400.0)
+
+    assert not healthy['stop']
+    assert stalled['stop']
+    assert stalled['stopping_room'] > healthy['stopping_room']
+
+
+def test_braking_diagnostics_report_the_obstacle_that_actually_fired():
+    """An obstacle being driven away from can sit deeper inside its keep-out than the
+    one being closed on, so a plain min-margin report would attribute the stop to the
+    wrong obstacle — and to a *negative* closing speed."""
+    passing = _obstacle(1, -0.2, 0.0)   # just behind, receding: inside keep-out, not closing
+    ahead = _obstacle(2, 1.0, 0.0)      # closing fast enough to trip the envelope
+    tracker = _make_tracker([passing, ahead], num_obstacles=2)
+
+    diag = tracker._obstacle_safety_check(
+        [passing, ahead], ego_pose=(0.0, 0.0, 0.0), speed=1.5, tick_interval_ms=50.0)
+
+    assert diag['stop']
+    assert diag['obstacle_id'] == 2
+    assert diag['closing_speed'] > 0.0
+
+
+def test_braking_diagnostics_report_the_most_critical_obstacle():
+    near = _obstacle(1, 1.0, 0.0)
+    far = _obstacle(2, 8.0, 0.0)
+    tracker = _make_tracker([near, far], num_obstacles=2)
+
+    diag = tracker._obstacle_safety_check(
+        [far, near], ego_pose=(0.0, 0.0, 0.0), speed=1.5, tick_interval_ms=50.0)
+
+    assert diag['stop']
+    assert diag['obstacle_id'] == 1, 'the smallest-margin obstacle must be reported'
+
+
 def test_side_hints_follow_the_obstacle_not_its_rank():
     """Hints are keyed by id, so a selection reorder cannot hand one obstacle's
     committed go-around side to another."""
@@ -217,3 +333,103 @@ def test_projection_leaves_the_callers_reference_untouched():
 
     np.testing.assert_array_equal(xref, original)
     assert not np.array_equal(projected, original), 'an on-path obstacle must bend the copy'
+
+
+def test_stopped_vehicle_still_reports_clearance_diagnostics():
+    """The tick right after a safety stop measures ~0 speed. A low-speed early-out
+    left those rows blank (nan) and let the solver's creep command through
+    unaudited — the stop/creep alternation that ratcheted the vehicle into
+    contact. Stopped must mean "cannot fire", never "not measured"."""
+    obstacle = _obstacle(1, 0.5, 0.0)
+    tracker = _make_tracker([obstacle])
+
+    diag = tracker._obstacle_safety_check(
+        [obstacle], ego_pose=(0.0, 0.0, 0.0), speed=0.0, tick_interval_ms=50.0)
+
+    assert not diag['stop']
+    assert diag['obstacle_id'] == 1
+    assert diag['physical_clearance'] == pytest.approx(0.5 - 0.15 - 0.3)
+
+
+def test_latched_hold_admits_escapes_but_not_deep_closing_commands():
+    """While a safety hold is latched the vehicle must still be allowed to leave:
+    the solver's reverse escape is the recovery path, while a forward creep
+    toward an almost-touching obstacle stays suppressed."""
+    from trajectory_following_ros2.backends.base_solver import SolverResult
+    obstacle = _obstacle(1, 0.5, 0.0)   # physical clearance 0.05 m: no budget left
+    tracker = _make_tracker([obstacle])
+    creep = SolverResult(velocity_cmd=0.15, is_optimal=True)
+    reverse = SolverResult(velocity_cmd=-0.15, is_optimal=True)
+
+    assert not tracker._hold_admissible_command(creep, [obstacle], (0.0, 0.0, 0.0))
+    assert tracker._hold_admissible_command(reverse, [obstacle], (0.0, 0.0, 0.0))
+
+    # Same forward command with the obstacle behind opens clearance.
+    behind = _obstacle(1, -0.5, 0.0)
+    assert tracker._hold_admissible_command(creep, [behind], (0.0, 0.0, 0.0))
+
+    # Pinched between two keep-outs, reversing away from the one ahead closes
+    # on the one behind: neither direction may pass.
+    assert not tracker._hold_admissible_command(
+        reverse, [obstacle, behind], (0.0, 0.0, 0.0))
+
+
+def test_latched_hold_admits_a_slow_creep_with_stopping_budget_in_hand():
+    """A vehicle parked just inside the comfort band (well clear of physical
+    contact) must be allowed to move slowly, or the hold is a standstill
+    deadlock: the comfort margin is spendable during recovery, and the
+    admissible speed shrinks to zero before the physical floor is reached."""
+    from trajectory_following_ros2.backends.base_solver import SolverResult
+    obstacle = _obstacle(1, 0.63, 0.0)  # keep-out clearance 0.03, physical 0.18
+    tracker = _make_tracker([obstacle])
+
+    creep = SolverResult(velocity_cmd=0.15, is_optimal=True)
+    fast = SolverResult(velocity_cmd=0.8, is_optimal=True)
+
+    assert tracker._hold_admissible_command(creep, [obstacle], (0.0, 0.0, 0.0))
+    assert not tracker._hold_admissible_command(fast, [obstacle], (0.0, 0.0, 0.0))
+
+
+def test_overlapping_keepouts_merge_into_one_projection_circle():
+    """Two keep-outs whose corridor is narrower than the vehicle must project as
+    one enclosing circle — a per-obstacle projection threads the reference
+    through the impassable gap and the solver accelerates into the pinch."""
+    a = _obstacle(1, 2.0, 0.6)
+    b = _obstacle(2, 2.0, -0.6)   # centres 1.2 m apart, keep-outs 0.6 m each
+    tracker = _make_tracker([a, b], num_obstacles=2)
+    centres = np.array([[2.0, 0.6], [2.0, -0.6]])
+
+    proj_c, proj_r, groups = tracker._merge_overlapping_keepouts(
+        centres, tracker._keepout_radii([a, b]))
+
+    assert len(groups) == 1 and sorted(groups[0]) == [0, 1]
+    np.testing.assert_allclose(proj_c[0], [2.0, 0.0])
+    assert proj_r[0] == pytest.approx(1.2)
+
+
+def test_separated_keepouts_stay_individual_projection_circles():
+    a = _obstacle(1, 2.0, 2.0)
+    b = _obstacle(2, 2.0, -2.0)
+    tracker = _make_tracker([a, b], num_obstacles=2)
+    centres = np.array([[2.0, 2.0], [2.0, -2.0]])
+
+    proj_c, proj_r, groups = tracker._merge_overlapping_keepouts(
+        centres, tracker._keepout_radii([a, b]))
+
+    assert len(groups) == 2
+    np.testing.assert_allclose(proj_r, [0.6, 0.6])
+
+
+def test_merged_projection_routes_the_reference_around_the_pair():
+    """The projected reference must clear BOTH keep-outs, not thread between."""
+    a = _obstacle(1, 1.5, 0.55)
+    b = _obstacle(2, 1.5, -0.55)   # reference on y=0 runs through the 4 cm gap
+    tracker = _make_tracker([a, b], num_obstacles=2)
+    xref = _straight_xref()
+
+    projected = tracker._project_reference_out_of_keepouts(xref, [a, b])
+
+    keepout = 0.6
+    for cx, cy in ((1.5, 0.55), (1.5, -0.55)):
+        d = np.hypot(projected[0, :] - cx, projected[1, :] - cy)
+        assert d.min() >= keepout - 0.05, 'reference must not thread the pinch'

@@ -24,6 +24,7 @@ class SolverResult:
     solve_time: float = 0.0
     status: str = 'uninitialized'
     error: Optional[str] = None     # post-solve exception message (None when no error)
+    requires_immediate_stop: bool = False  # unsafe iterate; never bridge with last command
 
 
 class BaseSolver(ABC):

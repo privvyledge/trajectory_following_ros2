@@ -38,16 +38,34 @@
     # would silently cap the count a `num_obstacles:=N` asked for). Pass num_obstacles:=N
     # (default 0) + generate_mpc_model:=true on the launch command.
     obstacle_collision_avoidance_method: euclidean
-    # Keep-out = ego_radius + obstacle_radius + safe_distance = 0.15 + r_obs + 0.15.
-    # An obstacle exactly ON the line is supported: the adapter projects in-keep-out
-    # reference points onto the keep-out boundary (side-hysteresis arc) and accepts
-    # budget-limited (status 2) SQP iterates, so the car detours ~0.6 m around the
-    # bubble instead of stalling. Expect status=2 log blips while negotiating it.
-    ego_radius: 0.15
-    safe_distance: 0.15  # now wired into the acados keep-out (was hardcoded 0.5)
-    # SLACK-WEIGHT LEVER (restart-only): acados uses a SCALAR obstacle_slack_weight
-    # (NOT the CasADi array params). Raise to harden avoidance (default 100).
+    # Keep-out = ego_radius + obstacle_radius + safe_distance, enforced at EACH ego
+    # collision disc. The f1tenth footprint is 0.58 x 0.31 m with the rear axle 0.19 m
+    # behind the body centre, so the body spans [-0.10, +0.48] m along x from the
+    # rear-axle reference point. Two circles cover it: each half-rectangle (0.29 x 0.31)
+    # has circumradius hypot(0.29, 0.31)/2 = 0.212, centred at +0.045 and +0.335.
+    #
+    # A single disc at the reference point (the old ego_radius: 0.15, offsets [0.0])
+    # does NOT cover the body: the front corner sits ~0.50 m from the reference point,
+    # so the solver could hold the reference point exactly on the keep-out boundary
+    # while the body reached ~0.10 m from a 0.3 m obstacle's centre — inside it. Two
+    # discs cover the body without inflating one radius to the circumscribing ~0.50 m,
+    # which would widen every detour and can deadlock a narrow corridor.
+    #
+    # CHANGING ego_disc_offsets CHANGES THE NUMBER OF GENERATED CONSTRAINT ROWS, so it
+    # needs generate_mpc_model:=True, exactly like num_obstacles.
+    #
+    # An obstacle exactly ON the line is supported: in-keep-out reference points are
+    # projected onto the keep-out boundary (side-hysteresis arc) and budget-limited
+    # (status 2) SQP iterates are accepted, so the car detours around the bubble
+    # instead of stalling. Expect status=2 log blips while negotiating it.
+    ego_radius: 0.212
+    ego_disc_offsets: [0.045, 0.335]
+    safe_distance: 0.15  # wired into the keep-out (was hardcoded 0.5)
+    # Slack penalties are restart-only generated-cost settings. The linear term keeps
+    # shallow margin use expensive; the quadratic term dominates deep penetration while
+    # retaining a recovery path if the initial state is already infeasible.
     obstacle_slack_weight: 1000.0
+    obstacle_slack_quadratic_weight: 10000.0
 
     Q:  [100.0, 100.0, 100.0, 16.0]
     Qf: [200.0, 200.0, 200.0, 40.0]

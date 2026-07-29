@@ -311,6 +311,7 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
 
         ego_radius = self.effective_ego_radius()
         safe_distance = self.get_parameter('safe_distance').value
+        ego_disc_offsets = self.effective_ego_disc_offsets()
 
         model_type = 'continuous' if 'continuous' in ode_type else 'discrete'
 
@@ -397,6 +398,7 @@ class KinematicCoupledCasadi(BaseTrajectoryTracker):
                 num_obstacles=num_obstacles,
                 collision_avoidance_scheme=collision_method,
                 ego_radius=ego_radius, safe_distance=safe_distance,
+                ego_disc_offsets=ego_disc_offsets,
                 slack_weights_obstacle_avoidance=slack_weights_obs,
                 slack_upper_bound_obstacle_avoidance=slack_ub_obs,
                 **common_kwargs)

@@ -46,6 +46,87 @@ def resolve_ego_radius(ego_radius):
     return DEFAULT_EGO_RADIUS if ego_radius <= 0.0 else ego_radius
 
 
+def resolve_ego_disc_offsets(offsets):
+    """Resolve the ``ego_disc_offsets`` parameter to a 1-D array of longitudinal offsets.
+
+    Each offset is a distance (m, + forward) from the rear-axle reference point to the
+    centre of one ego collision disc; every disc carries the same ``ego_radius``. An
+    empty/absent value means the single legacy disc centred on the reference point,
+    ``[0.0]`` — which reproduces the one-circle keep-out exactly.
+
+    A single disc at the reference point cannot cover a vehicle whose body extends well
+    ahead of the rear axle: the keep-out is then respected while the front corner still
+    reaches inside the obstacle. Two or more discs cover the footprint without inflating
+    a single radius out to the circumscribing one, which would widen every detour.
+
+    Shared by the controller (constraint + reference projection + diagnostics) and the
+    visualizer (which draws them), so the enforced and drawn geometry cannot diverge.
+    """
+    if offsets is None:
+        return np.zeros(1)
+    values = np.atleast_1d(np.asarray(offsets, dtype=float)).ravel()
+    if values.size == 0 or not np.all(np.isfinite(values)):
+        return np.zeros(1)
+    return values
+
+
+def ego_disc_centres(x, y, yaw, offsets):
+    """Centres of the ego collision discs for pose(s) ``(x, y, yaw)``.
+
+    :param x, y, yaw: scalars or equal-length 1-D arrays of rear-axle poses.
+    :param offsets: length-``d`` longitudinal disc offsets (see
+        :func:`resolve_ego_disc_offsets`).
+    :return: ``(n_poses, d, 2)`` array of disc centres (``n_poses`` is 1 for scalars).
+    """
+    offsets = resolve_ego_disc_offsets(offsets)
+    x = np.atleast_1d(np.asarray(x, dtype=float))
+    y = np.atleast_1d(np.asarray(y, dtype=float))
+    yaw = np.atleast_1d(np.asarray(yaw, dtype=float))
+    cx = x[:, None] + offsets[None, :] * np.cos(yaw)[:, None]
+    cy = y[:, None] + offsets[None, :] * np.sin(yaw)[:, None]
+    return np.stack([cx, cy], axis=-1)
+
+
+def rear_axle_keepout_radius(keepout_radius, offsets, heading_minus_radial):
+    """Rear-axle stand-off that clears a keep-out circle for every ego disc.
+
+    With the collision discs offset from the reference point, "is the reference point
+    ``R`` from the obstacle centre" is no longer the constraint — the constraint is that
+    every disc centre is. For a disc at offset ``d`` and an angle ``alpha`` between the
+    vehicle heading and the outward radial direction (obstacle centre -> rear axle),
+    solving ``|r + d*u| = R`` for the rear-axle stand-off ``rho`` gives
+
+        rho = -d*cos(alpha) + sqrt(R^2 - (d*sin(alpha))^2)
+
+    so a vehicle pointing *at* the obstacle must stand off further (``alpha ~ pi`` gives
+    ``R + d``) while one passing tangentially may sit slightly closer (``alpha ~ pi/2``
+    gives ``sqrt(R^2 - d^2)``) — the disc swings alongside rather than into the circle.
+    That angle dependence is the whole reason to prefer discs over one inflated radius:
+    a constant ``R + max|d|`` would widen every go-around, including the tangential
+    stretch where the geometry does not require it.
+
+    Degenerate case ``R < |d*sin(alpha)|``: the disc sweeps through the circle at every
+    stand-off along that ray, so no finite ``rho`` clears it; the conservative
+    ``R + |d|`` is returned for those entries.
+
+    :param keepout_radius: scalar keep-out radius ``R``.
+    :param offsets: length-``d`` disc offsets.
+    :param heading_minus_radial: scalar or array of ``alpha`` values (rad).
+    :return: array shaped like ``heading_minus_radial`` — the largest stand-off any
+        disc requires.
+    """
+    offsets = resolve_ego_disc_offsets(offsets)
+    alpha = np.atleast_1d(np.asarray(heading_minus_radial, dtype=float))
+    d = offsets[None, :]
+    radial = -d * np.cos(alpha)[:, None]
+    lateral = (d * np.sin(alpha)[:, None]) ** 2
+    clears = keepout_radius ** 2 - lateral
+    rho = np.where(clears >= 0.0,
+                   radial + np.sqrt(np.maximum(clears, 0.0)),
+                   keepout_radius + np.abs(d))
+    return rho.max(axis=1)
+
+
 def get_distance(node1, node2, metric='euclidean'):
     """
     Calculate distance
@@ -1234,7 +1315,7 @@ def generate_reference_trajectory_by_interpolation(trajectory, init_pose, closes
 
 
 def project_reference_out_of_keepouts(xref, obstacles, keepout_radii, margin=0.05,
-                                      side_hints=None):
+                                      side_hints=None, disc_offsets=None):
     """Move reference points that fall inside an obstacle keep-out circle onto its
     boundary, so the tracked target stays feasible.
 
@@ -1264,10 +1345,23 @@ def project_reference_out_of_keepouts(xref, obstacles, keepout_radii, margin=0.0
     :param margin: extra clearance (m) added to each keep-out radius.
     :param side_hints: optional length-n list of go-around directions from the
         previous call (+1 counter-clockwise, -1 clockwise, 0 none yet).
+    :param disc_offsets: optional ego collision-disc offsets (see
+        :func:`resolve_ego_disc_offsets`). With more than the single disc at the
+        reference point, the stand-off the reference is swept out to becomes
+        heading-dependent (see :func:`rear_axle_keepout_radius`) so the projected
+        target satisfies the same multi-disc keep-out the OCP enforces — a reference
+        parked on the single-disc circle would be infeasible head-on, which is the
+        park-at-the-bubble-edge deadlock this projection exists to prevent. The
+        heading used is the reference yaw carried in ``xref[3]`` (the path tangent);
+        yaw over the projected span is recomputed afterwards as before, so the
+        stand-off is a one-step approximation, deliberately evaluated before the
+        detour rather than iterated to a fixed point.
     :return: (xref, n_projected, side_hints) — the array, how many points were
         moved, and the updated per-obstacle direction hints.
     """
     obstacles = np.atleast_2d(np.asarray(obstacles, dtype=float))
+    disc_offsets = resolve_ego_disc_offsets(disc_offsets)
+    multi_disc = disc_offsets.size > 1 or not np.allclose(disc_offsets, 0.0)
     n_obstacles = obstacles.shape[0]
     radii = np.broadcast_to(np.asarray(keepout_radii, dtype=float).ravel(),
                             (n_obstacles,))
@@ -1279,11 +1373,16 @@ def project_reference_out_of_keepouts(xref, obstacles, keepout_radii, margin=0.0
     for obs_i, ((cx, cy), keepout) in enumerate(zip(obstacles[:, :2], radii)):
         boundary_radius = keepout + margin
         dist = np.hypot(xref[0, :] - cx, xref[1, :] - cy)
-        inside = dist < boundary_radius
+        angles = np.arctan2(xref[1, :] - cy, xref[0, :] - cx)
+        # Stand-off each reference point must hold. One disc on the reference point
+        # makes this the plain keep-out circle; offset discs make it heading-dependent.
+        stand_off = (rear_axle_keepout_radius(boundary_radius, disc_offsets,
+                                              xref[3, :] - angles)
+                     if multi_disc else np.full(horizon_len, boundary_radius))
+        inside = dist < stand_off
         if not inside.any():
             side_hints[obs_i] = 0  # negotiation over; next encounter re-decides
             continue
-        angles = np.arctan2(xref[1, :] - cy, xref[0, :] - cx)
         hint = side_hints[obs_i]
         i = 0
         while i < horizon_len:
@@ -1305,6 +1404,18 @@ def project_reference_out_of_keepouts(xref, obstacles, keepout_radii, margin=0.0
                 side = hint
             hint = side
             count = j - i + 1
+            # Placement stays on a constant-radius arc even with offset discs. The
+            # projected points are swept onto a circle about the obstacle and the yaw
+            # is then recomputed from them, so the heading over the detour is
+            # tangential — and a disc offset d along a tangent sits at
+            # hypot(rho, d) >= rho, i.e. *outside* the point it is measured from. The
+            # keep-out circle therefore already clears every disc on the arc itself.
+            # Sizing each point's radius by its own heading instead makes the radius
+            # and the yaw mutually dependent (the yaw is recomputed from the very
+            # points the radius places): measured, that feeds back into a lumpy arc
+            # with yaw kinks that violate the keep-out worse than not doing it. The
+            # heading dependence is used where it is stable — deciding *whether* a
+            # point intrudes, above, off the incoming reference yaw.
             for m, k in enumerate(range(i, j + 1)):
                 theta = angle_in + sweep * (m + 1) / (count + 1)
                 xref[0, k] = cx + boundary_radius * np.cos(theta)

@@ -35,12 +35,18 @@
     # num_obstacles is NOT set here — it is a launch arg applied after this overlay so it
     # stays authoritative. Pass num_obstacles:=N (default 0) + generate_mpc_model:=true.
     obstacle_collision_avoidance_method: euclidean
-    # Keep-out from an obstacle centre = ego_radius + obstacle_radius + safe_distance.
-    # F1/10 is ~0.3 m wide, so ego_radius 0.15 (half-width) is right. The old
-    # safe_distance default (0.5 m, hardcoded) added ~1.7 car-widths of buffer on top,
-    # which swallowed the path and deadlocked avoidance near the line; 0.15 m keeps a
-    # realistic margin so avoidance is a squeeze-through, not a wall.
-    ego_radius: 0.15
+    # Keep-out from an obstacle centre = ego_radius + obstacle_radius + safe_distance,
+    # enforced at EACH ego collision disc. The f1tenth body (0.58 x 0.31 m, rear axle
+    # 0.19 m behind the body centre) is covered by two circles of radius
+    # hypot(0.29, 0.31)/2 = 0.212 at +0.045 and +0.335 from the rear-axle reference
+    # point. A single disc there does not cover the body — the front corner sits
+    # ~0.50 m out, so the reference point can be on the boundary while the body is
+    # inside the obstacle. Two discs cover it without inflating one radius to the
+    # circumscribing ~0.50 m, which would widen every detour.
+    # Changing ego_disc_offsets changes the generated constraint-row count: rebuild
+    # with generate_mpc_model:=true, exactly like num_obstacles.
+    ego_radius: 0.212
+    ego_disc_offsets: [0.045, 0.335]
     safe_distance: 0.15
     slack_weights_obstacle_avoidance: [1000.0]
     slack_upper_bound_obstacle_avoidance: [1000.0]

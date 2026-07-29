@@ -30,12 +30,22 @@
     # num_obstacles is NOT set here — it is a launch arg applied after this overlay so it
     # stays authoritative. Pass num_obstacles:=N (default 0) + generate_mpc_model:=true.
     obstacle_collision_avoidance_method: euclidean
-    # Keep-out from an obstacle centre = ego_radius + obstacle_radius + safe_distance
-    # = 0.15 + r_obs + 0.15. NOTE: on the small F1/10 loop a 0.6 m keep-out already
-    # covers a large arc, so an obstacle placed exactly ON the recorded line is a hard
-    # (sometimes infeasible) case — prefer an obstacle offset ~0.3-0.6 m from the line.
-    ego_radius: 0.15
+    # Keep-out from an obstacle centre = ego_radius + obstacle_radius + safe_distance,
+    # enforced at EACH ego collision disc. The f1tenth body (0.58 x 0.31 m, rear axle
+    # 0.19 m behind the body centre) is covered by two circles of radius
+    # hypot(0.29, 0.31)/2 = 0.212 at +0.045 and +0.335 from the rear-axle reference
+    # point. A single disc there does not cover the body — the front corner sits
+    # ~0.50 m out, so the reference point can be on the boundary while the body is
+    # inside the obstacle. Two discs cover it without inflating one radius to the
+    # circumscribing ~0.50 m, which would widen every detour.
+    # Changing ego_disc_offsets changes the generated constraint-row count: rebuild
+    # with generate_mpc_model:=true, exactly like num_obstacles.
+    ego_radius: 0.212
+    ego_disc_offsets: [0.045, 0.335]
     safe_distance: 0.15
+    # On the small F1/10 loop this keep-out already covers a large arc, so an
+    # obstacle exactly ON the recorded line is a hard (sometimes infeasible) case —
+    # prefer an obstacle offset ~0.3-0.6 m from the line.
     # SLACK-WEIGHT LEVER: raising this hardens avoidance (the keep-out is soft/slacked
     # so it stays feasible when the reference is briefly inside the bubble). Try
     # 1000 -> 10000 -> 100000 to force progressively larger deviation. Restart-only

@@ -43,6 +43,10 @@ except ImportError:
     OBSTACLES_AVAILABLE = False
 
 _STALE_ODOM_THRESHOLD_S = 0.5  # seconds before odom is considered stale
+# Seconds without an ObjectArray before the obstacle feed is reported as silent. Well
+# above any plausible publish period (a 1 Hz feed is already slow for avoidance) so a
+# normal feed never trips it.
+_SILENT_OBSTACLE_FEED_S = 2.0
 
 
 class BaseTrajectoryTracker(Node, ABC):
@@ -108,6 +112,9 @@ class BaseTrajectoryTracker(Node, ABC):
                 'consecutive_failures', 'accel_cmd', 'steering_cmd', 'velocity_cmd', 'error',
                 'n_selected', 'sel_id', 'sel_side', 'sel_min_clearance',
                 'sel_ego_clearance',
+                'safety_stop', 'safety_reason', 'safety_obstacle_id',
+                'physical_clearance', 'closing_speed', 'stopping_room',
+                'applied_accel', 'applied_steering', 'applied_speed',
                 'tick_interval_ms', 'reference_ms', 'obstacle_ms', 'solver_wall_ms',
                 'pre_log_ms', 'previous_log_write_ms',
             ])
@@ -118,7 +125,7 @@ class BaseTrajectoryTracker(Node, ABC):
             self._solver_log_fh = None
             self._solver_log_writer = None
 
-    def _obstacle_diag(self, result: SolverResult, selected: list, ego_xy=None):
+    def _obstacle_diag(self, result: SolverResult, selected: list, ego_pose=None):
         """Per-tick obstacle diagnostics for the stats CSV.
 
         Returns ``(n_selected, sel_id, sel_side, sel_min_clearance,
@@ -133,10 +140,12 @@ class BaseTrajectoryTracker(Node, ABC):
         - ``sel_ego_clearance`` — the *executed* clearance: where the vehicle
           measurably was this tick. This is the one to judge encroachment by.
 
-        Both use the ego reference point against ``ego_radius + obstacle_radius +
-        safe_distance``, so they measure the disc the OCP enforces, not the vehicle
-        body — with a rear-axle reference point and an ``ego_radius`` smaller than
-        the front overhang, the body can clip an obstacle at positive clearance.
+        Both measure the worst of the ego collision discs (``ego_disc_offsets``)
+        against ``ego_radius + obstacle_radius + safe_distance`` — the same discs
+        the OCP constrains. With the default single disc on the rear-axle reference
+        point that is the reference point alone, and a body extending past the rear
+        axle can then clip an obstacle at positive clearance; configure the discs to
+        cover the footprint and the reported number covers the body too.
 
         A weak detour shows clearance dipping negative with the side steady; a
         side-hint flip shows ``sel_side`` changing sign tick to tick.
@@ -152,26 +161,210 @@ class BaseTrajectoryTracker(Node, ABC):
         try:
             centre = np.asarray(obs['state'][:2], dtype=float)
             keepout = float(self._keepout_radii([obs])[0])
+            offsets = self.effective_ego_disc_offsets()
+
+            def _clearance(x, y, yaw):
+                discs = trajectory_utils.ego_disc_centres(x, y, yaw, offsets)
+                d = np.hypot(discs[..., 0] - centre[0], discs[..., 1] - centre[1])
+                return float(np.min(d) - keepout)
+
             xseq = getattr(result, 'x_sequence', None)
             if xseq is not None:
-                d = np.hypot(xseq[0, :] - centre[0], xseq[1, :] - centre[1])
-                min_clear = float(np.min(d) - keepout)
-            if ego_xy is not None:
-                ego_clear = float(
-                    math.hypot(ego_xy[0] - centre[0], ego_xy[1] - centre[1]) - keepout)
+                min_clear = _clearance(xseq[0, :], xseq[1, :], xseq[3, :])
+            if ego_pose is not None:
+                ego_clear = _clearance(ego_pose[0], ego_pose[1], ego_pose[2])
         except (ValueError, IndexError, TypeError):
             pass
         return n_sel, sel_id, sel_side, min_clear, ego_clear
 
+    def _obstacle_safety_check(self, selected: list, ego_pose,
+                               speed: float, tick_interval_ms: float) -> dict:
+        """State-based obstacle braking envelope, with per-tick diagnostics.
+
+        Fires when the closing speed toward a selected obstacle leaves less
+        clearance than the room needed to stop: one reaction tick at the current
+        closing speed (the *observed* tick interval, so a cadence stall widens the
+        envelope) plus the braking distance at ``max_decel``.
+
+        Returns a dict — ``stop`` (bool), ``obstacle_id``, ``physical_clearance``,
+        ``closing_speed``, ``stopping_room``, ``margin`` — describing the most
+        critical obstacle/ego-disc pair, i.e. the smallest
+        ``clearance - stopping_room`` margin, **whether or not the envelope fired**.
+        So every logged row shows how close that tick came, not just the ones that
+        braked. ``physical_clearance`` is body-to-body
+        (``distance - ego_radius - obstacle_radius``): it excludes ``safe_distance``,
+        so negative means actual overlap, while the envelope itself is judged on the
+        full keep-out clearance.
+        """
+        diag = {'stop': False, 'obstacle_id': -1, 'physical_clearance': float('nan'),
+                'closing_speed': float('nan'), 'stopping_room': float('nan'),
+                'margin': float('nan')}
+        if not selected:
+            return diag
+        # No low-speed early-out: a stopped vehicle cannot fire (closing ≈ 0 fails
+        # the closing > 0.05 gate) but its clearance/margin must still be reported —
+        # skipping here blinded the tick right after a safety stop, and the solver's
+        # creep command was applied unchecked on exactly those ticks.
+        x, y, yaw = ego_pose
+        offsets = self.effective_ego_disc_offsets()
+        # ego_disc_centres returns (n_points, n_discs, 2); this is a single pose, so
+        # flatten to one row per disc — reducing over the wrong axis here silently
+        # turns the distance into per-coordinate magnitudes.
+        discs = trajectory_utils.ego_disc_centres(x, y, yaw, offsets).reshape(-1, 2)
+        ego_velocity = np.array([speed * np.cos(yaw), speed * np.sin(yaw)])
+        decel = max(abs(float(self.MAX_DECEL)), 1e-3)
+        # Reaction window: one observed tick plus the actuation lag — the plant keeps
+        # executing the *previous* command while a brake command works through the
+        # lag, so measured speed can still be rising for that long after a fire.
+        reaction = min(max(self.sample_time, tick_interval_ms * 1e-3)
+                       + self._ENVELOPE_ACTUATION_LAG_S, 0.7)
+        # If the last applied command was accelerating, assume it keeps doing so
+        # through the reaction window: an envelope that ignores this fires only
+        # after a full-throttle launch toward the keep-out has already made the
+        # stop physically impossible.
+        accel_headroom = max(0.0, float(getattr(self, 'acc_cmd', 0.0)))
+        margin_gate = float(self._gp('safe_distance'))
+        # Report rank: an obstacle that actually fired outranks any that did not, and
+        # within each group the smallest margin wins. Without the first key a stop can
+        # be reported alongside a *different* obstacle's (non-closing) numbers.
+        best_rank = (2, float('inf'))
+
+        for obs in selected:
+            centre = np.asarray(obs['state'][:2], dtype=float)
+            obstacle_velocity = np.asarray(obs.get('velocity', [0.0, 0.0]), dtype=float)
+            keepout = float(self._keepout_radii([obs])[0])
+            toward = centre[None, :] - discs
+            distance = np.linalg.norm(toward, axis=1)
+            unit_toward = toward / np.maximum(distance[:, None], 1e-9)
+            relative_velocity = ego_velocity - obstacle_velocity
+            closing = unit_toward @ relative_velocity
+            clearance = distance - keepout
+            reacted = np.maximum(closing, 0.0) + accel_headroom * reaction
+            stopping_room = (closing * reaction
+                             + 0.5 * accel_headroom * reaction**2
+                             + reacted**2 / (2.0 * decel))
+            margin = clearance - stopping_room
+            fires = (closing > 0.05) & (margin <= 0.0)
+            candidates = np.flatnonzero(fires) if fires.any() else np.arange(margin.size)
+            worst = int(candidates[np.argmin(margin[candidates])])
+            if fires.any():
+                diag['stop'] = True
+            rank = (0 if fires.any() else 1, float(margin[worst]))
+            if rank < best_rank:
+                best_rank = rank
+                diag.update({
+                    'obstacle_id': obs.get('id', -1),
+                    'physical_clearance': float(clearance[worst] + margin_gate),
+                    'closing_speed': float(closing[worst]),
+                    'stopping_room': float(stopping_room[worst]),
+                    'margin': float(margin[worst]),
+                })
+        return diag
+
+    #: Keep-out margin (m) the envelope must recover before a latched safety hold
+    #: releases. At standstill stopping_room ≈ 0, so this is effectively "clearance
+    #: has grown this far past the keep-out boundary again".
+    _SAFETY_HOLD_RELEASE_MARGIN = 0.05
+
+    #: Actuation lag (s) budgeted into the envelope's reaction window: the plant
+    #: keeps executing the previous command while a brake command works through
+    #: the command filter, so measured speed can still rise this long after a fire.
+    _ENVELOPE_ACTUATION_LAG_S = 0.2
+
+    #: Body-to-body clearance (m) a held vehicle must keep in hand: while a safety
+    #: hold is latched, a closing proposal is admitted only if it could stop with
+    #: at least this much physical clearance remaining.
+    _HOLD_PHYSICAL_FLOOR = 0.05
+
+    def _hold_admissible_command(self, result: SolverResult,
+                                 selected: list, ego_pose) -> bool:
+        """Whether a proposal may be applied while a safety hold is latched.
+
+        A held vehicle must still be allowed to *leave* — the solver's
+        reverse/step-aside escape is exactly the recovery path. A proposal is
+        judged against every selected obstacle still inside the release margin
+        (not just the one that fired: between two obstacles, backing away from
+        the one ahead can close on the one behind) and passes when either
+
+        - it does not close on that keep-out, or
+        - it closes slowly enough to stop with ``_HOLD_PHYSICAL_FLOOR`` of
+          body-to-body clearance still in hand. The comfort margin
+          (``safe_distance``) is spendable during recovery, exactly as the OCP's
+          slack treats it — without this, a vehicle parked just inside the
+          comfort band admits no command at all and the hold becomes a
+          standstill deadlock (observed as a 1400-tick latched stop).
+        """
+        x, y, yaw = ego_pose
+        offsets = self.effective_ego_disc_offsets()
+        discs = trajectory_utils.ego_disc_centres(x, y, yaw, offsets).reshape(-1, 2)
+        command_velocity = (float(result.velocity_cmd)
+                            * np.array([np.cos(yaw), np.sin(yaw)]))
+        decel = max(abs(float(self.MAX_DECEL)), 1e-3)
+        reaction = self.sample_time + self._ENVELOPE_ACTUATION_LAG_S
+        margin_gate = float(self._gp('safe_distance'))
+        keepouts = self._keepout_radii(selected)
+        for obs, keepout in zip(selected, keepouts):
+            centre = np.asarray(obs['state'][:2], dtype=float)
+            toward = centre[None, :] - discs
+            dist = np.linalg.norm(toward, axis=1)
+            clearance = float(dist.min()) - float(keepout)
+            if clearance >= self._SAFETY_HOLD_RELEASE_MARGIN:
+                continue
+            unit = toward / np.maximum(dist[:, None], 1e-9)
+            closing = float(np.max(unit @ command_velocity))
+            if closing <= 0.02:
+                continue
+            stopping_room = closing * reaction + closing**2 / (2.0 * decel)
+            if stopping_room > clearance + margin_gate - self._HOLD_PHYSICAL_FLOOR:
+                return False
+        return True
+
+    def _safety_brake_command(self, result: SolverResult, speed: float):
+        """Bounded-decel stop action: ``(accel, steering, speed)`` for a safety stop.
+
+        Sheds one tick of speed at ``max_decel`` — the same deceleration the
+        envelope's stopping-room formula assumes — while keeping the solver's
+        steering, so braking mid-avoidance-arc does not straighten the wheel the
+        way a hard zero did (that straightened lurch is what ratcheted the vehicle
+        into contact). Falls back to the last applied steering when the iterate is
+        not trusted.
+
+        The commanded speed is monotone over a braking sequence: measured speed can
+        keep *rising* through the actuation lag right after the envelope fires, and
+        ``measured - step`` alone would then command increasing speeds while
+        nominally braking. The bound resets whenever a tick publishes normally.
+        """
+        decel = max(abs(float(self.MAX_DECEL)), 1e-3)
+        step = decel * self.sample_time
+        self._brake_speed_bound = max(
+            0.0, min(abs(speed), self._brake_speed_bound) - step)
+        speed_cmd = math.copysign(self._brake_speed_bound, speed)
+        accel_cmd = -math.copysign(decel, speed) if abs(speed) > 1e-3 else 0.0
+        steering = float(result.steering_cmd) if result.is_optimal else self.delta_cmd
+        steering = float(np.clip(steering, self.MIN_STEER_ANGLE, self.MAX_STEER_ANGLE))
+        return accel_cmd, steering, speed_cmd
+
     def _log_solver_stats(self, result: SolverResult, selected: list = None,
-                          timing: Optional[dict] = None, ego_xy=None) -> None:
-        """Append one CSV row for this solve (no-op when logging is disabled)."""
+                          timing: Optional[dict] = None, ego_pose=None,
+                          safety: Optional[dict] = None, safety_reason: str = '',
+                          applied=None) -> None:
+        """Append one CSV row for this solve (no-op when logging is disabled).
+
+        ``accel_cmd``/``steering_cmd``/``velocity_cmd`` are what the solver
+        *proposed*; ``applied_*`` are what the controller actually published this
+        tick (zeros on a safety stop, the held command on a bridged failure), so
+        the two are never conflated. ``safety_reason`` names the intervention that
+        zeroed the tick (empty when the proposed command was applied).
+        """
         if self._solver_log_writer is None:
             return
         try:
             timing = timing or {}
+            safety = safety or {}
+            applied = applied if applied is not None else (
+                float('nan'), float('nan'), float('nan'))
             n_sel, sel_id, sel_side, sel_clear, ego_clear = self._obstacle_diag(
-                result, selected or [], ego_xy)
+                result, selected or [], ego_pose)
             previous_log_ms = self._last_solver_log_ms
             log_started = time.monotonic()
             self._solver_log_writer.writerow([
@@ -190,6 +383,15 @@ class BaseTrajectoryTracker(Node, ABC):
                 sel_side,
                 f'{sel_clear:.6f}',
                 f'{ego_clear:.6f}',
+                int(bool(safety_reason)),
+                safety_reason,
+                safety.get('obstacle_id', -1),
+                f"{safety.get('physical_clearance', float('nan')):.6f}",
+                f"{safety.get('closing_speed', float('nan')):.6f}",
+                f"{safety.get('stopping_room', float('nan')):.6f}",
+                f'{applied[0]:.6f}',
+                f'{applied[1]:.6f}',
+                f'{applied[2]:.6f}',
                 f"{timing.get('tick_interval_ms', float('nan')):.4f}",
                 f"{timing.get('reference_ms', float('nan')):.4f}",
                 f"{timing.get('obstacle_ms', float('nan')):.4f}",
@@ -311,6 +513,13 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('debug', False)
         self.declare_parameter('num_obstacles', 0)
         self.declare_parameter('ego_radius', -1.0)
+        # Longitudinal offsets (m, + forward from the rear-axle reference point) of the
+        # ego collision discs; every disc carries ego_radius. The default [0.0] is the
+        # single legacy disc on the reference point. Two or more discs cover a body that
+        # extends past the rear axle without inflating one radius to the circumscribing
+        # one — see trajectory_utils.resolve_ego_disc_offsets. Restart-only (the disc
+        # count is baked into the OCP constraint rows at build time).
+        self.declare_parameter('ego_disc_offsets', [0.0])
         # Extra keep-out buffer added to (ego_radius + obstacle_radius) when building
         # the obstacle constraint. Restart-only (baked into the OCP at build time).
         self.declare_parameter('safe_distance', 0.5)
@@ -321,6 +530,10 @@ class BaseTrajectoryTracker(Node, ABC):
         # A zero/absent twist reduces this exactly to a static fill; turn it off when a
         # perception feed reports velocities too noisy to extrapolate.
         self.declare_parameter('predict_obstacle_motion', True)
+        # State-based braking envelope on/off (hot-reloadable). Off, the check still
+        # runs and its diagnostics are logged every tick — it just never intervenes —
+        # so an A/B run compares identical CSV columns.
+        self.declare_parameter('obstacle_braking_envelope', True)
         self.declare_parameter('actuator_feedback_topic', '')
         self.declare_parameter('delay_compensation_enabled', False)
         self.declare_parameter('delay_compensation_method', 'forward_simulation')
@@ -423,6 +636,13 @@ class BaseTrajectoryTracker(Node, ABC):
         self.debug = self._gp('debug')
         self._num_obstacles = self._gp('num_obstacles')
         self._predict_obstacle_motion = self._gp('predict_obstacle_motion')
+        self.obstacle_braking_envelope = bool(self._gp('obstacle_braking_envelope'))
+        # Latched safety hold: armed on the first envelope fire, released only once
+        # the keep-out margin recovers (see _control_timer_callback). Without the
+        # latch the envelope zeroes single ticks while the solver's creep command is
+        # applied on the alternating ticks, ratcheting the vehicle into contact.
+        self._safety_hold = False
+        self._brake_speed_bound = float('inf')
         self.dt = self.sample_time = 1.0 / self.control_rate
         if not self.prediction_time:
             self.prediction_time = self.sample_time * self.horizon
@@ -480,6 +700,8 @@ class BaseTrajectoryTracker(Node, ABC):
         self._last_odom_stamp = None
 
         self.obstacles: list = []
+        self._obstacle_topic_name = ''
+        self._last_obstacle_msg_time = None
         self.n_obstacle_states: int = 3
         self.obstacle_states: Optional[np.ndarray] = None
         # Per-obstacle go-around side memory for the keep-out reference projection.
@@ -616,6 +838,8 @@ class BaseTrajectoryTracker(Node, ABC):
                 callback_group=self.subscription_group)
             self.get_logger().info(
                 f'Obstacle avoidance enabled: {self._num_obstacles} obstacles on {obstacle_topic}')
+            self._obstacle_topic_name = obstacle_topic
+            self._last_obstacle_msg_time = None
         elif self._num_obstacles > 0:
             self.get_logger().warn(
                 'num_obstacles > 0 but derived_object_msgs not available.')
@@ -856,6 +1080,7 @@ class BaseTrajectoryTracker(Node, ABC):
         scores these per tick. Keeping this callback free of ego state also keeps it
         free of the state mutex.
         """
+        self._last_obstacle_msg_time = time.monotonic()
         obstacles = []
         for obj in data.objects:
             pos = [obj.pose.position.x, obj.pose.position.y, obj.pose.position.z]
@@ -892,6 +1117,16 @@ class BaseTrajectoryTracker(Node, ABC):
         """
         return trajectory_utils.resolve_ego_radius(self._gp('ego_radius'))
 
+    def effective_ego_disc_offsets(self) -> np.ndarray:
+        """Ego collision-disc offsets, resolved to at least the single reference-point disc.
+
+        Shared, like :meth:`effective_ego_radius`, by the adapters that bake the discs
+        into the OCP, the relevance ranking, the reference projection and the executed
+        clearance diagnostics — one definition, so the enforced, the tracked and the
+        reported geometry agree.
+        """
+        return trajectory_utils.resolve_ego_disc_offsets(self._gp('ego_disc_offsets'))
+
     def _solver_has_obstacle_constraints(self) -> bool:
         """Whether the active backend actually constrains obstacles.
 
@@ -917,7 +1152,7 @@ class BaseTrajectoryTracker(Node, ABC):
         return (self._num_obstacles > 0 and self._solver is not None
                 and self._solver_has_obstacle_constraints())
 
-    def _select_obstacles(self, xref: np.ndarray, ego_xy) -> list:
+    def _select_obstacles(self, xref: np.ndarray, ego_pose) -> list:
         """Rank detections by relevance to this solve; return at most ``num_obstacles``.
 
         Relevance is measured against the point set ``{ego} + xref[0..N]`` rather than
@@ -946,21 +1181,53 @@ class BaseTrajectoryTracker(Node, ABC):
 
         centres = np.array([o['state'][:2] for o in self.obstacles], dtype=float)
         keepout = self._keepout_radii(self.obstacles)
-        points = np.column_stack([np.r_[ego_xy[0], xref[0, :]],
-                                  np.r_[ego_xy[1], xref[1, :]]])  # (N+2, 2)
+        # One entry per (stage, disc): an obstacle the body reaches must rank as an
+        # intruder even when the rear-axle point itself stays clear of the keep-out.
+        # Discs stay grouped by stage so a column index still maps back to its stage.
+        offsets = self.effective_ego_disc_offsets()
+        n_discs = offsets.size
+        poses = np.column_stack([np.r_[ego_pose[0], xref[0, :]],
+                                 np.r_[ego_pose[1], xref[1, :]],
+                                 np.r_[ego_pose[2], xref[3, :]]])  # (N+2, 3)
+        points = trajectory_utils.ego_disc_centres(
+            poses[:, 0], poses[:, 1], poses[:, 2], offsets).reshape(-1, 2)
 
-        dist = distance.cdist(centres, points)      # (n_detected, N+2)
+        dist = distance.cdist(centres, points)      # (n_detected, (N+2) * n_discs)
         intrudes = dist < keepout[:, None]
         bites = intrudes.any(axis=1)
         # argmax on a boolean row gives the first True — the earliest constraining
         # stage. Ego is column 0, so an obstacle already on the vehicle sorts first.
-        first_stage = intrudes.argmax(axis=1)
+        first_stage = intrudes.argmax(axis=1) // n_discs
         closest = dist.min(axis=1)
 
         keys = [(0, int(first_stage[i]), 0.0) if bites[i] else (1, 0, float(closest[i]))
                 for i in range(len(self.obstacles))]
         order = sorted(range(len(self.obstacles)), key=keys.__getitem__)
         return [self.obstacles[i] for i in order[:self._num_obstacles]]
+
+    def _warn_if_obstacle_feed_silent(self) -> None:
+        """Warn (throttled) when obstacle avoidance is configured but nothing arrives.
+
+        A silent feed is invisible in the control output: with no detections the run
+        tracks cleanly, every clearance column logs as ``nan``, and an obstacle test
+        that never saw an obstacle reads as a pass. Covers both "never arrived" (wrong
+        topic, publisher not started) and "went quiet mid-run" (publisher died).
+        """
+        if not self._obstacles_are_active():
+            return
+        if self._last_obstacle_msg_time is None:
+            self.get_logger().warn(
+                f'num_obstacles={self._num_obstacles} but no obstacle message has '
+                f'arrived on {self._obstacle_topic_name}; the vehicle is running with '
+                'no keep-out. Check that the obstacle publisher is up and on this '
+                'topic.', throttle_duration_sec=5.0)
+            return
+        silent_for = time.monotonic() - self._last_obstacle_msg_time
+        if silent_for > _SILENT_OBSTACLE_FEED_S:
+            self.get_logger().warn(
+                f'No obstacle message on {self._obstacle_topic_name} for '
+                f'{silent_for:.1f} s; still enforcing the last reported obstacles.',
+                throttle_duration_sec=5.0)
 
     def _pack_obstacle_states(self, selected: list) -> None:
         """Fill the ``(3 * num_obstacles, N+1)`` obstacle block and hand it to the solver.
@@ -995,6 +1262,59 @@ class BaseTrajectoryTracker(Node, ABC):
 
         self._solver.update_obstacles(self.obstacle_states)  # type: ignore[attr-defined]
 
+    def _merge_overlapping_keepouts(self, centres: np.ndarray,
+                                    keepouts: np.ndarray):
+        """Group keep-outs whose mutual gap is too narrow to drive through.
+
+        Two keep-out circles separated by less than an ego radius leave a corridor
+        the vehicle cannot physically use, yet the per-obstacle reference
+        projection would happily thread the reference through it — the solver then
+        accelerates into a pinch no constraint set is feasible for. For the
+        *projection only* (the OCP keeps the individual circles, so the real
+        detour still hugs the true boundaries), such circles are replaced by one
+        enclosing circle so the reference is routed around the group.
+
+        Returns ``(proj_centres, proj_radii, groups)`` where ``groups`` lists the
+        member indices of each projection circle.
+        """
+        n = len(centres)
+        parent = list(range(n))
+
+        def _find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        min_corridor = float(self.effective_ego_radius())
+        for i in range(n):
+            for j in range(i + 1, n):
+                d = float(np.hypot(*(centres[i] - centres[j])))
+                if d < keepouts[i] + keepouts[j] + min_corridor:
+                    parent[_find(i)] = _find(j)
+
+        clusters = {}
+        for i in range(n):
+            clusters.setdefault(_find(i), []).append(i)
+
+        proj_centres, proj_radii, groups = [], [], []
+        for members in clusters.values():
+            if len(members) == 1:
+                i = members[0]
+                proj_centres.append(centres[i])
+                proj_radii.append(float(keepouts[i]))
+            else:
+                # Enclosing circle about the members' mean centre (exact for two
+                # equal circles, conservative otherwise — a slightly generous
+                # guide arc is fine, the OCP enforces the true boundaries).
+                c = centres[members].mean(axis=0)
+                r = max(float(np.hypot(*(centres[i] - c)) + keepouts[i])
+                        for i in members)
+                proj_centres.append(c)
+                proj_radii.append(r)
+            groups.append(members)
+        return np.array(proj_centres), np.array(proj_radii), groups
+
     def _project_reference_out_of_keepouts(self, xref: np.ndarray,
                                            selected: list) -> np.ndarray:
         """Sweep reference points that fall inside an obstacle keep-out onto its boundary.
@@ -1015,17 +1335,29 @@ class BaseTrajectoryTracker(Node, ABC):
         if not selected:
             return xref
 
-        obstacles = np.array([o['state'] for o in selected], dtype=float)
+        centres = np.array([o['state'][:2] for o in selected], dtype=float)
+        proj_centres, proj_radii, groups = self._merge_overlapping_keepouts(
+            centres, self._keepout_radii(selected))
+        if len(groups) < len(selected):
+            self.get_logger().info(
+                f'{len(selected)} obstacle keep-outs merged into {len(groups)} '
+                'projection circle(s): the corridor between them is narrower than '
+                'the vehicle, so the reference is routed around the group.',
+                throttle_duration_sec=5.0)
         # Carry each obstacle's committed go-around side across ticks by id: the
         # projection takes hints positionally, but the selection order shifts as the
         # vehicle moves, so a positional store would leak one obstacle's side to
-        # another. Obstacles that drop out are forgotten, matching the projection's own
-        # "negotiation over, next encounter re-decides" reset.
-        hints = [self._keepout_side_hints.get(o['id'], 0) for o in selected]
+        # another. A merged group negotiates one shared side, keyed by its smallest
+        # member id and written back to every member so the commitment survives the
+        # group splitting. Obstacles that drop out are forgotten, matching the
+        # projection's own "negotiation over, next encounter re-decides" reset.
+        hint_keys = [min(selected[i]['id'] for i in g) for g in groups]
+        hints = [self._keepout_side_hints.get(k, 0) for k in hint_keys]
         xref, _, hints = trajectory_utils.project_reference_out_of_keepouts(
-            xref.copy(), obstacles[:, :2], self._keepout_radii(selected),
-            side_hints=hints)
-        self._keepout_side_hints = {o['id']: h for o, h in zip(selected, hints)}
+            xref.copy(), proj_centres, proj_radii,
+            side_hints=hints, disc_offsets=self.effective_ego_disc_offsets())
+        self._keepout_side_hints = {
+            selected[i]['id']: h for g, h in zip(groups, hints) for i in g}
         return xref
 
     def _last_command_is_saturated(self, atol: float = 1e-6) -> bool:
@@ -1074,6 +1406,25 @@ class BaseTrajectoryTracker(Node, ABC):
                 return False, 'last good command exceeded the hold-time limit'
 
         return True, 'within configured failure-hold gates'
+
+    def _goal_completion_ready(self, x, y, vel) -> bool:
+        """Whether the run may be reported as completed.
+
+        Arc-length projection can reach the tail while the vehicle is still moving or
+        while a spatially overlapping route tail remains untraversed. Completion must
+        therefore use the ordinary goal distance and stop-speed contract, not a looser
+        proximity-only gate.
+        """
+        past_grace = self.cumulative_distance >= 3.0 * self.distance_tolerance
+        # Route-progress gate: a self-near path can put the final waypoint within
+        # centimetres of a mid-course corner, so a vehicle shoved off-line there
+        # (e.g. by an obstacle standoff) satisfies the proximity + stop contract
+        # without having driven the route. Completion additionally requires the
+        # tracked index to have actually reached the tail.
+        last = len(self.path) - 1
+        progressed = last <= 0 or self.current_idx >= 0.9 * last
+        return past_grace and progressed and self.trajectory.is_goal_reached(
+            x, y, vel, self.final_goal)
 
     # ------------------------------------------------------------------
     # Main control loop
@@ -1158,24 +1509,21 @@ class BaseTrajectoryTracker(Node, ABC):
             return
 
         end_of_path = ref_traj is None
-        past_grace = self.cumulative_distance >= 3.0 * self.distance_tolerance
-        at_goal = past_grace and self.trajectory.is_goal_reached(x, y, vel, self.final_goal)
+        at_goal = self._goal_completion_ready(x, y, vel)
         if end_of_path and not at_goal:
-            # end_of_path comes from arc-length bookkeeping alone; require the
-            # vehicle to be physically near the final waypoint before trusting it.
-            # An index that ran ahead of the vehicle (e.g. captured by a later
-            # pass of a path that revisits the same neighbourhood) would otherwise
-            # latch a false "final goal reached" mid-course and park the vehicle
-            # at full authority. Hold zero instead — same posture as 'lost'.
-            goal_gate = max(3.0 * self.distance_tolerance, 0.5)
+            # Reaching the projection tail is necessary but not sufficient. Require
+            # the same near-goal + stopped contract as is_goal_reached; otherwise an
+            # overlapping/reverse tail can be skipped merely because its endpoint is
+            # spatially close. Hold zero until the contract becomes true.
             dist_to_goal = float(np.hypot(x - self.final_goal[0], y - self.final_goal[1]))
-            if dist_to_goal > goal_gate:
-                self.get_logger().warn(
-                    f'Reference reports end-of-path but the vehicle is {dist_to_goal:.2f} m '
-                    f'from the final waypoint (> {goal_gate:.2f} m gate); not latching the '
-                    f'goal — holding zero command.', throttle_duration_sec=2.0)
-                self._publish_zero_command()
-                return
+            speed_error = abs(vel - self.final_goal[2])
+            self.get_logger().warn(
+                f'Reference reports end-of-path but the completion contract is not met '
+                f'(goal distance {dist_to_goal:.2f} m, speed error {speed_error:.2f} m/s); '
+                'not latching the goal — holding zero command.',
+                throttle_duration_sec=2.0)
+            self._publish_zero_command()
+            return
         if end_of_path or at_goal:
             if self._advance_lap():
                 # Another lap: return and let the KD-tree re-anchor on the next tick.
@@ -1218,7 +1566,8 @@ class BaseTrajectoryTracker(Node, ABC):
         # both, so the constraint and the target can never disagree about what is there.
         reference_ms = (time.monotonic() - tick_started) * 1e3
         obstacle_started = time.monotonic()
-        selected = self._select_obstacles(xref, (x, y))
+        self._warn_if_obstacle_feed_silent()
+        selected = self._select_obstacles(xref, (x, y, psi))
         self._pack_obstacle_states(selected)
         projected_xref = self._project_reference_out_of_keepouts(xref, selected)
         obstacle_ms = (time.monotonic() - obstacle_started) * 1e3
@@ -1236,57 +1585,132 @@ class BaseTrajectoryTracker(Node, ABC):
         #     return early so the row that trips zero-command fallback is preserved.
         self._consecutive_failures = (
             0 if result.is_optimal else self._consecutive_failures + 1)
+
+        if not result.is_optimal:
+            err_suffix = f', error={result.error}' if result.error else ''
+            self.get_logger().warn(
+                f'Solver suboptimal (status={result.status}, '
+                f'consecutive={self._consecutive_failures}{err_suffix})',
+                throttle_duration_sec=1.0)
+
+        # Decide the safety action *before* the stats row is written, so the row
+        # records what was actually published, not merely what the solver proposed.
+        # A last-good-command bridge is unsafe when an obstacle is actively
+        # constrained: the previous command can still be driving toward it. The
+        # failure that preceded the reproduced collision occurred with 92 mm of
+        # physical clearance, then one held 1.5 m/s command crossed the boundary.
+        # Brake on every failed obstacle solve; keep the bounded hold policy for
+        # ordinary tracking failures where no selected keep-out is involved.
+        safety = self._obstacle_safety_check(
+            selected, (x, y, psi), vel, tick_interval_ms)
+        if not self.obstacle_braking_envelope:
+            # Advisory mode (A/B): diagnostics still reach the CSV, but the envelope
+            # never intervenes and any latched hold is dropped.
+            safety['stop'] = False
+            self._safety_hold = False
+        else:
+            # Latch: one envelope fire holds the vehicle until the keep-out margin
+            # recovers past a hysteresis threshold. A per-tick stop alone alternated
+            # with unchecked creep ticks (the stop zeroes speed, the next tick's
+            # low measured speed produced no fire) and ratcheted into contact.
+            # While latched, a proposal that does not close on the firing obstacle
+            # is let through — that is the recovery path (reverse / step aside).
+            if safety['stop']:
+                self._safety_hold = True
+            elif self._safety_hold:
+                margin = safety.get('margin', float('nan'))
+                if not selected or (np.isfinite(margin)
+                                    and margin > self._SAFETY_HOLD_RELEASE_MARGIN):
+                    self._safety_hold = False
+                elif not (result.is_optimal and self._hold_admissible_command(
+                        result, selected, (x, y, psi))):
+                    safety['stop'] = True
+        safety_reason = ''
+        policy_reason = ''
+        if safety['stop']:
+            safety_reason = 'braking_envelope'
+        elif not result.is_optimal:
+            if result.requires_immediate_stop:
+                safety_reason = 'unsafe_iterate'
+            elif selected:
+                safety_reason = 'obstacle_solve_failure'
+            else:
+                hold_last, policy_reason = self._failure_hold_decision()
+                if not hold_last:
+                    safety_reason = 'failure_policy'
+
+        if not safety_reason:
+            if result.is_optimal:
+                if not self._u_prev_from_echo:
+                    with self.mutex:
+                        self.u_prev[:, 0] = result.u_prev
+
+                # Unpack result (only the optimal solve updates the applied command).
+                self.acc_cmd = result.accel_cmd
+                self.delta_cmd = result.steering_cmd
+                self.velocity_cmd = result.velocity_cmd
+                self.jerk_cmd = result.jerk_cmd
+                self.delta_rate_cmd = result.steering_rate_cmd
+
+                self.uk[0, 0] = self.acc_cmd
+                self.uk[1, 0] = self.delta_cmd
+
+                try:
+                    self.mpc_predicted_states[:, :] = result.x_sequence.T  # (N+1, nx)
+                    self.mpc_predicted_inputs[:, :] = result.u_sequence.T  # (N, nu)
+                except ValueError:
+                    pass  # shape mismatch on first call if horizon changed
+            else:
+                self.get_logger().warn(
+                    f'Holding last good command: {policy_reason}.',
+                    throttle_duration_sec=1.0)
+
+            # 12. Saturation (applied command is final once this has run)
+            if self.saturate_input:
+                self._input_saturation()
+
+        # Stop action: the braking envelope sheds speed at max_decel while keeping
+        # the solver's steering (geometrically coherent mid-avoidance-arc); every
+        # other intervention hard-zeroes, because there the iterate itself is not
+        # trusted so its steering must not be applied either.
+        brake_cmd = (self._safety_brake_command(result, vel)
+                     if safety_reason == 'braking_envelope' else None)
+        if brake_cmd is None:
+            self._brake_speed_bound = float('inf')
+        if safety_reason:
+            applied = brake_cmd if brake_cmd is not None else (0.0, 0.0, 0.0)
+        else:
+            applied = (self.acc_cmd, self.delta_cmd, self.velocity_cmd)
         self._log_solver_stats(result, selected, timing={
             'tick_interval_ms': tick_interval_ms,
             'reference_ms': reference_ms,
             'obstacle_ms': obstacle_ms,
             'solver_wall_ms': solver_wall_ms,
             'pre_log_ms': (time.monotonic() - tick_started) * 1e3,
-        }, ego_xy=(x, y))
+        }, ego_pose=(x, y, psi), safety=safety, safety_reason=safety_reason,
+            applied=applied)
 
-        if result.is_optimal:
-            if not self._u_prev_from_echo:
-                with self.mutex:
-                    self.u_prev[:, 0] = result.u_prev
-
-            # Unpack result (only the optimal solve updates the applied command).
-            self.acc_cmd = result.accel_cmd
-            self.delta_cmd = result.steering_cmd
-            self.velocity_cmd = result.velocity_cmd
-            self.jerk_cmd = result.jerk_cmd
-            self.delta_rate_cmd = result.steering_rate_cmd
-
-            self.uk[0, 0] = self.acc_cmd
-            self.uk[1, 0] = self.delta_cmd
-
-            try:
-                self.mpc_predicted_states[:, :] = result.x_sequence.T  # (N+1, nx)
-                self.mpc_predicted_inputs[:, :] = result.u_sequence.T  # (N, nu)
-            except ValueError:
-                pass  # shape mismatch on first call if horizon changed
-        else:
-            err_suffix = f', error={result.error}' if result.error else ''
-            self.get_logger().warn(
-                f'Solver suboptimal (status={result.status}, '
-                f'consecutive={self._consecutive_failures}{err_suffix})',
+        if safety_reason:
+            action = 'Braking' if brake_cmd is not None else 'Zeroing commands'
+            detail = ''
+            if safety_reason == 'braking_envelope':
+                detail = (f", margin={safety.get('margin', float('nan')):.3f} m"
+                          f", phys={safety.get('physical_clearance', float('nan')):.3f} m"
+                          f", hold={self._safety_hold}")
+            self.get_logger().error(
+                f'{action} ({safety_reason}'
+                f'{": " + policy_reason if policy_reason else ""}{detail}).',
                 throttle_duration_sec=1.0)
-            hold_last, policy_reason = self._failure_hold_decision()
-            if not hold_last:
-                self.get_logger().error(
-                    f'Solver failure policy zeroing commands: {policy_reason}.',
-                    throttle_duration_sec=1.0)
+            if brake_cmd is not None:
+                self.acc_cmd, self.delta_cmd, self.velocity_cmd = brake_cmd
+                self.jerk_cmd = self.delta_rate_cmd = None
+                self._publish_command()
+            else:
                 self._publish_zero_command()
-                return
-            self.get_logger().warn(
-                f'Holding last good command: {policy_reason}.',
-                throttle_duration_sec=1.0)
+            return
 
         self.solution_time = result.solve_time
         self.solution_status = result.is_optimal
-
-        # 12. Saturation + publish
-        if self.saturate_input:
-            self._input_saturation()
 
         self._publish_command()
         if result.is_optimal:
@@ -1704,6 +2128,10 @@ class BaseTrajectoryTracker(Node, ABC):
                 self.MAX_ACCEL = param.value
             elif param.name == 'max_decel':
                 self.MAX_DECEL = param.value
+            elif param.name == 'obstacle_braking_envelope':
+                self.obstacle_braking_envelope = bool(param.value)
+                if not self.obstacle_braking_envelope:
+                    self._safety_hold = False
             elif param.name == 'desired_speed':
                 self.desired_speed = param.value
             elif param.name == 'loop':

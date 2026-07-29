@@ -22,6 +22,17 @@ from acados_template import AcadosModel, AcadosOcp, AcadosOcpSolver
 from trajectory_following_ros2.acados.kinematic_model import kinematic_model
 
 
+def obstacle_slack_penalties(n_constraints, linear_weight, quadratic_weight):
+    """Return acados lower/upper slack cost vectors for keep-out constraints."""
+    zeros = np.zeros(n_constraints)
+    return {
+        'zl': linear_weight * np.ones(n_constraints),
+        'zu': zeros.copy(),
+        'Zl': quadratic_weight * np.ones(n_constraints),
+        'Zu': zeros.copy(),
+    }
+
+
 def acados_settings(Tf, N, x0=None, scale_cost=True,
                     Q=None, R=None, Qe=None, Rd=None,
                     wheelbase=0.256,
@@ -38,7 +49,9 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
                     mpc_config_file="kinematic_bicycle_acados_ocp.json",
                     code_export_directory="c_generated_code",
                     num_obstacles=0, ego_radius=1.0, safe_distance=0.5,
-                    obstacle_slack_weight=100.0):
+                    obstacle_slack_weight=100.0,
+                    obstacle_slack_quadratic_weight=0.0,
+                    ego_disc_offsets=(0.0,)):
     # generate = True  # generates the OCP and stores in the json file
     # build = True  # builds/compiles the model and stores in code_export_directory
     # the cython version is faster than bare C because there is no call overhead as opposed to the C code call overhead
@@ -314,13 +327,21 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
     # CBF condition h(k+1)-h(k)+γh(k)>=0 links two stages and cannot be expressed in
     # acados's per-stage con_h_expr without augmenting the state vector.
     if num_obstacles > 0:
+        # One row per (obstacle, ego collision disc). Disc c sits `offset` ahead of the
+        # rear-axle reference point along the heading, so a body extending past the rear
+        # axle is covered without inflating ego_radius to the circumscribing radius —
+        # which would widen every detour. offsets == (0.0,) reproduces the single
+        # reference-point keep-out exactly, one row per obstacle as before.
+        _offsets = [float(o) for o in (ego_disc_offsets if len(ego_disc_offsets) else (0.0,))]
         h_exprs = [
-            (model.x[0] - _obs_states[3 * j]) ** 2
-            + (model.x[1] - _obs_states[3 * j + 1]) ** 2
+            (model.x[0] + offset * casadi.cos(model.x[3]) - _obs_states[3 * j]) ** 2
+            + (model.x[1] + offset * casadi.sin(model.x[3]) - _obs_states[3 * j + 1]) ** 2
             - (_ego_r + _obs_states[3 * j + 2] + safe_distance) ** 2
             for j in range(num_obstacles)
+            for offset in _offsets
         ]
         h_expr = casadi.vertcat(*h_exprs)
+        n_h = len(h_exprs)
         ocp.model.con_h_expr = h_expr    # stages 0..N-1
         ocp.model.con_h_expr_e = h_expr  # stage N (con_h_expr_e uses only model.x, no model.u)
 
@@ -342,24 +363,28 @@ def acados_settings(Tf, N, x0=None, scale_cost=True,
         # here just pushes a slack variable away from 0 for no benefit. Slacks are
         # unbounded above by default, which is what a soft constraint wants.
         _UH = 1e8    # constraint upper bound (>> max realistic dist^2, incl. far-park)
-        ocp.constraints.lh = np.zeros(num_obstacles)
-        ocp.constraints.uh = np.full(num_obstacles, _UH)
-        ocp.constraints.lh_e = np.zeros(num_obstacles)
-        ocp.constraints.uh_e = np.full(num_obstacles, _UH)
+        ocp.constraints.lh = np.zeros(n_h)
+        ocp.constraints.uh = np.full(n_h, _UH)
+        ocp.constraints.lh_e = np.zeros(n_h)
+        ocp.constraints.uh_e = np.full(n_h, _UH)
 
-        ocp.constraints.idxsh = np.arange(num_obstacles, dtype=int)
-        ocp.constraints.idxsh_e = np.arange(num_obstacles, dtype=int)
+        ocp.constraints.idxsh = np.arange(n_h, dtype=int)
+        ocp.constraints.idxsh_e = np.arange(n_h, dtype=int)
 
-        # Linear slack cost on lower slack only (zu=0: h>=0 cannot be violated from above).
-        # TODO: expose Zl/Zl_e for quadratic penalty if stronger penalization is needed.
-        ocp.cost.zl = obstacle_slack_weight * np.ones(num_obstacles)
-        ocp.cost.zu = np.zeros(num_obstacles)
-        ocp.cost.Zl = np.zeros(num_obstacles)
-        ocp.cost.Zu = np.zeros(num_obstacles)
-        ocp.cost.zl_e = obstacle_slack_weight * np.ones(num_obstacles)
-        ocp.cost.zu_e = np.zeros(num_obstacles)
-        ocp.cost.Zl_e = np.zeros(num_obstacles)
-        ocp.cost.Zu_e = np.zeros(num_obstacles)
+        # Penalize lower slack only (zu/Zu=0: h>=0 cannot be violated from above).
+        # The linear term keeps even small margin intrusions expensive. The optional
+        # quadratic term makes deep penetration disproportionately expensive without
+        # turning the keep-out hard/infeasible when the initial state is already inside.
+        slack_cost = obstacle_slack_penalties(
+            n_h, obstacle_slack_weight, obstacle_slack_quadratic_weight)
+        ocp.cost.zl = slack_cost['zl']
+        ocp.cost.zu = slack_cost['zu']
+        ocp.cost.Zl = slack_cost['Zl']
+        ocp.cost.Zu = slack_cost['Zu']
+        ocp.cost.zl_e = slack_cost['zl'].copy()
+        ocp.cost.zu_e = slack_cost['zu'].copy()
+        ocp.cost.Zl_e = slack_cost['Zl'].copy()
+        ocp.cost.Zu_e = slack_cost['Zu'].copy()
 
     # Input-rate (slew) limiting is NOT generated here. It is applied by
     # AcadosSolverAdapter._apply_input_rate_bound, which tightens the stage-0 input box

@@ -27,6 +27,44 @@ from trajectory_following_ros2.backends.base_solver import BaseSolver, SolverRes
 from trajectory_following_ros2.acados.acados_settings import acados_settings
 
 
+def minimum_obstacle_clearance(x_sequence: np.ndarray,
+                               obstacle_states: Optional[np.ndarray],
+                               num_obstacles: int,
+                               ego_radius: float,
+                               safe_distance: float,
+                               ego_disc_offsets: np.ndarray) -> float:
+    """Return the minimum predicted disc-to-keep-out clearance over the horizon."""
+    if num_obstacles <= 0 or obstacle_states is None:
+        return float('inf')
+    states = np.asarray(x_sequence, dtype=float)
+    obstacles = np.asarray(obstacle_states, dtype=float).reshape(
+        num_obstacles, 3, states.shape[1])
+    offsets = np.asarray(ego_disc_offsets, dtype=float).reshape(-1, 1)
+    disc_x = states[0][None, :] + offsets * np.cos(states[3])[None, :]
+    disc_y = states[1][None, :] + offsets * np.sin(states[3])[None, :]
+    dx = disc_x[:, None, :] - obstacles[None, :, 0, :]
+    dy = disc_y[:, None, :] - obstacles[None, :, 1, :]
+    keepout = ego_radius + safe_distance + obstacles[None, :, 2, :]
+    return float(np.min(np.hypot(dx, dy) - keepout))
+
+
+def is_unsafe_obstacle_iterate(physical_clearance: float,
+                               stage0_physical_clearance: float) -> bool:
+    """True when an iterate predicting physical overlap must be rejected.
+
+    Exception — recovery: when stage 0 (the measured vehicle pose) is itself in
+    physical overlap, no plan can be overlap-free and rejecting everything
+    deadlocks the vehicle in contact, including the solver's own reverse-escape
+    proposal. An iterate whose worst predicted clearance does not go deeper than
+    where the vehicle already is stays acceptable; plans that press further in
+    are still rejected.
+    """
+    if physical_clearance >= -1e-3:
+        return False
+    return not (stage0_physical_clearance < -1e-3
+                and physical_clearance >= stage0_physical_clearance - 1e-3)
+
+
 class AcadosSolverAdapter(BaseSolver):
     """Wraps the acados OCP solver to conform to BaseSolver."""
 
@@ -34,6 +72,8 @@ class AcadosSolverAdapter(BaseSolver):
                  stage_cost_type: str = 'NONLINEAR_LS',
                  terminal_cost_type: str = 'NONLINEAR_LS',
                  num_obstacles: int = 0, ego_radius: float = 1.0,
+                 safe_distance: float = 0.0,
+                 ego_disc_offsets: Optional[np.ndarray] = None,
                  has_weight_params: bool = False,
                  Q: Optional[np.ndarray] = None,
                  R: Optional[np.ndarray] = None,
@@ -55,6 +95,9 @@ class AcadosSolverAdapter(BaseSolver):
         self._terminal_cost_type = terminal_cost_type
         self._num_obstacles = num_obstacles
         self._ego_radius = ego_radius
+        self._safe_distance = float(safe_distance)
+        self._ego_disc_offsets = np.asarray(
+            ego_disc_offsets if ego_disc_offsets is not None else [0.0], dtype=float)
         self._obstacle_states: Optional[np.ndarray] = None  # (3*n_obs, N+1)
         self._has_weight_params = has_weight_params
         # Input-rate (slew) bound applied to stage 0 each tick; None disables it.
@@ -183,12 +226,24 @@ class AcadosSolverAdapter(BaseSolver):
         The module-level Python logger has no handler configured under ROS, so only
         WARNING and above reach the root ``lastResort`` handler — an ``info()`` call
         here is silently dropped. Route through the node logger when one was passed.
+
+        Each severity must be emitted from its own source line: the rclpy logger keys
+        its per-call-site context on (function, file, line), and raises
+        ``ValueError: Logger severity cannot be changed between calls`` if one line
+        ever logs at two different severities. A single ``getattr(...)(text)``
+        dispatch is therefore a latent crash — the first INFO through it poisons
+        every later WARN.
         """
         text = (msg % args) if args else msg
-        if self._ros_logger is not None:
-            getattr(self._ros_logger, 'warn' if level == 'warning' else level)(text)
+        logger = self._ros_logger if self._ros_logger is not None else logging.getLogger(__name__)
+        if level == 'debug':
+            logger.debug(text)
+        elif level == 'info':
+            logger.info(text)
+        elif level == 'error':
+            logger.error(text)
         else:
-            getattr(logging.getLogger(__name__), level)(text)
+            logger.warning(text)
 
     def _solver_stat(self, name: str) -> np.ndarray:
         """Read one acados statistic without letting diagnostics affect control."""
@@ -443,7 +498,24 @@ class AcadosSolverAdapter(BaseSolver):
         # genuinely degenerate statuses (QP failure, NaN detection) still count as
         # failures and feed the consecutive-failure zero-command safety fallback.
         finite = bool(np.isfinite(u).all() and np.isfinite(x_seq).all())
-        is_optimal = finite and status in (0, 2)
+        min_clearance = minimum_obstacle_clearance(
+            x_seq, self._obstacle_states, self._num_obstacles,
+            self._ego_radius, self._safe_distance, self._ego_disc_offsets)
+        # The generated constraint includes safe_distance as a deliberately soft
+        # comfort margin. Spending some of that buffer is recoverable; crossing the
+        # physical disc/obstacle boundary is not. Reject both status-0 and status-2
+        # solutions that predict actual overlap. The base receives an explicit
+        # immediate-stop flag so its normal bounded "hold last good command" bridge
+        # cannot carry the vehicle farther into the obstacle.
+        physical_clearance = min_clearance + self._safe_distance
+        stage0_clearance = minimum_obstacle_clearance(
+            x_seq[:, :1],
+            self._obstacle_states[:, :1] if self._obstacle_states is not None else None,
+            self._num_obstacles, self._ego_radius, self._safe_distance,
+            self._ego_disc_offsets)
+        unsafe_obstacle_iterate = finite and is_unsafe_obstacle_iterate(
+            physical_clearance, stage0_clearance + self._safe_distance)
+        is_optimal = finite and status in (0, 2) and not unsafe_obstacle_iterate
 
         if not is_optimal:
             self._dump_failure(
@@ -482,6 +554,10 @@ class AcadosSolverAdapter(BaseSolver):
             is_optimal=is_optimal,
             solve_time=solve_time,
             status=str(status),
+            error=(f'unsafe obstacle iterate (physical clearance '
+                   f'{physical_clearance:.3f} m)'
+                   if unsafe_obstacle_iterate else None),
+            requires_immediate_stop=unsafe_obstacle_iterate,
         )
 
     @property
@@ -532,6 +608,7 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
                                    get_package_share_directory('trajectory_following_ros2'),
                                    'data', 'model'))
         self.declare_parameter('obstacle_slack_weight', 100.0)
+        self.declare_parameter('obstacle_slack_quadratic_weight', 0.0)
         # In-solver input-rate (slew) limiting. acados otherwise only penalizes the
         # input rate via the Rd cost and never bounds it, so the solver can plan a slew
         # faster than the actuator and get post-clipped (tracking mismatch). When
@@ -601,10 +678,13 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
         collision_method = self.get_parameter('obstacle_collision_avoidance_method').value
         safe_distance = self.get_parameter('safe_distance').value
         obstacle_slack_weight = self.get_parameter('obstacle_slack_weight').value
+        obstacle_slack_quadratic_weight = self.get_parameter(
+            'obstacle_slack_quadratic_weight').value
         enforce_input_rate = bool(self.get_parameter('enforce_input_rate_constraint').value)
         failure_dump_file = self.get_parameter('acados_failure_dump_file').value
 
         ego_radius = self.effective_ego_radius()
+        ego_disc_offsets = self.effective_ego_disc_offsets()
 
         if collision_method == 'cbf':
             self.get_logger().warn(
@@ -615,6 +695,13 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
             self.get_logger().warn(
                 f"num_obstacles={num_obstacles}: acados parameter vector includes obstacle "
                 "states. If num_obstacles changed since last build, set generate_mpc_model=True.")
+            # The disc count sets the number of generated constraint rows, so changing
+            # it needs a rebuild for exactly the same reason num_obstacles does.
+            self.get_logger().info(
+                f'acados ego collision discs: {np.array2string(ego_disc_offsets, precision=3)} m '
+                f'ahead of the rear axle, radius {ego_radius:.3f} m each '
+                f'({num_obstacles * ego_disc_offsets.size} keep-out rows). '
+                'Changing ego_disc_offsets requires generate_mpc_model=True.')
 
         build_path = os.path.join(model_dir, 'c_generated_code')
         config_path = os.path.join(model_dir, 'kinematic_bicycle_acados_ocp.json')
@@ -670,6 +757,8 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
             ego_radius=ego_radius,
             safe_distance=safe_distance,
             obstacle_slack_weight=obstacle_slack_weight,
+            obstacle_slack_quadratic_weight=obstacle_slack_quadratic_weight,
+            ego_disc_offsets=tuple(ego_disc_offsets.tolist()),
         )
 
         os.chdir(cwd)
@@ -686,6 +775,8 @@ class KinematicCoupledAcados(BaseTrajectoryTracker):
             terminal_cost_type=terminal_cost_type,
             num_obstacles=num_obstacles,
             ego_radius=ego_radius,
+            safe_distance=safe_distance,
+            ego_disc_offsets=ego_disc_offsets,
             has_weight_params=has_weight_params,
             Q=self.Q, R=self.R, Qe=self.Qf, Rd=self.Rd,
             dt=self.sample_time,
