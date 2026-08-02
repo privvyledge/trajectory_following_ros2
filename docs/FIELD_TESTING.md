@@ -806,25 +806,51 @@ is intentional, not a bug.
 The **braking envelope** (`obstacle_braking_envelope`, bool node param, default `True`,
 hot-reloadable) is the predictive safety layer: it compares stopping room (reaction
 tick + actuation lag at `max_decel`) against measured physical clearance, latches a hold
-on first fire, and releases when the margin recovers. Leave it **on** — an A/B on the
-two-obstacle F1/10 course showed that with it off the reactive layers only fire *after*
-intrusion (physical overlaps returned and the run stalled). Turn it off
-(`ros2 param set <controller> obstacle_braking_envelope false`) only for diagnostics —
-interventions are still logged either way. Note `max_decel` and the actuation lag are
-what its stopping-room math assumes: keep `max_decel` honest for the CARLA ego.
+on first fire, and releases when the margin recovers. **Its right setting is
+scale-dependent**, and the two platforms' A/Bs came out opposite ways:
+
+- **F1/10: leave it on.** With it off on the two-obstacle course the reactive layers
+  only fire *after* intrusion — physical overlaps returned and the run stalled. The
+  f1tenth obstacle YAMLs keep the default `True`.
+- **CARLA: the obstacle weights YAMLs set it `false` (advisory).** The envelope
+  extrapolates straight-line motion, so it cannot see the planned swerve; at ~9 m/s its
+  `v²/2·max_decel` term fires ~17 m out on every pass, and because the reference
+  projection grazes the keep-out boundary the latch cannot release mid-pass — the car
+  creeps past every obstacle at ~1–2 m/s. A full-route A/B (6 obstacles,
+  `carla_town01_moving`) showed off = equal-or-better executed clearance (acados
+  +0.7999 vs +0.7998 m; CasADi +0.797 vs **+0.325** m — the brake-lurch cycle actually
+  degraded tracking) with 0 overlaps and a 20–26 % faster run. The failure-triggered
+  layers (`unsafe_iterate`, `obstacle_solve_failure`, `failure_policy`) stay active, and
+  advisory mode still logs every margin/clearance diagnostic to the CSV.
+- **Caveat — moving actors:** that A/B used static obstacles. For a first live CARLA run
+  with moving vehicles/pedestrians, consider re-enabling it for the session
+  (`ros2 param set <controller> obstacle_braking_envelope true`) until the solver's
+  handling of reported obstacle motion is validated at speed.
+
+Note `max_decel` and the actuation lag are what the envelope's stopping-room math
+assumes: keep `max_decel` honest for the CARLA ego.
 
 For post-run analysis, set `solver_log_file` in the weights YAML (§8.2) — the CSV
 carries per-tick clearance, safety-stop reason, and proposed-vs-applied commands.
 
 To use CARLA's **own** actors instead of the fake publisher, the ros-bridge publishes
-`derived_object_msgs/ObjectArray` on `/carla/ego_vehicle/objects`. Point the controller at
-it via the weights YAML (`obstacle_topic` is a node param that `mpc.launch.py` hardcodes
-to `fake_obstacles/object_array`; the weights overlay is applied last and wins):
+`derived_object_msgs/ObjectArray` on `/carla/ego_vehicle/objects`. Pass it as a launch
+argument on either launch file:
 
-```yaml
-# in config/weights/carla_acados_obstacle.yaml
-    obstacle_topic: /carla/ego_vehicle/objects
+```bash
+    obstacle_topic:=/carla/ego_vehicle/objects
 ```
+
+Use the **ego-scoped** topic, not the world-scoped `/carla/objects`: the latter reports
+the ego vehicle itself, which would make the car its own keep-out and stop it dead.
+
+Setting `obstacle_topic:` in the weights YAML also works and stays supported — the launch
+argument is applied after the overlays, so it wins if both are set.
+
+With a live feed the reported object **count varies** as actors spawn and despawn, unlike
+the fixed-length fake publisher. Nothing extra is required for that, but it is the
+condition that used to crash obstacle ranking, so on the first live run confirm the
+controller survives an actor appearing or disappearing mid-route rather than assuming it.
 
 **Verify the frame first** — §7.1 applies in full here:
 

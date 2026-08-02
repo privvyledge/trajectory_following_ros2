@@ -53,6 +53,16 @@
     # infeasible.
     obstacle_slack_weight: 1000.0
     obstacle_slack_quadratic_weight: 10000.0
+    # State-based braking envelope OFF (advisory: diagnostics still logged, no
+    # intervention) at CARLA scale. A/B on carla_town01_moving with 6 obstacles
+    # (2026-08-02): envelope off left min physical clearance unchanged
+    # (+0.7999 vs +0.7998 m), 0 overlaps, and finished 26% faster — the
+    # straight-line envelope cannot see the planned swerve, so at 9 m/s it
+    # latches on every pass and drags speed to ~1-2 m/s. Keep it TRUE on the
+    # F1/10 configs (0.66 m keep-outs at 1.5 m/s — there it is load-bearing).
+    # Consider re-enabling for live runs with MOVING obstacles until validated.
+    # Hot-reloadable: ros2 param set <node> obstacle_braking_envelope true
+    obstacle_braking_envelope: false
 
     # Tuned Town01 tracking set (see carla_acados.yaml for the derivation).
     Q:  [5.0, 5.0, 15.0, 0.05]

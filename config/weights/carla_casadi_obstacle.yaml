@@ -1,0 +1,143 @@
+/**:
+  ros__parameters:
+    # ---------------------------------------------------------------------------
+    # CARLA × CasADi — EXACT (sqpmethod) obstacle avoidance.
+    # Tracking weights / reference levers are the tuned carla_casadi.yaml set
+    # (Town01 moving route, true CTE mean 0.032 m / max 0.298 m); the obstacle
+    # block mirrors carla_acados_obstacle.yaml so the two backends enforce the
+    # SAME keep-out geometry and are directly comparable run-to-run.
+    # Overlay (highest wins): weights > platforms/carla.yaml > base.
+    # Launch:
+    #   mpc_toolbox:=casadi platform:=carla weights:=carla_casadi_obstacle \
+    #       num_obstacles:=N generate_mpc_model:=true
+    #
+    # Unlike the solver_type=qp + ltv path (see f1tenth_casadi_qp_obstacle.yaml),
+    # which LINEARIZES the exterior-of-circle keep-out about a per-stage operating
+    # point (soft, and the linearization gradient vanishes head-on), this uses the
+    # quad/qrqp sqpmethod path on the full nonlinear model and carries the EXACT
+    # squared-distance constraint; the SQP convexify layer handles its
+    # nonconvexity. At CARLA scale (9 m/s straights, ~6 m keep-out radii) the
+    # exact constraint is what makes the detour commit early enough.
+    # ---------------------------------------------------------------------------
+    horizon: 25
+    sample_time: 0.05
+    prediction_time: 1.25  # sample_time * horizon
+
+    # EXACT nonconvex-constraint path: sqpmethod on the full nonlinear model.
+    solver_type: quad
+    solver: qrqp
+    discrete_model_type: nonlinear
+    discrete_integration_method: rk4
+    # PD Hessian: required for a well-conditioned qrqp QP. Without it the u-rate
+    # slack leaves zero rows in the Hessian -> singular H -> multi-second solves
+    # and Search_Direction_Becomes_Too_Small at fast corners.
+    slack_objective_is_quadratic: True
+
+    # max_iter is the sqpmethod OUTER iteration count and behaves as a TIME BUDGET
+    # next to a nonconvex keep-out, not a convergence knob: the adapter accepts a
+    # budget-limited iterate as usable (RTI-style), so a capped solve is not a
+    # failure. Same lesson as carla_acados_obstacle.yaml's max_iter 20 — and it is
+    # NOT optional at CARLA scale. Measured on the Town01 route with the 6-obstacle
+    # set, `max_iter: 200` (the value carla_casadi.yaml uses with no obstacles):
+    # solve p50 6.7 ms but p95 91 ms and a 4.5 s degenerate
+    # Search_Direction_Becomes_Too_Small next to the cybertruck keep-out. A
+    # multi-second solve is not just a dropped tick — the plant keeps integrating
+    # the last command, so at 8 m/s the vehicle travels ~40 m while the control
+    # loop is blocked, which is far outside projection_window and the reference
+    # projection reports 'lost' and never re-acquires. The run stopped dead at
+    # ref_idx 256 of 1431, twice, reproducibly.
+    # Raising the cap does not fix a limit cycle; it only lengthens the stall.
+    max_iter: 25
+    # Loose, obstacle-appropriate tolerance: 1e-4 (the no-obstacle value) chases a
+    # stationarity residual the nonconvex keep-out limit-cycles on and burns the
+    # whole budget every solve.
+    termination_condition: 0.1
+    # Bounds the INNER qrqp QP. max_iter alone does not: capping outer iterations
+    # 200 -> 25 pulled solve p95 from 91 ms to 27 ms but made the one degenerate
+    # Search_Direction_Becomes_Too_Small solve WORSE (4.5 s -> 7.9 s), because that
+    # solve is one inner QP grinding, not outer iterations accumulating. This is
+    # the knob that bounds it (0 = plugin default = unbounded). Adding it took the
+    # run from ref_idx 251 to 598 of 1431 (5 of 6 obstacles passed, 0 physical
+    # overlaps, min clearance +0.692 m, solve p50 13 ms / p95 30 ms).
+    #
+    # KNOWN RESIDUAL — read before a long CARLA run. It bounds the stall but does
+    # not remove it: p99 was still 518 ms with a 2.26 s worst case and 23
+    # Search_Direction_Becomes_Too_Small solves, and the run eventually lost the
+    # path the same way just past bike_2. So this config avoids obstacles
+    # correctly but is not yet proven to hold a full CARLA-scale route. Prefer
+    # acados for long obstacle runs until this is closed; next levers to try are
+    # sqp_convexify_strategy: eigen-clip, sqp_hessian_approximation:
+    # limited-memory, or the solver_type: qp + discrete_model_type: ltv path
+    # (one QP per tick, so a degenerate outer loop is structurally impossible —
+    # at the cost of a linearized, weaker keep-out).
+    qp_inner_max_iter: 100
+
+    # Obstacle avoidance (Euclidean, EXACT squared distance on the quad path).
+    # num_obstacles is NOT set here — it is a launch arg applied after this overlay
+    # so it stays authoritative. Pass num_obstacles:=N + generate_mpc_model:=true.
+    obstacle_collision_avoidance_method: euclidean
+    # Keep-out from an obstacle centre = ego_radius + obstacle_radius +
+    # safe_distance, enforced at EACH ego collision disc. The default ros-bridge
+    # ego (Tesla Model 3-class) is ~4.69 x 1.85 m with roughly 1.0 m of rear
+    # overhang, so the body spans about [-1.0, +3.7] m along x from the rear-axle
+    # reference point. Two circles cover it: each half-rectangle (~2.35 x 1.85 m)
+    # has circumradius hypot(2.35, 1.85)/2 ~= 1.50 m, centred at ~+0.18 and
+    # ~+2.53 m. If your ego blueprint differs, recompute: with body span
+    # [x_rear, x_front] and width w, each half has length L = (x_front - x_rear)/2,
+    # radius = hypot(L, w)/2, centres at x_rear + L/2 and x_front - L/2.
+    #
+    # CHANGING ego_disc_offsets CHANGES THE NUMBER OF GENERATED CONSTRAINT ROWS,
+    # so it needs generate_mpc_model:=True, exactly like num_obstacles.
+    # These three MUST match carla_acados_obstacle.yaml or a CasADi-vs-acados
+    # comparison is measuring different geometry.
+    ego_radius: 1.5
+    ego_disc_offsets: [0.18, 2.53]
+    # Comfort margin on top of the disc radii. Vehicle-scale (the F1/10 uses
+    # 0.15 m); also the spendable band the braking envelope lets the solver use
+    # during recovery. Raise it to start detours earlier and carry more speed.
+    safe_distance: 0.8
+    # SLACK-WEIGHT LEVER: the keep-out is soft/slacked so it stays feasible when
+    # the reference is briefly inside the bubble. Raising this hardens avoidance —
+    # try 1000 -> 10000 -> 100000 to force progressively larger deviation. A single
+    # value broadcasts to every obstacle. Restart-only (baked into the OCP at
+    # build; keep generate_mpc_model:=true when you change it).
+    slack_weights_obstacle_avoidance: [1000.0]
+    slack_upper_bound_obstacle_avoidance: [1000.0]
+    # State-based braking envelope OFF (advisory: diagnostics still logged, no
+    # intervention) at CARLA scale. A/B on carla_town01_moving with 6 obstacles
+    # (2026-08-02): envelope off IMPROVED min physical clearance (+0.797 vs
+    # +0.325 m — the envelope's brake-lurch cycle near the boundary degraded
+    # tracking), 0 overlaps, 20% faster. Keep it TRUE on the F1/10 configs
+    # (0.66 m keep-outs at 1.5 m/s — there it is load-bearing).
+    # Consider re-enabling for live runs with MOVING obstacles until validated.
+    # Hot-reloadable: ros2 param set <node> obstacle_braking_envelope true
+    obstacle_braking_envelope: false
+
+    # Tuned Town01 tracking set (see carla_casadi.yaml for the derivation):
+    # modest position authority with high steering-rate damping for stability on
+    # the ~9 m/s straights, and a low accel-axis penalty so it can brake into the
+    # corners. Velocity weight highest in Q/Qf, yaw lowest.
+    Q:  [5.0, 5.0, 15.0, 0.05]
+    R:  [0.5, 100.0]
+    Rd: [1.0, 1000.0]
+    Qf: [10.0, 10.0, 30.0, 0.1]
+    use_bryson_weights: false
+
+    use_speed_profile: True
+    # Curvature speed cap; slows the hairpins to ~5 m/s. NOTE this inherits the
+    # tuned CasADi value (1.2) while carla_acados_obstacle.yaml inherits acados'
+    # (1.0) — a pre-existing per-backend tuning difference, not an obstacle
+    # choice. It shapes the reference, which is backend-independent, so a strict
+    # CasADi-vs-acados A/B should pin BOTH files to the same value first.
+    max_lateral_accel: 1.2
+    min_reference_speed: 0.3
+
+    # Reference anchor distance. Platform default 5.0 m over-anchors and cuts the
+    # R~12 m corners; 2.5 m tracks the near path. Do NOT drop below ~2.5 (stalls).
+    distance_tolerance: 2.5
+
+    # The OCP structure includes the obstacle constraints, so the model must be
+    # (re)generated when this overlay is first used or when num_obstacles /
+    # ego_disc_offsets / the slack weights change.
+    generate_mpc_model: True
+    build_with_cython: True
