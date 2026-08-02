@@ -40,6 +40,7 @@ Notes:
 """
 import logging
 import os
+import shutil
 import time
 import numpy as np
 import casadi
@@ -512,7 +513,11 @@ class KinematicMPCCasadi(KinematicMPCBase):
            * https://github.com/casadi/casadi/wiki/FAQ:-how-to-make-jit-not-recompile-when-problem-is-unchanged
         '''
         # compiler and flags are common to jit and external code_generation
-        compiler = "ccache gcc"  # Linux (gcc, clang, ccache gcc)  # todo: catch exception if ccache is not installed
+        # Linux (gcc, clang, ccache gcc). ccache is only a build-cache wrapper, so it is
+        # used when present and dropped when not: CasADi's shell compiler hands the string
+        # to /bin/sh, and a missing ccache aborts solver construction with
+        # "Compilation failed" (sh: 1: ccache: not found) rather than degrading.
+        compiler = "ccache gcc" if shutil.which("ccache") else "gcc"
         # compiler = "clang"  # OSX
         # compiler = "cl.exe" # Windows
         flags = ["-O3"]  # Linux/OSX. ['O3'] enables the most optimizations

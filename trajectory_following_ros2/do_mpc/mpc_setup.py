@@ -3,6 +3,7 @@
 """
 
 import os
+import shutil
 import numpy as np
 # from casadi import *
 import casadi
@@ -99,7 +100,7 @@ class MPC(object):
         self.mpc.set_tvp_fun(self.tvp_fun)
 
         # compilation parameters
-        compiler = "ccache gcc"  # Linux (gcc, clang, ccache gcc)  # todo: catch exception if ccache is not installed
+        compiler = "ccache gcc"  # Linux (gcc, clang, ccache gcc)
         # compiler = "clang"  # OSX
         # compiler = "cl.exe" # Windows
         flags = ["-O3"]  # Linux/OSX. ['O3'] enables the most optimizations
@@ -110,6 +111,14 @@ class MPC(object):
                 "-march=native",  # optimizes for the specific hardware (CPU) but isn't transferable
                 "-fPIC",  # for shared_libraries
             ]  # for performance boost using gcc
+
+        # ccache is only a build-cache wrapper, so drop it when it is not installed:
+        # CasADi's shell compiler hands this string to /bin/sh, and a missing ccache
+        # aborts solver construction ("sh: 1: ccache: not found" -> "Compilation failed")
+        # instead of degrading. Applied after the flag selection above so the flags a
+        # machine gets do not depend on whether ccache happens to be present.
+        if compiler.startswith("ccache ") and shutil.which("ccache") is None:
+            compiler = compiler.split(None, 1)[1]
 
         # JIT compilation automatically compiles helper functions as well as the solver.
         # Yields about a 2.5x increase in performance
