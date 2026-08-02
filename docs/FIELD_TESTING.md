@@ -26,6 +26,35 @@ Everything below assumes:
 
 ## 0. One-time setup
 
+### 0.0 Get the source
+
+The package lives in the `src/` of a ROS 2 workspace. Clone it there — the workspace root
+(the directory *containing* `src/`) is where every `colcon` command in this guide runs
+from.
+
+```bash
+mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
+git clone https://github.com/privvyledge/trajectory_following_ros2.git
+cd trajectory_following_ros2
+git checkout refactor/unify-backends
+```
+
+**Branch:** work is on **`refactor/unify-backends`**, not `master`. The unified
+`BaseTrajectoryTracker` / `BaseSolver` architecture, the obstacle-avoidance stack, the
+multi-disc keep-out and every config in `config/weights/` described here are on that
+branch only. A fresh clone lands on `master` and will not match this guide.
+
+To update an existing checkout before a test session:
+
+```bash
+cd ~/ros2_ws/src/trajectory_following_ros2
+git pull                      # then rebuild — see 0.1; config/*.yaml are copied, not symlinked
+```
+
+On the Jetson / CARLA boxes the workspace may be named differently (`~/f1tenth_ws`,
+`~/carla_ros_ws`); use whichever you build from, and be consistent — a second stale
+workspace on the same machine is a known source of "my fix did not take effect".
+
 ### 0.1 Build
 
 The package is `ament_python`. If the nodes run against a **Python venv**, build with
