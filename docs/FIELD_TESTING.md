@@ -630,24 +630,30 @@ C codegen. Edit the YAML to `False` after a successful build.
 
 Two behaviours you should know about before wiring a real perception stack in:
 
-**Obstacles are NOT filtered by heading or velocity.** `base_tracker._obstacle_callback`
-computes a plain Euclidean distance from the vehicle to each object and sorts by it:
+**Only `num_obstacles` of the reported objects reach the OCP, ranked against the
+horizon.** `_obstacle_callback` caches *every* reported object with no ranking at all;
+`_select_obstacles` scores them per tick against `{ego} ∪ xref[0..N]` — the planned
+reference window, not the vehicle. Objects whose keep-out actually bites somewhere on
+that window ("intruders") sort first by the *earliest constraining stage*; the rest
+follow by distance to the window. So an obstacle behind the car no longer evicts one
+ahead, and two obstacles sitting on the reference are ordered by which one you reach
+first rather than tying at distance ≈ 0.
 
-```python
-dist = np.linalg.norm(np.array(pos[:2]) - np.array([self.x, self.y]))
-obstacles.append({'state': [pos[0], pos[1], radius], 'distance': dist})
-self.obstacles = sorted(obstacles, key=lambda o: o['distance'])
-```
+There is still **no heading cone and no velocity gate**, and that is deliberate: the
+horizon is already forward-only, and a heading cone would cut an on-path hairpin
+obstacle out of the OCP exactly when it matters. `predict_obstacle_motion` (default
+`True`) propagates each object over the horizon at its reported `twist`; ranking itself
+uses current positions.
 
-There is no dot product against heading, no forward/behind test, no velocity gate. The
-controller then takes the **first `num_obstacles` entries** of that sorted list. So an
-obstacle 1 m *behind* the car outranks one 5 m *ahead*, and with `num_obstacles: 1` it
-will crowd the relevant one out of the OCP entirely. This is fine with the
-`fake_obstacle_publisher` and a handful of static objects; it is **not** fine with a live
-perception feed that reports everything around the vehicle. Either filter upstream
-(publish only forward objects) or raise `num_obstacles` enough to cover the clutter —
-each obstacle adds constraints and solve time, and `num_obstacles` is restart-only
-(it changes the OCP structure, so `generate_mpc_model:=true`).
+Consequences for a live feed:
+
+- Size `num_obstacles` to the **simultaneous** clutter you expect near the path, not to
+  the total actor count — each one adds constraints and solve time. Six well-separated
+  obstacles along a route are fine at `num_obstacles: 1–2`.
+- `num_obstacles` is restart-only *and* rebuild-only (it sizes the generated OCP), so
+  pair any change with `generate_mpc_model:=true`.
+- Go-around side hints are keyed by `Object.id`, so a feed that renumbers its objects
+  between messages will re-decide which side to pass on.
 
 **Obstacles are NOT transformed through TF.** The callback reads `obj.pose.position`
 directly and compares it against the vehicle odometry. `data.header.frame_id` is
@@ -664,8 +670,10 @@ ignored entirely. So:
 - In the closed-loop sim, `map → odom` is an identity TF, so map/waypoint coordinates can
   be used directly as `odom` coordinates.
 
-Also note: the callback reads `self.x`/`self.y` without acquiring the state mutex (there
-is a `todo` marker at the site). Harmless at current rates, but it is a known race.
+A live feed whose **object count varies** (actors spawning/despawning) is the normal
+CARLA case and is handled: selection takes a single snapshot of the detection list per
+tick. That used to be an `IndexError` out of the control timer, which killed the node
+with the last drive command latched.
 
 ### 7.2 Keep-out geometry
 
@@ -692,10 +700,12 @@ behaviour, not a bug.
 
 ### 7.3 F1/10 obstacle runs
 
-**`mpc.launch.py` has no `num_obstacles` launch argument** — it hardcodes
-`num_obstacles: 0` and `ego_radius: 1.0`. Passing `num_obstacles:=1` will fail as an
-unknown launch argument. Obstacles on hardware come from the **weights YAML overlay**
-(which is applied last and wins).
+`num_obstacles` and `obstacle_topic` are **launch arguments on both launch files**, and
+both are applied *after* the platform/weights overlays, so the launch value wins. The
+obstacle weights YAMLs deliberately do not pin `num_obstacles` — pass it explicitly, with
+`generate_mpc_model:=true`, since it sizes the generated OCP. Everything else in the
+obstacle block (discs, `safe_distance`, slack weights, `max_iter`) comes from the weights
+YAML.
 
 acados — exact nonlinear keep-out, strongest for head-on / on-path:
 
@@ -764,33 +774,174 @@ Restart-only, and it changes the OCP, so pair with `generate_mpc_model:=true`.
 
 ### 7.4 CARLA + obstacles
 
-Use `config/weights/carla_acados_obstacle.yaml` — the tuned `carla_acados.yaml` set plus
-the obstacle block scaled to the CARLA ego. Key values and why:
+Use `config/weights/carla_acados_obstacle.yaml` or `carla_casadi_obstacle.yaml` — the
+tuned no-obstacle set for that backend plus an obstacle block scaled to the CARLA ego.
+The two files share identical keep-out geometry on purpose, so a backend comparison is
+apples-to-apples. Key values and why:
 
 | Param | Value | Why |
 |---|---|---|
 | `ego_radius` / `ego_disc_offsets` | `1.5` / `[0.18, 2.53]` | Two discs covering a ~4.69 × 1.85 m body with ~1.0 m rear overhang (the two half-rectangle circumcircles, same construction as the F1/10 file). A single rear-axle disc lets the front of the car clip an obstacle at *positive* reported clearance. If your ego blueprint differs, recompute per the comment in the file. |
-| `safe_distance` | `0.8` | Vehicle-scale comfort margin (F1/10 uses 0.15). Also the band the braking envelope can spend during recovery. Raise it to start detours earlier and carry more speed. |
-| `max_iter` | `20` (+ `termination_condition: 0.1`) | A **time budget**, not a convergence knob: near a nonconvex keep-out the SQP limit-cycles and eats any budget; the budget-limited status-2 iterate is accepted RTI-style. Do not raise it to "fix" status-2 floods — worst-case solve time scales with the cap. |
+| `safe_distance` | `0.4` | Vehicle-scale comfort margin (F1/10 uses 0.15); the 1.5 m ego discs already conservatively cover the body. |
+| `decompose_obstacle_boxes` / `num_obstacles` | `true` / `6` | Elongated BOX actors become up to three longitudinal discs. The discs rank into OCP slots independently, so use six slots and regenerate once. |
+| `max_avoidance_offset` | `2.0` | Detours beyond this lateral offset switch to an on-path stopping reference; `0.0` restores unbounded detours. The CARLA YAMLs disable the braking envelope, so this speed ramp **is** the stopping mechanism here. |
+| `keepout_engagement_distance` | `25.0` | Grows the projection guide smoothly as the obstacle approaches; the OCP always keeps its full safety radius. The detour bound above is measured against the *ramped* radius, so lowering this also delays the stop-vs-swerve decision. |
+| `progress_watchdog_timeout` | `8.0` | Zero the command when a drive command is applied but nothing moves (index frozen, `\|v\| < 0.2`). Raised from the `5.0` default because a CARLA ego legitimately sits near-stationary at full throttle for ~5 s pulling away from spawn. `progress_watchdog_enabled: false` disables it. |
+| `max_iter` | acados `20`, CasADi `25` + `qp_inner_max_iter: 100` (both with `termination_condition: 0.1`) | A **time budget**, not a convergence knob: near a nonconvex keep-out the SQP limit-cycles and eats any budget; the budget-limited status-2 iterate is accepted RTI-style. Do not raise it to "fix" status-2 floods — worst-case solve time scales with the cap. |
 | `obstacle_slack_weight` / `_quadratic_weight` | `1000` / `10000` | Linear term keeps shallow margin use expensive; quadratic dominates deep penetration while keeping a recovery path from an already-infeasible start. |
 
-`num_obstacles` is **not** pinned in the file — pass it at launch (it is a structural
-override applied after the overlays). `ego_disc_offsets`, `num_obstacles`, and the slack
-weights all change the generated OCP → pair any change with `generate_mpc_model:=true`.
+The obstacle files document `num_obstacles: 6`, but the launch argument is the
+authoritative structural override applied after the overlays, so pass `num_obstacles:=6`
+explicitly. `ego_disc_offsets`, `num_obstacles`, and the slack weights all change the
+generated OCP → the first run after this update must use `generate_mpc_model:=true`.
 
-Rebuild (YAML files are copied into `share/`, not symlinked), then launch:
+#### Obstacle source: spawn real CARLA actors (preferred)
+
+Spawn the obstacles from the ros-bridge objects definition file (this repo's
+`carla_obstacles.json` is the reference layout for `data/carla_town01_moving.csv`: three
+vehicles, two bikes and a pedestrian, six events ≥30 m of arc apart, difficulty rising
+along the route, ending on the pedestrian — the only mandatory avoidance). No
+`fake_obstacle_publisher` is needed: the ego's `sensor.pseudo.objects` already reports
+every *other* actor with true shape dimensions on
+**`/carla/ego_vehicle/objects`**, in `map`, which is the controller's `global_frame`.
+
+Use the **ego-scoped** topic, never the world-scoped `/carla/objects` — the latter
+reports the ego vehicle itself, which would make the car its own keep-out and stop it
+dead. Verify the frame and that actors are being reported before the first run:
 
 ```bash
-cd ~/ros2_ws && python3 -m colcon build --packages-select trajectory_following_ros2 --symlink-install
+ros2 topic echo /carla/ego_vehicle/objects --once | grep -m2 frame_id
+ros2 topic hz /carla/ego_vehicle/objects
+```
+
+The obstacles spawn **physics-enabled** — nothing calls `simulate_physics(False)` — so
+any contact displaces an actor and that run will not replay identically. Treat a
+post-contact run as non-reproducible and respawn.
+
+#### Rebuild, then launch
+
+YAML files are *copied* into `share/`, not symlinked, so a weights change needs a
+rebuild. `num_obstacles` and the disc/slack settings size the generated OCP, so pair the
+first obstacle run with `generate_mpc_model:=true`.
+
+```bash
+cd ~/carla_ros_ws && python3 -m colcon build --packages-select trajectory_following_ros2 --symlink-install
 source install/setup.bash
+```
 
+acados — exact nonlinear keep-out; the recommended CARLA obstacle backend:
+
+```bash
 ros2 launch trajectory_following_ros2 mpc.launch.py \
-    mpc_toolbox:=acados platform:=carla weights:=carla_acados_obstacle \
+    mpc_toolbox:=acados \
+    control_type:=mpc \
+    platform:=carla \
+    weights:=carla_acados_obstacle \
     load_waypoints:=true \
-    waypoints_csv:=$HOME/ros2_ws/src/trajectory_following_ros2/data/carla_town01_moving.csv \
-    stage_cost_type:=EXTERNAL terminal_cost_type:=EXTERNAL use_sim_time:=true
+    waypoints_csv:="$(ros2 pkg prefix trajectory_following_ros2)/share/trajectory_following_ros2/data/carla_town01_moving.csv" \
+    stage_cost_type:=EXTERNAL \
+    terminal_cost_type:=EXTERNAL \
+    num_obstacles:=6 \
+    obstacle_topic:=/carla/ego_vehicle/objects \
+    generate_mpc_model:=true \
+    use_sim_time:=true \
+    robot_frame:=ego_vehicle \
+    global_frame:=map \
+    frequency:=20.0 \
+    wheelbase:=2.87528 \
+    odom_topic:=/carla/ego_vehicle/odometry \
+    ackermann_cmd_topic:=/drive \
+    load_visualizer:=true
+```
 
-# CARLA's global_frame is `map`, so publish obstacles in map coordinates:
+CasADi — same keep-out geometry, exact sqpmethod path (`carla_casadi_obstacle.yaml`
+mirrors the acados obstacle block deliberately, so a CasADi-vs-acados comparison is
+apples-to-apples):
+
+```bash
+ros2 launch trajectory_following_ros2 mpc.launch.py \
+    mpc_toolbox:=casadi \
+    control_type:=mpc \
+    use_opti:=false \
+    platform:=carla \
+    weights:=carla_casadi_obstacle \
+    load_waypoints:=true \
+    waypoints_csv:="$(ros2 pkg prefix trajectory_following_ros2)/share/trajectory_following_ros2/data/carla_town01_moving.csv" \
+    num_obstacles:=6 \
+    obstacle_topic:=/carla/ego_vehicle/objects \
+    generate_mpc_model:=true \
+    use_sim_time:=true \
+    robot_frame:=ego_vehicle \
+    global_frame:=map \
+    frequency:=20.0 \
+    wheelbase:=2.87528 \
+    odom_topic:=/carla/ego_vehicle/odometry \
+    ackermann_cmd_topic:=/drive \
+    load_visualizer:=true
+```
+
+The pre-decomposition configurations completed the six-obstacle route with 0 physical
+overlaps on 2026-08-02, but that evidence does not validate the new box decomposition,
+offset bound, or engagement ramp. Re-run both commands above after rebuilding.
+CasADi carries a known solve-time tail next to a nonconvex keep-out
+(`qp_inner_max_iter: 100` + `max_iter: 25` bound it; see the comments in
+`carla_casadi_obstacle.yaml`), so for long routes prefer acados and treat CasADi as the
+cross-check.
+
+#### Acceptance for the re-test
+
+Capture a CSV — uncomment `solver_log_file` in the weights YAML before the rebuild
+(it is a node parameter, not a launch argument; §8.2):
+
+```yaml
+    solver_log_file: '/tmp/carla_obstacle_acados.csv'   # and _casadi.csv for the other run
+```
+
+Then score it:
+
+```bash
+python3 analyze_safety_run.py /tmp/carla_obstacle_acados.csv --safe-distance 0.4
+```
+
+Pass criteria:
+
+| Check | Where | Expected |
+|---|---|---|
+| No contact | `physical_clearance` (already body-to-body) | never negative; analyzer reports 0 physical overlaps |
+| Truck pass stays on pavement | RViz/rerun, or peak lateral error | CTE below roughly 2 m past the truck — the pre-fix runs peaked at 4.2 m |
+| Detour is smooth, not a lunge | `des_steer` / the CSV steering column | no ±70°-class steering spikes at the moment an obstacle enters the horizon (this is what `keepout_engagement_distance` exists to remove) |
+| Route completes | node log | "Final goal reached", no permanent stall |
+| Watchdog stayed quiet | `safety_reason` column | no `no_progress` rows, **especially in the first ~10 s while pulling away from spawn** — if it fires there, raise `progress_watchdog_timeout` |
+| Stop-mode was not thrashing | `avoidance_stop` column | either all zero (every detour fitted inside `max_avoidance_offset`) or a few contiguous runs; rapid 0/1 alternation means the hysteresis band needs widening |
+
+Two things to watch specifically, both new and both unproven in the field:
+
+- **Decomposed-box ends.** A decomposed box's discs merge into one projection circle
+  centred on the box with the (tight) sub-disc radius, which under-covers the box's
+  front and rear by roughly a disc spacing. The OCP still constrains every sub-disc at
+  full radius, so this is a tracking-quality risk, not a safety one — but if
+  `sel_min_clearance` dips or acados status-2 counts spike specifically while abeam a
+  truck/bus **end** (rather than its middle), that is this effect and it should be
+  reported rather than tuned around.
+- **Ramp/bound coupling.** `max_avoidance_offset` is evaluated against the *ramped*
+  keep-out radius, so the stop-vs-swerve decision cannot fire until the ramp is well
+  underway. At the shipped values the bound is crossed ~16 m out against a ~11 m
+  braking distance; if you lower `keepout_engagement_distance` or raise route speed,
+  re-check that a genuine stop-mode engagement still leaves room to stop.
+
+`num_obstacles:=6` leaves room for two elongated three-disc actors in the horizon. Slots
+are ranked per disc, so one truck can legitimately consume three. Changing this count
+requires another generated-model rebuild.
+
+Drop the `generate_mpc_model:=true` on repeat runs with unchanged structure (obstacle
+count, ego discs, slack weights) — it only forces a rebuild.
+
+#### Alternative: fake_obstacle_publisher
+
+For a single scripted obstacle without touching the CARLA actor set. `global_frame` is
+`map`, so publish in map coordinates and leave `obstacle_topic` at its default:
+
+```bash
 ros2 run trajectory_following_ros2 fake_obstacle_publisher --ros-args \
     -p obstacle_x:="[120.0]" -p obstacle_y:="[2.0]" -p obstacle_radius:="[1.0]" \
     -p frame_id:=map -p use_sim_time:=true
@@ -831,37 +982,23 @@ Note `max_decel` and the actuation lag are what the envelope's stopping-room mat
 assumes: keep `max_decel` honest for the CARLA ego.
 
 For post-run analysis, set `solver_log_file` in the weights YAML (§8.2) — the CSV
-carries per-tick clearance, safety-stop reason, and proposed-vs-applied commands.
-
-To use CARLA's **own** actors instead of the fake publisher, the ros-bridge publishes
-`derived_object_msgs/ObjectArray` on `/carla/ego_vehicle/objects`. Pass it as a launch
-argument on either launch file:
-
-```bash
-    obstacle_topic:=/carla/ego_vehicle/objects
-```
-
-Use the **ego-scoped** topic, not the world-scoped `/carla/objects`: the latter reports
-the ego vehicle itself, which would make the car its own keep-out and stop it dead.
+carries per-tick clearance, safety-stop reason, and proposed-vs-applied commands. When
+scoring it, subtract `safe_distance` (0.4 here) from the reported clearances to separate
+real body-to-body overlap from ordinary margin use — `physical_clearance` is already
+body-to-body, `sel_*_clearance` are not.
 
 Setting `obstacle_topic:` in the weights YAML also works and stays supported — the launch
 argument is applied after the overlays, so it wins if both are set.
 
-With a live feed the reported object **count varies** as actors spawn and despawn, unlike
-the fixed-length fake publisher. Nothing extra is required for that, but it is the
-condition that used to crash obstacle ranking, so on the first live run confirm the
-controller survives an actor appearing or disappearing mid-route rather than assuming it.
+If `ros2 topic echo /carla/ego_vehicle/objects` reports a `frame_id` other than `map`
+(CARLA's `global_frame`), the positions are silently misinterpreted and you need a
+transform node in between — obstacles are **not** TF-transformed (§7.1).
 
-**Verify the frame first** — §7.1 applies in full here:
-
-```bash
-ros2 topic echo /carla/ego_vehicle/objects --once | grep -m2 frame_id
-```
-
-If that reports anything other than `map` (CARLA's `global_frame`), the positions will be
-silently misinterpreted and you need a transform node in between. Also note that feed
-reports **all** actors including ones behind the ego, and the nearest-N sort does not care
-about direction — filter upstream or raise `num_obstacles`.
+A silent feed is warned about, not silently tolerated: with `num_obstacles > 0` and no
+`ObjectArray` ever arriving (or none for 2 s), the controller logs a throttled warning.
+Without it, a run with the obstacle publisher down looks *identical to a clean run* — no
+detections, clean tracking, every clearance column `nan` — so check for that warning
+before reading a quiet obstacle run as a pass.
 
 ### 7.5 What normal obstacle logs look like
 
@@ -876,6 +1013,14 @@ about direction — filter upstream or raise `num_obstacles`.
   flip-flopping head-on. Debug topics show the **raw** reference; the projection happens on
   a copy.
 - Expected on-path result: ~0.5–0.6 m detour, rejoin downstream, 0 failure latches.
+- `avoidance_stop=1` rows mean the required detour exceeded `max_avoidance_offset`, so the
+  reference kept its raw geometry with a braking speed profile — the car is *deliberately*
+  stopping short of the blocker instead of leaving the corridor. Contiguous runs are normal;
+  rapid alternation is not (the hysteresis band releases at `0.8 ×` the bound).
+- `safety_reason=no_progress` means the watchdog saw a drive command applied with the
+  reference index frozen and the vehicle not moving. It zeroes the command but does not
+  latch. Seeing it while pulling away from a standstill means `progress_watchdog_timeout`
+  is too short for that platform, not that the vehicle is stuck.
 - `N obstacle keep-outs merged into 1 projection circle(s)` INFO when two keep-outs pinch
   a too-narrow corridor — the reference routes around the group while the OCP keeps the
   true circles. Expected at close obstacle pairs.
@@ -958,13 +1103,15 @@ Columns, in groups:
   closing_speed, stopping_room` — `physical_clearance` is body-to-body (excludes
   `safe_distance`; negative = real overlap), recorded every tick, not just on
   interventions. `safety_reason` ∈ {`braking_envelope`, `unsafe_iterate`,
-  `obstacle_solve_failure`, `failure_policy`}.
+  `obstacle_solve_failure`, `failure_policy`, `no_progress`}.
 - **Applied:** `applied_accel, applied_steering, applied_speed` — what was actually
   published. `*_cmd` above are what the solver *proposed*; they differ on every tick an
   intervention fired, so judge command traces on `applied_*`.
 - **Tick timing:** `tick_interval_ms, reference_ms, obstacle_ms, solver_wall_ms,
   pre_log_ms, previous_log_write_ms` — report cadence (p50/p95/max `tick_interval_ms`)
   before quoting solver stats.
+- **Reference intervention:** `avoidance_stop` — `1` when the lateral-offset bound
+  replaced the detour geometry with an on-path braking reference for that solve.
 
 Quick pass/fail read of a run: physical-overlap rows (`physical_clearance < 0`) must be
 0; `n_selected` must equal the expected obstacle count throughout (a silent feed voids
