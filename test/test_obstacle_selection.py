@@ -8,7 +8,7 @@ attributes, so no ROS context is needed.
 import numpy as np
 import pytest
 
-from trajectory_following_ros2.base_tracker import BaseTrajectoryTracker
+from trajectory_following_ros2.base_tracker import AvoidanceStopLatch, BaseTrajectoryTracker
 
 HORIZON = 25
 SAMPLE_TIME = 0.05
@@ -46,6 +46,11 @@ def _make_tracker(obstacles, num_obstacles=1, predict_motion=True, solver=None):
     tracker.MAX_DECEL = -3.0
     tracker.n_obstacle_states = 3
     tracker._keepout_side_hints = {}
+    tracker._avoidance_stop_latch = AvoidanceStopLatch()
+    tracker._avoidance_stop_active = False
+    tracker.max_avoidance_offset = 0.0
+    tracker.keepout_engagement_distance = 0.0
+    tracker.x = tracker.y = tracker.yaw = 0.0
 
     class _NullLogger:
         def info(self, *a, **k):

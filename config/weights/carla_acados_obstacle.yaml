@@ -25,9 +25,10 @@
     nlp_solver_type: SQP
     max_iter: 20
 
-    # Obstacle avoidance (exact nonlinear con_h). num_obstacles is NOT set here —
-    # it is a launch arg applied after this overlay so it stays authoritative.
-    # Pass num_obstacles:=N (default 0) + generate_mpc_model:=true on launch.
+    # Obstacle avoidance (exact nonlinear con_h). The launch argument remains
+    # authoritative over this overlay; keep num_obstacles:=6 on the launch line.
+    # The first run after changing the slot count needs generate_mpc_model:=true.
+    num_obstacles: 6
     obstacle_collision_avoidance_method: euclidean
     # Keep-out = ego_radius + obstacle_radius + safe_distance, enforced at EACH
     # ego collision disc. The default ros-bridge ego (Tesla Model 3-class) is
@@ -46,7 +47,30 @@
     # Comfort margin on top of the disc radii. Vehicle-scale (the F1/10 uses
     # 0.15 m); also the spendable band the braking envelope lets the solver use
     # during recovery. Raise it to start detours earlier and carry more speed.
-    safe_distance: 0.8
+    safe_distance: 0.4
+    # Split elongated BOX reports into tight planar discs before slot ranking.
+    # The six-slot generated model must be rebuilt once after enabling this.
+    decompose_obstacle_boxes: true
+    # Lateral detour bound. Beyond this displacement the reference stops bending
+    # around the obstacle and instead keeps its raw geometry with a braking speed
+    # profile, so the car halts short of the keep-out rather than leaving the road
+    # (Town01 lanes are ~3.5 m). 0.0 restores the unbounded detour.
+    max_avoidance_offset: 2.0
+    # Distance at which the projection guide starts growing toward its full radius.
+    # Without it the projection switches on as a one-tick multi-metre sideways step
+    # and the controller tracks that step with a lunge. The OCP keeps the full,
+    # unramped keep-out at all times — this shapes only the tracking target.
+    # NOTE: the detour bound above is evaluated against the RAMPED radius, so the
+    # stop-vs-swerve decision cannot fire before the ramp is well underway. At
+    # 8 m/s the ramp completes ~10 m out (sample_time * horizon * v) and the 2.0 m
+    # bound is crossed ~16 m out, still ahead of the ~11 m braking distance — that
+    # margin shrinks if this distance is lowered or the route speed is raised.
+    keepout_engagement_distance: 25.0
+    # No-progress watchdog: zero the command when a drive command is applied but
+    # neither the reference index nor the position moves. 8.0 s (default 5.0)
+    # because a CARLA ego can legitimately sit near-stationary at full throttle for
+    # ~5 s while pulling away from the spawn.
+    progress_watchdog_timeout: 8.0
     # Slack penalties are restart-only generated-cost settings. The linear term
     # keeps shallow margin use expensive; the quadratic term dominates deep
     # penetration while retaining a recovery path if the initial state is already

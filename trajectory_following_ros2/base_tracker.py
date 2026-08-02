@@ -49,6 +49,113 @@ _STALE_ODOM_THRESHOLD_S = 0.5  # seconds before odom is considered stale
 _SILENT_OBSTACLE_FEED_S = 2.0
 
 
+class ProgressWatchdog:
+    """Detect sustained commanded motion without index or planar progress."""
+
+    def __init__(self, timeout: float = 5.0, displacement_threshold: float = 0.5):
+        self.timeout = float(timeout)
+        self.displacement_threshold = float(displacement_threshold)
+        self._anchor = None
+
+    def reset(self) -> None:
+        self._anchor = None
+
+    def update(self, now: float, current_idx: int, position, speed: float,
+               applied_speed: float, applied_accel: float,
+               max_accel: float = 1.0,
+               final_goal_reached: bool = False) -> bool:
+        """Return true once the no-progress condition has held for ``timeout``."""
+        position = np.asarray(position, dtype=float)
+        intentional_stop = abs(applied_speed) < 0.1 and applied_accel <= 0.0
+        reverse_command = applied_speed < -0.1
+        low_speed = abs(speed) < 0.2
+        drive_command = (abs(applied_speed) >= 0.1
+                         or applied_accel > 0.5 * abs(max_accel))
+
+        if self._anchor is not None:
+            _, anchor_idx, anchor_position = self._anchor
+            progressed = (current_idx > anchor_idx
+                          or np.linalg.norm(position - anchor_position)
+                          > self.displacement_threshold)
+        else:
+            progressed = False
+
+        if (final_goal_reached or intentional_stop or reverse_command or progressed
+                or not low_speed or not drive_command):
+            self._anchor = (float(now), int(current_idx), position.copy())
+            return False
+        if self._anchor is None:
+            self._anchor = (float(now), int(current_idx), position.copy())
+            return False
+        return float(now) - self._anchor[0] >= self.timeout
+
+
+class AvoidanceStopLatch:
+    """Hysteresis for stop-instead-of-swerve decisions keyed by obstacle group."""
+
+    def __init__(self, release_ratio: float = 0.8):
+        self.release_ratio = float(release_ratio)
+        self._active = set()
+
+    def clear(self) -> None:
+        self._active.clear()
+
+    def update(self, required_offsets: dict, bound: float) -> set:
+        if bound <= 0.0:
+            self.clear()
+            return set()
+        current = set(required_offsets)
+        self._active.intersection_update(current)
+        release = self.release_ratio * bound
+        for key, required in required_offsets.items():
+            if key in self._active:
+                if required < release:
+                    self._active.remove(key)
+            elif required > bound:
+                self._active.add(key)
+        return set(self._active)
+
+
+def obstacle_shape_discs(shape: str, dimensions, position, yaw: float = 0.0,
+                         decompose_boxes: bool = False, max_discs: int = 3,
+                         min_radius: float = 0.3):
+    """Return planar ``[x, y, radius]`` discs for one reported obstacle shape.
+
+    The second return value reports a zero-radius detection before the configured
+    floor was applied, allowing the ROS callback to emit a throttled warning.
+    """
+    dimensions = list(dimensions)
+    x, y = float(position[0]), float(position[1])
+    raw_radius = None
+    states = []
+    if shape == 'SPHERE' and dimensions:
+        raw_radius = float(dimensions[0])
+    elif shape == 'CYLINDER' and len(dimensions) >= 2:
+        raw_radius = float(dimensions[1])
+    elif shape == 'BOX' and len(dimensions) >= 3:
+        length, width = map(float, dimensions[:2])
+        aspect = length / width if width > 0.0 else 0.0
+        if decompose_boxes and length > 0.0 and width > 0.0 and aspect > 1.5:
+            count = min(int(math.ceil(aspect)), max(1, int(max_discs)))
+            half_length = (length / count) / 2.0
+            raw_radius = math.hypot(half_length, width / 2.0)
+            axis = np.array([math.cos(yaw), math.sin(yaw)])
+            extent = length / 2.0 - half_length
+            fractions = np.linspace(-1.0, 1.0, count) if count > 1 else [0.0]
+            states = [[x + axis[0] * extent * fraction,
+                       y + axis[1] * extent * fraction,
+                       max(raw_radius, float(min_radius))]
+                      for fraction in fractions]
+        else:
+            raw_radius = math.hypot(length, width) / 2.0 / 1.3
+    if raw_radius is None:
+        return [], False
+    degenerate = raw_radius == 0.0
+    if not states:
+        states = [[x, y, max(raw_radius, float(min_radius))]]
+    return states, degenerate
+
+
 class BaseTrajectoryTracker(Node, ABC):
     """
     Common ROS 2 boilerplate for all trajectory tracking controllers.
@@ -117,6 +224,7 @@ class BaseTrajectoryTracker(Node, ABC):
                 'applied_accel', 'applied_steering', 'applied_speed',
                 'tick_interval_ms', 'reference_ms', 'obstacle_ms', 'solver_wall_ms',
                 'pre_log_ms', 'previous_log_write_ms',
+                'avoidance_stop',
             ])
             self._solver_log_fh.flush()
             self.get_logger().info(f'Solver stats logging to {path}')
@@ -398,6 +506,7 @@ class BaseTrajectoryTracker(Node, ABC):
                 f"{timing.get('solver_wall_ms', float('nan')):.4f}",
                 f"{timing.get('pre_log_ms', float('nan')):.4f}",
                 f'{previous_log_ms:.4f}',
+                int(bool(getattr(self, '_avoidance_stop_active', False))),
             ])
             self._solver_log_fh.flush()
             self._last_solver_log_ms = (time.monotonic() - log_started) * 1e3
@@ -523,6 +632,11 @@ class BaseTrajectoryTracker(Node, ABC):
         # Extra keep-out buffer added to (ego_radius + obstacle_radius) when building
         # the obstacle constraint. Restart-only (baked into the OCP at build time).
         self.declare_parameter('safe_distance', 0.5)
+        self.declare_parameter('decompose_obstacle_boxes', False)
+        self.declare_parameter('obstacle_max_discs', 3)
+        self.declare_parameter('min_obstacle_radius', 0.3)
+        self.declare_parameter('max_avoidance_offset', 0.0)
+        self.declare_parameter('keepout_engagement_distance', 0.0)
         self.declare_parameter('obstacle_topic', 'fake_obstacles/object_array')
         self.declare_parameter('obstacle_collision_avoidance_method', 'euclidean')
         # Propagate each obstacle over the horizon at the constant velocity reported in
@@ -534,6 +648,8 @@ class BaseTrajectoryTracker(Node, ABC):
         # runs and its diagnostics are logged every tick — it just never intervenes —
         # so an A/B run compares identical CSV columns.
         self.declare_parameter('obstacle_braking_envelope', True)
+        self.declare_parameter('progress_watchdog_enabled', True)
+        self.declare_parameter('progress_watchdog_timeout', 5.0)
         self.declare_parameter('actuator_feedback_topic', '')
         self.declare_parameter('delay_compensation_enabled', False)
         self.declare_parameter('delay_compensation_method', 'forward_simulation')
@@ -636,13 +752,25 @@ class BaseTrajectoryTracker(Node, ABC):
         self.debug = self._gp('debug')
         self._num_obstacles = self._gp('num_obstacles')
         self._predict_obstacle_motion = self._gp('predict_obstacle_motion')
+        self.decompose_obstacle_boxes = bool(self._gp('decompose_obstacle_boxes'))
+        self.obstacle_max_discs = max(1, int(self._gp('obstacle_max_discs')))
+        self.min_obstacle_radius = max(0.0, float(self._gp('min_obstacle_radius')))
+        self.max_avoidance_offset = max(0.0, float(self._gp('max_avoidance_offset')))
+        self.keepout_engagement_distance = max(
+            0.0, float(self._gp('keepout_engagement_distance')))
         self.obstacle_braking_envelope = bool(self._gp('obstacle_braking_envelope'))
+        self.progress_watchdog_enabled = bool(self._gp('progress_watchdog_enabled'))
+        self.progress_watchdog_timeout = max(
+            0.0, float(self._gp('progress_watchdog_timeout')))
         # Latched safety hold: armed on the first envelope fire, released only once
         # the keep-out margin recovers (see _control_timer_callback). Without the
         # latch the envelope zeroes single ticks while the solver's creep command is
         # applied on the alternating ticks, ratcheting the vehicle into contact.
         self._safety_hold = False
         self._brake_speed_bound = float('inf')
+        self._progress_watchdog = ProgressWatchdog(self.progress_watchdog_timeout)
+        self._avoidance_stop_latch = AvoidanceStopLatch()
+        self._avoidance_stop_active = False
         self.dt = self.sample_time = 1.0 / self.control_rate
         if not self.prediction_time:
             self.prediction_time = self.sample_time * self.horizon
@@ -1090,21 +1218,27 @@ class BaseTrajectoryTracker(Node, ABC):
                 obj.shape.CYLINDER: 'CYLINDER',
             }.get(obj.shape.type, 'BOX')
 
-            if shape == 'SPHERE' and obj.shape.dimensions:
-                radius = obj.shape.dimensions[0]
-            elif shape == 'CYLINDER' and len(obj.shape.dimensions) >= 2:
-                radius = obj.shape.dimensions[1]
-            elif shape == 'BOX' and len(obj.shape.dimensions) >= 3:
-                l, w, h = obj.shape.dimensions[:3]
-                radius = (math.sqrt(l**2 + w**2 + h**2) / 2) / 1.3
-            else:
+            quat = obj.pose.orientation
+            yaw = tf_transformations.euler_from_quaternion(
+                [quat.x, quat.y, quat.z, quat.w])[2]
+            states, degenerate = obstacle_shape_discs(
+                shape, obj.shape.dimensions, pos, yaw=yaw,
+                decompose_boxes=self.decompose_obstacle_boxes,
+                max_discs=self.obstacle_max_discs,
+                min_radius=self.min_obstacle_radius)
+            if not states:
                 continue
-
-            obstacles.append({
-                'id': int(obj.id),
-                'state': [pos[0], pos[1], radius],
-                'velocity': [obj.twist.linear.x, obj.twist.linear.y],
-            })
+            if degenerate:
+                self.get_logger().warn(
+                    f'Obstacle {int(obj.id)} reported zero-size geometry; applying '
+                    f'min_obstacle_radius={self.min_obstacle_radius:.3f} m.',
+                    throttle_duration_sec=10.0)
+            for state in states:
+                obstacles.append({
+                    'id': int(obj.id),
+                    'state': state,
+                    'velocity': [obj.twist.linear.x, obj.twist.linear.y],
+                })
 
         self.obstacles = obstacles
 
@@ -1272,7 +1406,8 @@ class BaseTrajectoryTracker(Node, ABC):
         self._solver.update_obstacles(self.obstacle_states)  # type: ignore[attr-defined]
 
     def _merge_overlapping_keepouts(self, centres: np.ndarray,
-                                    keepouts: np.ndarray):
+                                    keepouts: np.ndarray,
+                                    obstacle_ids=None):
         """Group keep-outs whose mutual gap is too narrow to drive through.
 
         Two keep-out circles separated by less than an ego radius leave a corridor
@@ -1308,10 +1443,20 @@ class BaseTrajectoryTracker(Node, ABC):
 
         proj_centres, proj_radii, groups = [], [], []
         for members in clusters.values():
+            same_parent = (obstacle_ids is not None
+                           and len({obstacle_ids[i] for i in members}) == 1)
             if len(members) == 1:
                 i = members[0]
                 proj_centres.append(centres[i])
                 proj_radii.append(float(keepouts[i]))
+            elif same_parent:
+                # A decomposed BOX is a longitudinal chain of discs. Enclosing that
+                # chain recreates (and can exceed) the oversized single-circle detour
+                # decomposition is meant to remove. The OCP still constrains every
+                # sub-disc; this projection-only circle shares one side decision at
+                # the parent centre and uses the tight lateral sub-disc radius.
+                proj_centres.append(centres[members].mean(axis=0))
+                proj_radii.append(max(float(keepouts[i]) for i in members))
             else:
                 # Enclosing circle about the members' mean centre (exact for two
                 # equal circles, conservative otherwise — a slightly generous
@@ -1324,8 +1469,88 @@ class BaseTrajectoryTracker(Node, ABC):
             groups.append(members)
         return np.array(proj_centres), np.array(proj_radii), groups
 
+    def _engaged_keepout_radii(self, xref: np.ndarray, selected: list,
+                               ego_position) -> np.ndarray:
+        """Projection-only keep-out radii with optional distance engagement ramp."""
+        full = self._keepout_radii(selected)
+        engagement = self.keepout_engagement_distance
+        if engagement <= 0.0:
+            return full
+        centres = np.array([o['state'][:2] for o in selected], dtype=float)
+        distance_to_vehicle = np.linalg.norm(
+            centres - np.asarray(ego_position, dtype=float), axis=1)
+        target_speed = float(np.max(np.abs(xref[2, :]))) if xref.shape[1] else 0.0
+        horizon_arc = self.sample_time * self.horizon * target_speed
+        d_full = np.maximum(full, horizon_arc)
+        ramp = np.zeros_like(full)
+        for i, (distance_to_obstacle, full_distance) in enumerate(
+                zip(distance_to_vehicle, d_full)):
+            if distance_to_obstacle <= full_distance:
+                ramp[i] = 1.0
+            elif distance_to_obstacle >= engagement:
+                ramp[i] = 0.0
+            elif engagement > full_distance:
+                ramp[i] = ((engagement - distance_to_obstacle)
+                           / (engagement - full_distance))
+        return full * np.clip(ramp, 0.0, 1.0)
+
+    def _projection_group_offsets(self, xref: np.ndarray, centres: np.ndarray,
+                                  radii: np.ndarray, groups: list,
+                                  selected: list) -> dict:
+        """Required lateral displacement for each merged projection group."""
+        required = {}
+        offsets = self.effective_ego_disc_offsets()
+        for centre, radius, group in zip(centres, radii, groups):
+            key = frozenset(selected[i]['id'] for i in group)
+            hint_key = min(key)
+            candidate, _, _ = trajectory_utils.project_reference_out_of_keepouts(
+                xref.copy(), np.asarray([centre]), np.asarray([radius]),
+                side_hints=[self._keepout_side_hints.get(hint_key, 0)],
+                disc_offsets=offsets)
+            displacement = np.hypot(
+                candidate[0, :] - xref[0, :], candidate[1, :] - xref[1, :])
+            required[key] = max(required.get(key, 0.0), float(displacement.max()))
+        return required
+
+    def _first_keepout_intrusion(self, xref: np.ndarray, selected: list) -> int:
+        """First raw-reference stage that intrudes any selected full keep-out."""
+        inside = np.zeros(xref.shape[1], dtype=bool)
+        offsets = self.effective_ego_disc_offsets()
+        for obs, keepout in zip(selected, self._keepout_radii(selected)):
+            centre = np.asarray(obs['state'][:2], dtype=float)
+            dx = xref[0, :] - centre[0]
+            dy = xref[1, :] - centre[1]
+            radial = np.arctan2(dy, dx)
+            stand_off = trajectory_utils.rear_axle_keepout_radius(
+                float(keepout) + 0.05, offsets, xref[3, :] - radial)
+            inside |= np.hypot(dx, dy) < stand_off
+        hits = np.flatnonzero(inside)
+        return int(hits[0]) if hits.size else xref.shape[1] - 1
+
+    def _stop_before_keepout_reference(self, xref: np.ndarray,
+                                       selected: list) -> np.ndarray:
+        """Keep raw geometry and impose a deceleration-feasible speed reference."""
+        stopped = xref.copy()
+        first = self._first_keepout_intrusion(xref, selected)
+        segment_lengths = np.hypot(np.diff(xref[0, :]), np.diff(xref[1, :]))
+        distance_to_entry = np.zeros(first + 1)
+        if first > 0:
+            distance_to_entry[:-1] = np.cumsum(segment_lengths[:first][::-1])[::-1]
+        available = np.maximum(
+            distance_to_entry - float(self._gp('safe_distance')), 0.0)
+        speed = np.maximum(stopped[2, :], 0.0)
+        speed[:first + 1] = np.minimum(
+            speed[:first + 1],
+            np.sqrt(2.0 * max(abs(float(self.MAX_DECEL)), 1e-6) * available))
+        speed[first:] = 0.0
+        for stage in range(1, speed.size):
+            speed[stage] = min(speed[stage], speed[stage - 1])
+        stopped[2, :] = speed
+        return stopped
+
     def _project_reference_out_of_keepouts(self, xref: np.ndarray,
-                                           selected: list) -> np.ndarray:
+                                           selected: list,
+                                           ego_pose=None) -> np.ndarray:
         """Sweep reference points that fall inside an obstacle keep-out onto its boundary.
 
         A reference threading a keep-out hands the tracking cost a target the
@@ -1341,12 +1566,19 @@ class BaseTrajectoryTracker(Node, ABC):
         returns a projected copy, leaving ``self.xref`` (and so the reference debug
         topic) as the raw reference.
         """
+        self._avoidance_stop_active = False
         if not selected:
+            self._avoidance_stop_latch.clear()
             return xref
 
         centres = np.array([o['state'][:2] for o in selected], dtype=float)
+        if ego_pose is None:
+            ego_pose = (self.x, self.y, self.yaw)
+        projection_radii = self._engaged_keepout_radii(
+            xref, selected, ego_pose[:2])
         proj_centres, proj_radii, groups = self._merge_overlapping_keepouts(
-            centres, self._keepout_radii(selected))
+            centres, projection_radii,
+            obstacle_ids=[o['id'] for o in selected])
         if len(groups) < len(selected):
             self.get_logger().info(
                 f'{len(selected)} obstacle keep-outs merged into {len(groups)} '
@@ -1362,12 +1594,23 @@ class BaseTrajectoryTracker(Node, ABC):
         # projection's own "negotiation over, next encounter re-decides" reset.
         hint_keys = [min(selected[i]['id'] for i in g) for g in groups]
         hints = [self._keepout_side_hints.get(k, 0) for k in hint_keys]
-        xref, _, hints = trajectory_utils.project_reference_out_of_keepouts(
+        projected, _, hints = trajectory_utils.project_reference_out_of_keepouts(
             xref.copy(), proj_centres, proj_radii,
             side_hints=hints, disc_offsets=self.effective_ego_disc_offsets())
         self._keepout_side_hints = {
             selected[i]['id']: h for g, h in zip(groups, hints) for i in g}
-        return xref
+        bound = self.max_avoidance_offset
+        if bound <= 0.0:
+            self._avoidance_stop_latch.clear()
+            return projected
+
+        required = self._projection_group_offsets(
+            xref, proj_centres, proj_radii, groups, selected)
+        active = self._avoidance_stop_latch.update(required, bound)
+        if not active:
+            return projected
+        self._avoidance_stop_active = True
+        return self._stop_before_keepout_reference(xref, selected)
 
     def _last_command_is_saturated(self, atol: float = 1e-6) -> bool:
         """Return whether the last applied command sits on any configured limit."""
@@ -1478,6 +1721,7 @@ class BaseTrajectoryTracker(Node, ABC):
 
         # 4. Final-goal latch: once the run is complete (and not looping), hold zero.
         if self.final_goal_reached:
+            self._progress_watchdog.reset()
             self._publish_zero_command()
             return
 
@@ -1578,7 +1822,8 @@ class BaseTrajectoryTracker(Node, ABC):
         self._warn_if_obstacle_feed_silent()
         selected = self._select_obstacles(xref, (x, y, psi))
         self._pack_obstacle_states(selected)
-        projected_xref = self._project_reference_out_of_keepouts(xref, selected)
+        projected_xref = self._project_reference_out_of_keepouts(
+            xref, selected, ego_pose=(x, y, psi))
         obstacle_ms = (time.monotonic() - obstacle_started) * 1e3
 
         solve_started = time.monotonic()
@@ -1650,10 +1895,6 @@ class BaseTrajectoryTracker(Node, ABC):
 
         if not safety_reason:
             if result.is_optimal:
-                if not self._u_prev_from_echo:
-                    with self.mutex:
-                        self.u_prev[:, 0] = result.u_prev
-
                 # Unpack result (only the optimal solve updates the applied command).
                 self.acc_cmd = result.accel_cmd
                 self.delta_cmd = result.steering_cmd
@@ -1690,6 +1931,25 @@ class BaseTrajectoryTracker(Node, ABC):
             applied = brake_cmd if brake_cmd is not None else (0.0, 0.0, 0.0)
         else:
             applied = (self.acc_cmd, self.delta_cmd, self.velocity_cmd)
+
+        if self.progress_watchdog_enabled:
+            no_progress = self._progress_watchdog.update(
+                time.monotonic(), self.current_idx, (x, y), vel,
+                applied_speed=applied[2], applied_accel=applied[0],
+                max_accel=self.MAX_ACCEL,
+                final_goal_reached=self.final_goal_reached)
+        else:
+            self._progress_watchdog.reset()
+            no_progress = False
+        if no_progress and not safety_reason:
+            safety_reason = 'no_progress'
+            applied = (0.0, 0.0, 0.0)
+
+        # A safety intervention must freeze the solver warm-start input. Delay this
+        # update until every applied-command decision, including the watchdog, is final.
+        if not safety_reason and result.is_optimal and not self._u_prev_from_echo:
+            with self.mutex:
+                self.u_prev[:, 0] = result.u_prev
         self._log_solver_stats(result, selected, timing={
             'tick_interval_ms': tick_interval_ms,
             'reference_ms': reference_ms,
@@ -2141,6 +2401,42 @@ class BaseTrajectoryTracker(Node, ABC):
                 self.obstacle_braking_envelope = bool(param.value)
                 if not self.obstacle_braking_envelope:
                     self._safety_hold = False
+            elif param.name == 'progress_watchdog_enabled':
+                self.progress_watchdog_enabled = bool(param.value)
+                if not self.progress_watchdog_enabled:
+                    self._progress_watchdog.reset()
+            elif param.name == 'progress_watchdog_timeout':
+                if float(param.value) < 0.0:
+                    success = False
+                    self.get_logger().error(
+                        'Rejected progress_watchdog_timeout: expected seconds >= 0.')
+                else:
+                    self.progress_watchdog_timeout = float(param.value)
+                    self._progress_watchdog.timeout = self.progress_watchdog_timeout
+                    self._progress_watchdog.reset()
+            elif param.name == 'min_obstacle_radius':
+                if float(param.value) < 0.0:
+                    success = False
+                    self.get_logger().error(
+                        'Rejected min_obstacle_radius: expected metres >= 0.')
+                else:
+                    self.min_obstacle_radius = float(param.value)
+            elif param.name == 'max_avoidance_offset':
+                if float(param.value) < 0.0:
+                    success = False
+                    self.get_logger().error(
+                        'Rejected max_avoidance_offset: expected metres >= 0.')
+                else:
+                    self.max_avoidance_offset = float(param.value)
+                    if self.max_avoidance_offset == 0.0:
+                        self._avoidance_stop_latch.clear()
+            elif param.name == 'keepout_engagement_distance':
+                if float(param.value) < 0.0:
+                    success = False
+                    self.get_logger().error(
+                        'Rejected keepout_engagement_distance: expected metres >= 0.')
+                else:
+                    self.keepout_engagement_distance = float(param.value)
             elif param.name == 'desired_speed':
                 self.desired_speed = param.value
             elif param.name == 'loop':

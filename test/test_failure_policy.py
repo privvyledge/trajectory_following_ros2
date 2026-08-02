@@ -245,7 +245,8 @@ def test_stats_header_and_row_have_matching_widths(tmp_path):
     assert len(header) == len(row)
     for name in ('safety_stop', 'safety_reason', 'physical_clearance',
                  'closing_speed', 'stopping_room',
-                 'applied_accel', 'applied_steering', 'applied_speed'):
+                 'applied_accel', 'applied_steering', 'applied_speed',
+                 'avoidance_stop'):
         assert name in header
     assert header.index('safety_stop') == SAFETY_STOP
     assert header.index('applied_accel') == APPLIED.start
