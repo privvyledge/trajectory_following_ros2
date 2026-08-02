@@ -23,7 +23,18 @@
     horizon: 25
     sample_time: 0.05
     prediction_time: 1.25
-    max_iter: 200
+    # max_iter is a TIME BUDGET, not a convergence knob — the adapter accepts a
+    # budget-limited (status=2) iterate RTI-style, so a capped solve is not a
+    # failure. 200 was over budget on the live CARLA run: ~15 solves per route hit
+    # exactly sqp_iter=200 at 52-60 ms wall (warn budget 40 ms, tick 50 ms) while
+    # every other solve converged in 1-3 ms and CTE was 0.000 m on the straights
+    # where they fired. That is the SQP limit-cycling on the stationarity residual,
+    # not slow convergence, so the extra iterations bought nothing and only
+    # lengthened the stall. Per-iteration cost measured ~0.27 ms (53.4 ms / 200),
+    # so 50 bounds the worst case near ~14 ms with ample margin. Raising it back
+    # will not "fix" a status-2 flood; it only makes the overruns longer.
+    # (The obstacle config caps harder still, at 20 — see carla_acados_obstacle.yaml.)
+    max_iter: 50
     termination_condition: 0.0001
 
     Q:  [5.0, 5.0, 15.0, 0.05]
