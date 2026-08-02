@@ -48,6 +48,7 @@ def generate_launch_description():
     ode_type = LaunchConfiguration('ode_type')
     use_opti = LaunchConfiguration('use_opti')
     num_obstacles = LaunchConfiguration('num_obstacles')
+    obstacle_topic = LaunchConfiguration('obstacle_topic')
     discrete_model_type = LaunchConfiguration('discrete_model_type')
     discrete_integration_method = LaunchConfiguration('discrete_integration_method')
     load_waypoints = LaunchConfiguration('load_waypoints')
@@ -236,6 +237,18 @@ def generate_launch_description():
                         'launch-time choice, not a weight, so a weights file must not silently '
                         'override the requested count. Obstacle runs also need '
                         'generate_mpc_model:=true.'
+    )
+    obstacle_topic_la = DeclareLaunchArgument(
+            'obstacle_topic',
+            default_value='fake_obstacles/object_array',
+            description='ObjectArray topic the controller constrains against. Defaults to '
+                        'the fake_obstacle_publisher topic; point it at a real perception '
+                        'feed (e.g. a CARLA ros-bridge /carla/<role>/objects) to run '
+                        'against live detections. Use the EGO-SCOPED topic — a world-scoped '
+                        'one reports the ego vehicle itself and would make the car its own '
+                        'keep-out. Detections must already be in global_frame; they are not '
+                        'TF-transformed. Applied AFTER the platform/weights overlays so the '
+                        'launch arg is authoritative.'
     )
     discrete_model_type_la = DeclareLaunchArgument(
             'discrete_model_type',
@@ -542,7 +555,7 @@ def generate_launch_description():
              platform_la, weights_la,
              robot_frame_la, global_frame_la,
              frequency_la, publish_twist_topic_la, wheelbase_la, ode_type_la,
-             use_opti_la, num_obstacles_la,
+             use_opti_la, num_obstacles_la, obstacle_topic_la,
              discrete_model_type_la, discrete_integration_method_la,
              load_waypoints_la, waypoints_csv_la,
              saturate_input_la, allow_reversing_la, max_speed_la, min_speed_la, max_accel_la, max_decel_la,
@@ -794,7 +807,11 @@ def generate_launch_description():
                 # NOTE: num_obstacles is set AFTER the overlays (see below) so the launch
                 # arg wins; it must not be pinned here or in a weights file.
                 SetParameter(name='ego_radius', value=1.0, condition=IfCondition(load_params_from_args)),
-                SetParameter(name='obstacle_topic', value='fake_obstacles/object_array', condition=IfCondition(load_params_from_args)),
+                # obstacle_topic is NOT set here — it is applied AFTER the overlays (see
+                # below) so the launch arg wins, exactly like num_obstacles. It used to be
+                # pinned to the fake-publisher topic at this point with no launch argument
+                # at all, which made a real perception feed (e.g. a CARLA ros-bridge
+                # /carla/<role>/objects) unreachable from the launch line.
                 SetParameter(name='obstacle_collision_avoidance_method', value="euclidean", condition=IfCondition(load_params_from_args)),
 
                 # Waypoint Parameters
@@ -828,6 +845,13 @@ def generate_launch_description():
                 # pin the count (value_type=int coerces the launch-arg string to integer).
                 SetParameter(name='num_obstacles',
                              value=ParameterValue(num_obstacles, value_type=int),
+                             condition=IfCondition(load_params_from_args)),
+                # Which topic the CONTROLLER takes detections from. Also applied LAST: the
+                # feed is an explicit launch choice and a weights/platform file must not
+                # silently redirect it. Point it at an ego-scoped perception topic to run
+                # against live detections; a world-scoped one reports the ego itself and
+                # would make the vehicle its own keep-out.
+                SetParameter(name='obstacle_topic', value=obstacle_topic,
                              condition=IfCondition(load_params_from_args)),
 
                 # Load nodes

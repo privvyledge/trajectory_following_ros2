@@ -211,7 +211,11 @@ def generate_launch_description():
                         'config (solver_type/solver/max_iter/discrete_*) below.'),
         DeclareLaunchArgument(
             'obstacle_topic', default_value='fake_obstacles/object_array',
-            description='Topic where fake obstacles are published (ObjectArray).'),
+            description='ObjectArray topic the controller constrains against and the '
+                        'visualizer draws. Point it at a real perception feed (e.g. a '
+                        'CARLA ros-bridge /carla/<role>/objects) to run against live '
+                        'detections; use the ego-scoped topic, since a world-scoped one '
+                        'reports the ego itself and makes the car its own keep-out.'),
         DeclareLaunchArgument(
             'footprint_topic', default_value='',
             description='Topic where Nav2 footprint is published (PolygonStamped).'),
@@ -605,9 +609,19 @@ def generate_launch_description():
                 solver_failure_zero_on_saturation, value_type=bool),
         }
 
+        # Which topic the CONTROLLER takes detections from. Previously `obstacle_topic`
+        # reached the visualizer only, so retargeting the feed (e.g. to a CARLA
+        # ros-bridge `/carla/<role>/objects`) left the controller subscribed to the
+        # default fake-publisher topic — drawn obstacles, none constrained. Applied
+        # after the overlays for the same reason `num_obstacles` is: the feed is an
+        # explicit launch choice a weights file must not silently redirect.
+        obstacle_feed_params = {
+            'obstacle_topic': obstacle_topic,
+        }
+
         def _params(solver_dict, tail_dict):
             return ([params_file, reference_params, solver_dict] + overlays
-                    + [failure_policy_params, tail_dict])
+                    + [failure_policy_params, obstacle_feed_params, tail_dict])
 
         return [
             Node(
