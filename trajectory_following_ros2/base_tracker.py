@@ -1176,11 +1176,20 @@ class BaseTrajectoryTracker(Node, ABC):
         distance scores both ~0 and breaks the tie arbitrarily — which can pick the
         farther one and reinstate the very bug this ranking removes.
         """
-        if not self._obstacles_are_active() or not self.obstacles:
+        # Bind the cached list ONCE. ``_obstacle_callback`` runs on another executor
+        # thread and rebinds ``self.obstacles`` to a fresh list; re-reading the
+        # attribute below would let the length change mid-ranking, so the per-obstacle
+        # arrays built here would be indexed by a different obstacle count (IndexError,
+        # which kills the controller and leaves the last command latched). A stale-but-
+        # consistent snapshot is the intended contract — that is why the callback needs
+        # no mutex. Feeds with a fixed object count never expose this; a live perception
+        # feed whose count varies as actors appear and disappear does.
+        obstacles = self.obstacles
+        if not self._obstacles_are_active() or not obstacles:
             return []
 
-        centres = np.array([o['state'][:2] for o in self.obstacles], dtype=float)
-        keepout = self._keepout_radii(self.obstacles)
+        centres = np.array([o['state'][:2] for o in obstacles], dtype=float)
+        keepout = self._keepout_radii(obstacles)
         # One entry per (stage, disc): an obstacle the body reaches must rank as an
         # intruder even when the rear-axle point itself stays clear of the keep-out.
         # Discs stay grouped by stage so a column index still maps back to its stage.
@@ -1201,9 +1210,9 @@ class BaseTrajectoryTracker(Node, ABC):
         closest = dist.min(axis=1)
 
         keys = [(0, int(first_stage[i]), 0.0) if bites[i] else (1, 0, float(closest[i]))
-                for i in range(len(self.obstacles))]
-        order = sorted(range(len(self.obstacles)), key=keys.__getitem__)
-        return [self.obstacles[i] for i in order[:self._num_obstacles]]
+                for i in range(len(obstacles))]
+        order = sorted(range(len(obstacles)), key=keys.__getitem__)
+        return [obstacles[i] for i in order[:self._num_obstacles]]
 
     def _warn_if_obstacle_feed_silent(self) -> None:
         """Warn (throttled) when obstacle avoidance is configured but nothing arrives.

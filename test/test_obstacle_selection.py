@@ -433,3 +433,42 @@ def test_merged_projection_routes_the_reference_around_the_pair():
     for cx, cy in ((1.5, 0.55), (1.5, -0.55)):
         d = np.hypot(projected[0, :] - cx, projected[1, :] - cy)
         assert d.min() >= keepout - 0.05, 'reference must not thread the pinch'
+
+
+def test_selection_survives_a_feed_whose_object_count_changes_mid_rank():
+    """A perception feed whose object count changes between reads must not crash.
+
+    ``_obstacle_callback`` rebinds ``self.obstacles`` to a fresh list from another
+    executor thread. Ranking that re-read the attribute could therefore build its
+    per-obstacle arrays from one list and index them with another list's length —
+    ``IndexError``, which propagates out of the control timer and kills the controller
+    while the last command stays latched on the actuator. A fixed-count publisher can
+    never expose this; a live feed whose count varies as actors appear and disappear
+    does. The fix is a single read, so the tick works from a stale-but-consistent
+    snapshot.
+
+    The stub returns the short list for the first three reads and the long list after,
+    which is exactly the read order the pre-fix code used (guard, centres, radii, then
+    ``len``) — so this test fails with ``IndexError`` against that version.
+    """
+    short = [_obstacle(1, 1.0, 0.0)]
+    grown = [_obstacle(1, 1.0, 0.0), _obstacle(2, 2.0, 0.0), _obstacle(3, 3.0, 0.0)]
+    tracker = _make_tracker(short, num_obstacles=2)
+    reads = []
+
+    class _RebindingFeed(type(tracker)):
+        @property
+        def obstacles(self):
+            reads.append(len(reads))
+            return short if len(reads) <= 3 else grown
+
+        @obstacles.setter
+        def obstacles(self, value):   # the callback's rebind; ignored by the stub
+            pass
+
+    tracker.__class__ = _RebindingFeed
+
+    selected = tracker._select_obstacles(_straight_xref(), (0.0, 0.0, 0.0))
+
+    assert len(reads) == 1, 'ranking must read the cached detections exactly once'
+    assert [o['id'] for o in selected] == [1]
