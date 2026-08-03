@@ -971,6 +971,37 @@ ros2 launch trajectory_following_ros2 mpc.launch.py \
     load_visualizer:=true
 ```
 
+#### Offloading the feed: `merge_obstacle_sources`
+
+`/carla/merged_obstacles` carries ~1235 objects at ~8 Hz. rclpy deserializes all of them
+**inside the controller's executor, before any callback runs** — ~137 ms of CPU per
+message, which saturates that process's GIL and dilates the control tick several-fold.
+`obstacle_ingest_radius` (50 m in both CARLA obstacle YAMLs) runs after deserialization,
+so it cuts the disc-conversion cost but cannot touch this. Add the aggregator to the
+launch to move that cost into its own process:
+
+```bash
+    merge_obstacle_sources:=true \
+    obstacle_source_topics:="['/carla/merged_obstacles']" \
+    obstacle_source_qos:="['volatile']" \
+    obstacle_gate_radius:=50.0 \
+    obstacle_topic:=/obstacles/object_array \
+```
+
+`obstacle_topic` becomes the aggregator's **output** — replace the
+`obstacle_topic:=/carla/merged_obstacles` line above rather than adding to it, and never
+list the output topic among the sources. Expect the aggregator to sit near 100% of one
+core; that is the point. Add a second entry to both arrays (with `'transient_local'` for a
+latched static publisher) to merge more feeds; ids are namespaced per source so the
+controller's per-obstacle go-around hysteresis cannot cross-apply between them.
+
+Sanity check while it runs:
+
+```bash
+ros2 topic hz /obstacles/object_array
+ros2 topic echo /obstacles/object_array --once --full-length | grep -c "^  id:"
+```
+
 The pre-decomposition configurations completed the six-obstacle route with 0 physical
 overlaps on 2026-08-02, but that evidence does not validate the new box decomposition,
 offset bound, or engagement ramp. Re-run both commands above after rebuilding.

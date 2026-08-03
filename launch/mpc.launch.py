@@ -9,6 +9,7 @@ Remap nav2 path topic to
 """
 
 import os
+from typing import List
 
 import numpy as np
 
@@ -49,6 +50,10 @@ def generate_launch_description():
     use_opti = LaunchConfiguration('use_opti')
     num_obstacles = LaunchConfiguration('num_obstacles')
     obstacle_topic = LaunchConfiguration('obstacle_topic')
+    merge_obstacle_sources = LaunchConfiguration('merge_obstacle_sources', default=False)
+    obstacle_source_topics = LaunchConfiguration('obstacle_source_topics')
+    obstacle_source_qos = LaunchConfiguration('obstacle_source_qos')
+    obstacle_gate_radius = LaunchConfiguration('obstacle_gate_radius')
     discrete_model_type = LaunchConfiguration('discrete_model_type')
     discrete_integration_method = LaunchConfiguration('discrete_integration_method')
     load_waypoints = LaunchConfiguration('load_waypoints')
@@ -252,6 +257,38 @@ def generate_launch_description():
                         'keep-out. Detections must already be in global_frame; they are not '
                         'TF-transformed. Applied AFTER the platform/weights overlays so the '
                         'launch arg is authoritative.'
+    )
+    merge_obstacle_sources_la = DeclareLaunchArgument(
+            'merge_obstacle_sources',
+            default_value='False',
+            description='Launch the obstacle_aggregator node, which merges the '
+                        'obstacle_source_topics feeds into one and gates them to '
+                        'obstacle_gate_radius around the vehicle. Point obstacle_topic at '
+                        'its output (obstacles/object_array by default). Off by default, so '
+                        'single-source setups are untouched.'
+    )
+    obstacle_source_topics_la = DeclareLaunchArgument(
+            'obstacle_source_topics',
+            default_value="['/carla/merged_obstacles']",
+            description='ObjectArray topics the aggregator merges (Python-list syntax). '
+                        'Only used when merge_obstacle_sources:=True.'
+    )
+    obstacle_source_qos_la = DeclareLaunchArgument(
+            'obstacle_source_qos',
+            default_value="['volatile']",
+            description="Per-source durability, parallel to obstacle_source_topics: "
+                        "'volatile' or 'transient_local'. A transient_local source is "
+                        'treated as latched static content — it is picked up on late join '
+                        'and never aged out by source_timeout.'
+    )
+    obstacle_gate_radius_la = DeclareLaunchArgument(
+            'obstacle_gate_radius',
+            default_value='0.0',
+            description='Metres around the vehicle the aggregator forwards obstacles from; '
+                        '0.0 = forward everything. Sized from the worst-case horizon reach. '
+                        'This is what keeps a map-scale feed (CARLA publishes ~1235 objects) '
+                        'from being deserialized in the controller process, where it '
+                        'saturates the GIL and dilates the control tick.'
     )
     discrete_model_type_la = DeclareLaunchArgument(
             'discrete_model_type',
@@ -559,6 +596,8 @@ def generate_launch_description():
              robot_frame_la, global_frame_la,
              frequency_la, publish_twist_topic_la, wheelbase_la, ode_type_la,
              use_opti_la, num_obstacles_la, obstacle_topic_la,
+             merge_obstacle_sources_la, obstacle_source_topics_la,
+             obstacle_source_qos_la, obstacle_gate_radius_la,
              discrete_model_type_la, discrete_integration_method_la,
              load_waypoints_la, waypoints_csv_la,
              saturate_input_la, allow_reversing_la, max_speed_la, min_speed_la, max_accel_la, max_decel_la,
@@ -707,6 +746,28 @@ def generate_launch_description():
                 # params_file,
                 common_parameters,
             ],
+    )
+
+    # Merges N obstacle feeds into the single topic the controller subscribes to, and
+    # gates them to obstacle_gate_radius. Its own process, deliberately: the per-message
+    # deserialization of a map-scale feed is what starves the control loop's GIL.
+    obstacle_aggregator_node = Node(
+            condition=IfCondition(merge_obstacle_sources),
+            package='trajectory_following_ros2',
+            executable='obstacle_aggregator',
+            name='obstacle_aggregator',
+            output='screen',
+            parameters=[{
+                'input_topics': ParameterValue(obstacle_source_topics, value_type=List[str]),
+                'input_qos': ParameterValue(obstacle_source_qos, value_type=List[str]),
+                # The controller's feed IS this node's output, so the two can never be
+                # pointed at different topics by accident. Do not list obstacle_topic in
+                # obstacle_source_topics — that would feed the node its own output.
+                'output_topic': ParameterValue(obstacle_topic, value_type=str),
+                'ego_gate_radius': ParameterValue(obstacle_gate_radius, value_type=float),
+                'odom_topic': ParameterValue(odom_topic, value_type=str),
+            }],
+            arguments=['--ros-args', '--log-level', log_level],
     )
 
     visualizer_node = Node(
@@ -859,6 +920,7 @@ def generate_launch_description():
 
                 # Load nodes
                 waypoint_loader_node,
+                obstacle_aggregator_node,
                 acados_mpc_node,
                 casadi_mpc_node,
                 do_mpc_node,
