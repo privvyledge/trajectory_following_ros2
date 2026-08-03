@@ -43,6 +43,7 @@ def _make_tracker(obstacles, num_obstacles=1, predict_motion=True, solver=None):
     tracker._solver = _RecordingSolver() if solver is None else solver
     tracker.horizon = HORIZON
     tracker.sample_time = SAMPLE_TIME
+    tracker.prediction_time = HORIZON * SAMPLE_TIME
     tracker.MAX_DECEL = -3.0
     tracker.n_obstacle_states = 3
     tracker._keepout_side_hints = {}
@@ -477,3 +478,113 @@ def test_selection_survives_a_feed_whose_object_count_changes_mid_rank():
 
     assert len(reads) == 1, 'ranking must read the cached detections exactly once'
     assert [o['id'] for o in selected] == [1]
+
+
+# ---------------------------------------------------------------------------
+# Relevance cutoff — a slot is only worth spending on a detection this solve can
+# reach. Filling every slot with the merely-nearest detection is harmless on a
+# handful of objects and destructive on a live map feed, where it hands the
+# projection merge a set of bystanders to fuse into a phantom keep-out.
+# ---------------------------------------------------------------------------
+
+def test_unreachable_static_bystander_does_not_take_a_slot():
+    """Clear of the window by more than the detour bound, with no speed to close it."""
+    on_path = _obstacle(1, 1.0, 0.0)
+    bystander = _obstacle(2, 1.0, 6.0)      # 6 m off, keep-out 0.6 -> 5.4 m clear
+    tracker = _make_tracker([bystander, on_path], num_obstacles=2)
+    tracker.max_avoidance_offset = 2.0
+
+    selected = tracker._select_obstacles(_straight_xref(), ego_pose=(0.0, 0.0, 0.0))
+
+    assert [o['id'] for o in selected] == [1], 'bystander beyond the detour bound must not take a slot'
+
+
+def test_bystander_within_the_detour_bound_keeps_its_slot():
+    """Inside the swerve envelope it can still bite once the vehicle leaves the line."""
+    on_path = _obstacle(1, 1.0, 0.0)
+    near = _obstacle(2, 1.0, 2.0)          # 2 m off, keep-out 0.6 -> 1.4 m clear < 2.0
+    tracker = _make_tracker([near, on_path], num_obstacles=2)
+    tracker.max_avoidance_offset = 2.0
+
+    selected = tracker._select_obstacles(_straight_xref(), ego_pose=(0.0, 0.0, 0.0))
+
+    assert sorted(o['id'] for o in selected) == [1, 2]
+
+
+def test_fast_crossing_bystander_keeps_its_slot():
+    """Reach grows with the obstacle's own travel over the horizon, so a crossing
+    actor is not dismissed on its current position the way a lamp post is."""
+    on_path = _obstacle(1, 1.0, 0.0)
+    crossing = _obstacle(2, 1.0, 6.0, velocity=(0.0, -8.0))   # 8 m/s * 1.25 s = 10 m
+    tracker = _make_tracker([crossing, on_path], num_obstacles=2)
+    tracker.max_avoidance_offset = 2.0
+
+    selected = tracker._select_obstacles(_straight_xref(), ego_pose=(0.0, 0.0, 0.0))
+
+    assert sorted(o['id'] for o in selected) == [1, 2]
+
+
+def test_unbounded_detour_keeps_the_fill_all_behaviour():
+    """With no bound on the swerve there is no bound to prove irrelevance from."""
+    on_path = _obstacle(1, 1.0, 0.0)
+    bystander = _obstacle(2, 1.0, 50.0)
+    tracker = _make_tracker([bystander, on_path], num_obstacles=2)
+    tracker.max_avoidance_offset = 0.0
+
+    selected = tracker._select_obstacles(_straight_xref(), ego_pose=(0.0, 0.0, 0.0))
+
+    assert sorted(o['id'] for o in selected) == [1, 2]
+
+
+# ---------------------------------------------------------------------------
+# Merge gating — proximity alone over-merges a chain running alongside the route.
+# ---------------------------------------------------------------------------
+
+def test_same_side_chain_is_not_merged_when_the_reference_threads_no_gap():
+    """Roadside furniture in a line beside the route: consecutive members are close
+    enough to trip the distance gate, but the reference passes none of the gaps
+    between them, and the enclosing circle would reach across the carriageway."""
+    a = _obstacle(1, 1.0, 0.9)
+    b = _obstacle(2, 1.6, 0.9)     # 0.6 m apart, both 0.9 m to one side of y=0
+    tracker = _make_tracker([a, b], num_obstacles=2)
+    centres = np.array([[1.0, 0.9], [1.6, 0.9]])
+    keepouts = tracker._keepout_radii([a, b])
+    sides = tracker._keepout_sides(_straight_xref(), centres)
+
+    _, _, gated = tracker._merge_overlapping_keepouts(
+        centres, keepouts, obstacle_ids=[1, 2], sides=sides)
+    _, _, ungated = tracker._merge_overlapping_keepouts(centres, keepouts)
+
+    np.testing.assert_array_equal(sides, [1.0, 1.0])
+    assert len(ungated) == 1, 'distance alone fuses the chain (the behaviour being gated)'
+    assert len(gated) == 2, 'same side of the reference — no gap is threaded, so no merge'
+
+
+def test_genuine_pinch_still_merges_when_the_reference_runs_through_it():
+    a = _obstacle(1, 2.0, 0.6)
+    b = _obstacle(2, 2.0, -0.6)     # straddling y=0: the reference runs between them
+    tracker = _make_tracker([a, b], num_obstacles=2)
+    centres = np.array([[2.0, 0.6], [2.0, -0.6]])
+    sides = tracker._keepout_sides(_straight_xref(), centres)
+
+    _, proj_r, groups = tracker._merge_overlapping_keepouts(
+        centres, tracker._keepout_radii([a, b]), obstacle_ids=[1, 2], sides=sides)
+
+    np.testing.assert_array_equal(sides, [1.0, -1.0])
+    assert len(groups) == 1 and sorted(groups[0]) == [0, 1]
+    assert proj_r[0] == pytest.approx(1.2)
+
+
+def test_sub_discs_of_one_obstacle_merge_regardless_of_side():
+    """A decomposed box is one physical body: its chain must project as one circle
+    even though every sub-disc lies on the same side of the reference."""
+    a = _obstacle(7, 1.0, 0.9)
+    b = _obstacle(7, 1.6, 0.9)
+    tracker = _make_tracker([a, b], num_obstacles=2)
+    centres = np.array([[1.0, 0.9], [1.6, 0.9]])
+    sides = tracker._keepout_sides(_straight_xref(), centres)
+
+    _, _, groups = tracker._merge_overlapping_keepouts(
+        centres, tracker._keepout_radii([a, b]), obstacle_ids=[7, 7], sides=sides)
+
+    assert len(groups) == 1, 'sub-discs of one parent are exempt from the side test'

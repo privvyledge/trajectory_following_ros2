@@ -46,6 +46,7 @@ class VisualizerNode(Node):
 
         self._mutex = threading.Lock()
         self._ref_first_xy = None
+        self._last_ego_xy = None
         self._ref_first_yaw = None
 
         self._backends: list = []
@@ -79,6 +80,13 @@ class VisualizerNode(Node):
         # no controller is running. Empty ('') auto-discovers the controller among the
         # running nodes, which the launch files rename per backend.
         self.declare_parameter('controller_node_name',    '')
+        # Draw only obstacles within this radius of the vehicle (0 = draw every
+        # reported object). A live CARLA feed carries the whole map's static geometry —
+        # 1235 objects on Town01 — and each one costs two patches that the backend
+        # tears down and rebuilds per message, which wedges the matplotlib GUI thread
+        # solid and leaves an apparently blank window. The controller only ever
+        # constrains obstacles near the horizon, so drawing the rest shows nothing.
+        self.declare_parameter('viz_obstacle_radius',     80.0)
         self.declare_parameter('viz_ego_radius',          0.15)
         self.declare_parameter('viz_safe_distance',        0.15)
         self.declare_parameter('viz_ego_disc_offsets',     [0.0])
@@ -226,6 +234,7 @@ class VisualizerNode(Node):
         self.controller_node_name = gp('controller_node_name')
         # Fallbacks only — _setup_keepout_sync replaces these with the controller's
         # live values once it is reachable.
+        self.viz_obstacle_radius = float(gp('viz_obstacle_radius'))
         self.viz_ego_radius = gp('viz_ego_radius')
         self.viz_safe_distance = gp('viz_safe_distance')
         self.viz_ego_disc_offsets = resolve_ego_disc_offsets(gp('viz_ego_disc_offsets'))
@@ -371,6 +380,7 @@ class VisualizerNode(Node):
         self._log('log_vehicle_pose', x, y, yaw, speed, stamp=msg.header.stamp)
 
         with self._mutex:
+            self._last_ego_xy = (x, y)
             ref_xy = self._ref_first_xy
             ref_yaw = self._ref_first_yaw
 
@@ -451,8 +461,14 @@ class VisualizerNode(Node):
 
     def _obstacle_cb(self, msg: 'ObjectArray'):
         obstacles = []
+        with self._mutex:
+            ego_xy = self._last_ego_xy
         for obj in msg.objects:
             pos = [obj.pose.position.x, obj.pose.position.y, obj.pose.position.z]
+            if (self.viz_obstacle_radius > 0.0 and ego_xy is not None
+                    and math.hypot(pos[0] - ego_xy[0],
+                                   pos[1] - ego_xy[1]) > self.viz_obstacle_radius):
+                continue
             q = obj.pose.orientation
             _, _, yaw = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
 

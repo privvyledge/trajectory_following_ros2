@@ -9,7 +9,13 @@
     # Overlay (highest wins): weights > platforms/carla.yaml > base.
     # Launch:
     #   mpc_toolbox:=casadi platform:=carla weights:=carla_casadi_obstacle \
-    #       num_obstacles:=N generate_mpc_model:=true
+    #       num_obstacles:=N generate_mpc_model:=true \
+    #       obstacle_topic:=/carla/merged_obstacles
+    # Feed: /carla/merged_obstacles = dynamic CARLA actors merged with static
+    # level geometry (light poles, sign posts, traffic-light masts). The
+    # dynamic-actors-only predecessor was /carla/ego_vehicle/objects; poles are
+    # invisible on it, which is how a detour hit one. Static geometry competes
+    # for the same num_obstacles slots — watch n_selected / sel_id in the CSV.
     #
     # Unlike the solver_type=qp + ltv path (see f1tenth_casadi_qp_obstacle.yaml),
     # which LINEARIZES the exterior-of-circle keep-out about a per-stage operating
@@ -81,18 +87,22 @@
     # safe_distance, enforced at EACH ego collision disc. The default ros-bridge
     # ego (Tesla Model 3-class) is ~4.69 x 1.85 m with roughly 1.0 m of rear
     # overhang, so the body spans about [-1.0, +3.7] m along x from the rear-axle
-    # reference point. Two circles cover it: each half-rectangle (~2.35 x 1.85 m)
-    # has circumradius hypot(2.35, 1.85)/2 ~= 1.50 m, centred at ~+0.18 and
-    # ~+2.53 m. If your ego blueprint differs, recompute: with body span
-    # [x_rear, x_front] and width w, each half has length L = (x_front - x_rear)/2,
-    # radius = hypot(L, w)/2, centres at x_rear + L/2 and x_front - L/2.
+    # reference point. With n discs each covers a sub-rectangle of length
+    # L = (x_front - x_rear)/n and carries radius = hypot(L, w)/2, centred at
+    # x_rear + L*(k + 1/2).
+    #
+    # FOUR discs, not two: the disc radius is a circumscribing radius applied
+    # omnidirectionally, so at n=2 (1.50 m) it over-states the 0.925 m half-width by
+    # 0.57 m per side. On a ~3.5 m Town01 lane that made every kerbside pole an
+    # active constraint (2.23 m demanded vs 2.1-2.34 m available); n=4 needs 1.82 m
+    # and clears the same furniture by ~0.5 m. See carla_acados_obstacle.yaml.
     #
     # CHANGING ego_disc_offsets CHANGES THE NUMBER OF GENERATED CONSTRAINT ROWS,
     # so it needs generate_mpc_model:=True, exactly like num_obstacles.
     # These three MUST match carla_acados_obstacle.yaml or a CasADi-vs-acados
     # comparison is measuring different geometry.
-    ego_radius: 1.5
-    ego_disc_offsets: [0.18, 2.53]
+    ego_radius: 1.096
+    ego_disc_offsets: [-0.4125, 0.7625, 1.9375, 3.1125]
     # Comfort margin on top of the disc radii. Vehicle-scale (the F1/10 uses
     # 0.15 m); also the spendable band the braking envelope lets the solver use
     # during recovery. Raise it to start detours earlier and carry more speed.
@@ -105,6 +115,11 @@
     # profile, so the car halts short of the keep-out rather than leaving the road
     # (Town01 lanes are ~3.5 m). 0.0 restores the unbounded detour.
     max_avoidance_offset: 2.0
+    # Radius within which a reported object is converted to keep-out discs at all.
+    # Kept in sync with carla_acados_obstacle.yaml, where the reasoning lives: the
+    # merged feed's whole-level geometry costs ~115 ms of CPU per message to convert,
+    # which starves the control thread. 0.0 disables the gate.
+    obstacle_ingest_radius: 50.0
     # Distance at which the projection guide starts growing toward its full radius.
     # Without it the projection switches on as a one-tick multi-metre sideways step;
     # CasADi tracked that step with a +-70 deg lunge and an underdamped rejoin. The

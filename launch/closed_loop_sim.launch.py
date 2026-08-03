@@ -212,9 +212,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'obstacle_topic', default_value='fake_obstacles/object_array',
             description='ObjectArray topic the controller constrains against and the '
-                        'visualizer draws. Point it at a real perception feed (e.g. a '
-                        'CARLA ros-bridge /carla/<role>/objects) to run against live '
-                        'detections; use the ego-scoped topic, since a world-scoped one '
+                        'visualizer draws. Point it at a real perception feed to run '
+                        'against live detections; for CARLA that is /carla/merged_obstacles '
+                        '(dynamic actors + static level geometry such as light poles), or '
+                        '/carla/ego_vehicle/objects for dynamic actors only. Use an '
+                        'ego-scoped feed, since a world-scoped one '
                         'reports the ego itself and makes the car its own keep-out.'),
         DeclareLaunchArgument(
             'footprint_topic', default_value='',

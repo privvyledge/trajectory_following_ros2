@@ -243,8 +243,11 @@ def generate_launch_description():
             default_value='fake_obstacles/object_array',
             description='ObjectArray topic the controller constrains against. Defaults to '
                         'the fake_obstacle_publisher topic; point it at a real perception '
-                        'feed (e.g. a CARLA ros-bridge /carla/<role>/objects) to run '
-                        'against live detections. Use the EGO-SCOPED topic — a world-scoped '
+                        'feed to run against live detections. For CARLA use '
+                        '/carla/merged_obstacles (dynamic actors merged with static level '
+                        'geometry: light poles, sign posts, traffic-light masts); '
+                        '/carla/ego_vehicle/objects is the dynamic-actors-only predecessor. '
+                        'Use an EGO-SCOPED feed — a world-scoped '
                         'one reports the ego vehicle itself and would make the car its own '
                         'keep-out. Detections must already be in global_frame; they are not '
                         'TF-transformed. Applied AFTER the platform/weights overlays so the '

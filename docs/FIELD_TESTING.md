@@ -829,23 +829,85 @@ generated OCP → the first run after this update must use `generate_mpc_model:=
 Spawn the obstacles from the ros-bridge objects definition file (this repo's
 `carla_obstacles.json` is the reference layout for `data/carla_town01_moving.csv`: three
 vehicles, two bikes and a pedestrian, six events ≥30 m of arc apart, difficulty rising
-along the route, ending on the pedestrian — the only mandatory avoidance). No
-`fake_obstacle_publisher` is needed: the ego's `sensor.pseudo.objects` already reports
-every *other* actor with true shape dimensions on
-**`/carla/ego_vehicle/objects`**, in `map`, which is the controller's `global_frame`.
+along the route, ending on the pedestrian — the only mandatory avoidance). The spawn
+points were re-centred on the driven lane (2026-08-02) — the earlier layout put most
+actors far enough off the route that they never entered the horizon, so a run could look
+like a pass without avoiding anything. No `fake_obstacle_publisher` is needed: the ego's
+`sensor.pseudo.objects` already reports every *other* actor with true shape dimensions,
+in `map`, which is the controller's `global_frame`.
 
-Use the **ego-scoped** topic, never the world-scoped `/carla/objects` — the latter
-reports the ego vehicle itself, which would make the car its own keep-out and stop it
-dead. Verify the frame and that actors are being reported before the first run:
+**Use `/carla/merged_obstacles`** (2026-08-02). The CARLA side now merges the ego-scoped
+actor feed with a *static*-geometry publisher (light poles, sign posts, traffic-light
+masts extracted from the baked level geometry) into one `ObjectArray`. The controller
+takes a single topic and has a silent-feed watchdog, so a merged feed is what it wants:
 
 ```bash
-ros2 topic echo /carla/ego_vehicle/objects --once | grep -m2 frame_id
-ros2 topic hz /carla/ego_vehicle/objects
+ros2 topic echo /carla/merged_obstacles --once | grep -m2 frame_id
+ros2 topic hz /carla/merged_obstacles
 ```
+
+This is what closes the failure mode from the 2026-08-02 acados run, where the detour
+went onto the sidewalk and struck a light pole that no ObjectArray reported.
+
+The predecessor feed, still valid for a dynamic-actors-only run:
+
+```bash
+# ros2 topic echo /carla/ego_vehicle/objects --once | grep -m2 frame_id
+```
+
+Whichever you use, it must be the **ego-scoped** feed, never the world-scoped
+`/carla/objects` — that one reports the ego vehicle itself, which would make the car its
+own keep-out and stop it dead. Confirm the merged topic excludes the ego before the
+first run (`n_selected` in the CSV pinned at max with a ~0 m clearance is the symptom).
 
 The obstacles spawn **physics-enabled** — nothing calls `simulate_physics(False)` — so
 any contact displaces an actor and that run will not replay identically. Treat a
 post-contact run as non-reproducible and respawn.
+
+#### Static obstacles: which CityObjectLabels to publish
+
+The static publisher takes a `static_obstacles.yaml` on the CARLA side. Recommended
+starting point for the Town01 route — genuine roadside hazards only, everything else off:
+
+```yaml
+labels:
+  Poles: true            # light poles, sign posts — the light pole we hit
+  TrafficSigns: true     # sign faces + posts
+  TrafficLight: true     # heads + masts
+  Static: false          # street furniture: broad and noisy, enable only if needed
+  Fences: false
+  Walls: false
+  GuardRail: false
+  Buildings: false
+  Vegetation: false      # tree trunks are real, but the label includes canopy
+  # Roads/RoadLines/Sidewalks/Ground/Terrain: false — enabling any makes the map unsolvable
+  # Vehicles/Pedestrians/Dynamic: false — already arrive as actors; enabling double-counts
+
+defaults:
+  z_band: [0.0, 2.5]     # keep, and see below — this is load-bearing
+  near: [-2.0, -165.0]   # centre of the Town01 test route
+  radius: 200.0
+```
+
+Three things this side of the interface cares about:
+
+- **Keep `z_band`.** A CARLA street lamp is three sub-meshes; the arm's bounding box has
+  a ~1.93 m radius several metres up and reaches out over the carriageway. Without the
+  band it becomes a ~4 m ground obstacle. Our radius conversion is *planar* now
+  (`sqrt(l²+w²)/2/1.3`, §7.2), so the height term no longer inflates the keep-out — but
+  the arm's plan-view extent is genuinely wide, so the band still has to do the filtering.
+- **Object count vs. `num_obstacles`.** Town01 has ~220 pole objects. The controller
+  ranks against the horizon and constrains at most `num_obstacles` of them, so a large
+  feed is not itself a problem — but poles now compete for the same slots as the six
+  scripted actors, and a pole beside a truck can evict the truck. Budget slots
+  accordingly and watch `n_selected` / `sel_id` in the CSV. `num_obstacles` is
+  restart-and-rebuild (`generate_mpc_model:=true`).
+- **`min_obstacle_radius` floors zero-dim reports.** If the extractor emits any object
+  with `dimensions: [0,0,0]`, it gets the 0.3 m floor and a throttled warning naming the
+  id rather than a silent radius-0 keep-out.
+
+Once you have the live label census (`dump_static_obstacles.py --list-labels`), tighten
+`near`/`radius` to the driven route so distant geometry never reaches the ranking at all.
 
 #### Rebuild, then launch
 
@@ -871,7 +933,7 @@ ros2 launch trajectory_following_ros2 mpc.launch.py \
     stage_cost_type:=EXTERNAL \
     terminal_cost_type:=EXTERNAL \
     num_obstacles:=6 \
-    obstacle_topic:=/carla/ego_vehicle/objects \
+    obstacle_topic:=/carla/merged_obstacles \
     generate_mpc_model:=true \
     use_sim_time:=true \
     robot_frame:=ego_vehicle \
@@ -897,7 +959,7 @@ ros2 launch trajectory_following_ros2 mpc.launch.py \
     load_waypoints:=true \
     waypoints_csv:="$(ros2 pkg prefix trajectory_following_ros2)/share/trajectory_following_ros2/data/carla_town01_moving.csv" \
     num_obstacles:=6 \
-    obstacle_topic:=/carla/ego_vehicle/objects \
+    obstacle_topic:=/carla/merged_obstacles \
     generate_mpc_model:=true \
     use_sim_time:=true \
     robot_frame:=ego_vehicle \
@@ -1019,9 +1081,9 @@ body-to-body, `sel_*_clearance` are not.
 Setting `obstacle_topic:` in the weights YAML also works and stays supported — the launch
 argument is applied after the overlays, so it wins if both are set.
 
-If `ros2 topic echo /carla/ego_vehicle/objects` reports a `frame_id` other than `map`
-(CARLA's `global_frame`), the positions are silently misinterpreted and you need a
-transform node in between — obstacles are **not** TF-transformed (§7.1).
+If `ros2 topic echo /carla/merged_obstacles` (or `/carla/ego_vehicle/objects`) reports a
+`frame_id` other than `map` (CARLA's `global_frame`), the positions are silently
+misinterpreted and you need a transform node in between — obstacles are **not** TF-transformed (§7.1).
 
 A silent feed is warned about, not silently tolerated: with `num_obstacles > 0` and no
 `ObjectArray` ever arriving (or none for 2 s), the controller logs a throttled warning.

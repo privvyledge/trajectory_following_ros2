@@ -9,7 +9,13 @@
     # Launch (obstacles REQUIRE EXTERNAL cost):
     #   mpc_toolbox:=acados platform:=carla weights:=carla_acados_obstacle \
     #       stage_cost_type:=EXTERNAL terminal_cost_type:=EXTERNAL \
-    #       num_obstacles:=N generate_mpc_model:=true
+    #       num_obstacles:=N generate_mpc_model:=true \
+    #       obstacle_topic:=/carla/merged_obstacles
+    # Feed: /carla/merged_obstacles = dynamic CARLA actors merged with static
+    # level geometry (light poles, sign posts, traffic-light masts). The
+    # dynamic-actors-only predecessor was /carla/ego_vehicle/objects; poles are
+    # invisible on it, which is how a detour hit one. Static geometry competes
+    # for the same num_obstacles slots — watch n_selected / sel_id in the CSV.
     # ---------------------------------------------------------------------------
     horizon: 25
     sample_time: 0.05
@@ -33,17 +39,26 @@
     # Keep-out = ego_radius + obstacle_radius + safe_distance, enforced at EACH
     # ego collision disc. The default ros-bridge ego (Tesla Model 3-class) is
     # ~4.69 x 1.85 m with roughly 1.0 m of rear overhang, so the body spans about
-    # [-1.0, +3.7] m along x from the rear-axle reference point. Two circles cover
-    # it: each half-rectangle (~2.35 x 1.85 m) has circumradius
-    # hypot(2.35, 1.85)/2 ~= 1.50 m, centred at ~+0.18 and ~+2.53 m.
-    # If your ego blueprint differs, recompute: with body span [x_rear, x_front]
-    # and width w, each half has length L = (x_front - x_rear)/2,
-    # radius = hypot(L, w)/2, centres at x_rear + L/2 and x_front - L/2.
+    # [-1.0, +3.7] m along x from the rear-axle reference point. With n discs each
+    # covers a sub-rectangle of length L = (x_front - x_rear)/n and carries
+    # radius = hypot(L, w)/2, centred at x_rear + L*(k + 1/2).
+    #
+    # FOUR discs, not two. The disc radius is a *circumscribing* radius applied
+    # omnidirectionally, so it over-states the half-width (0.925 m) by whatever the
+    # sub-rectangle's length contributes — at n=2 that is 1.50 m, i.e. 0.57 m of
+    # phantom lateral bulk on each side. On a ~3.5 m Town01 lane that is the
+    # difference between clearing the kerb and not: against a 0.3 m post the keep-out
+    # demands 2.23 m of lateral room while Town01 street furniture sits 2.1-2.34 m
+    # from the lane centre, so every pole and traffic-light mast became an active
+    # constraint with ~0.1 m to spare and the solver spent the run at the edge of
+    # infeasibility. n=4 drops the radius to 1.10 m and the demand to 1.82 m, which
+    # clears the same furniture by ~0.5 m. Measured cost is under 1 ms of ranking;
+    # it does double the generated con_h rows (6 obstacles x 4 discs = 24).
     #
     # CHANGING ego_disc_offsets CHANGES THE NUMBER OF GENERATED CONSTRAINT ROWS,
     # so it needs generate_mpc_model:=True, exactly like num_obstacles.
-    ego_radius: 1.5
-    ego_disc_offsets: [0.18, 2.53]
+    ego_radius: 1.096
+    ego_disc_offsets: [-0.4125, 0.7625, 1.9375, 3.1125]
     # Comfort margin on top of the disc radii. Vehicle-scale (the F1/10 uses
     # 0.15 m); also the spendable band the braking envelope lets the solver use
     # during recovery. Raise it to start detours earlier and carry more speed.
@@ -56,6 +71,28 @@
     # profile, so the car halts short of the keep-out rather than leaving the road
     # (Town01 lanes are ~3.5 m). 0.0 restores the unbounded detour.
     max_avoidance_offset: 2.0
+    # Radius within which a reported object is converted to keep-out discs at all.
+    # The merged CARLA feed carries the whole level's static geometry (~1235 objects
+    # -> ~3154 discs), and converting every one of them on every message costs about
+    # 115 ms of CPU per message. That saturates the interpreter lock and starves the
+    # control thread: measured 792 ms per tick against a 50 ms budget, with the tick's
+    # own compute only ~31 ms of it. Nothing this far out can reach the horizon, so
+    # gating before the conversion is free.
+    #
+    # Sized from the worst-case reach, not picked by feel:
+    #   ego travel over the horizon  max_speed 10.5 * prediction_time 1.25 = 13.1 m
+    #   reference anchor             distance_tolerance                    =  2.5 m
+    #   keep-out                     ego_radius + safe_distance + r_obs    =  4.5 m
+    #   detour bound                 max_avoidance_offset                  =  2.0 m
+    #   an oncoming actor closing    10.5 * 1.25                           = 13.1 m
+    #   furthest ego disc            ego_disc_offsets[-1]                  =  3.1 m
+    #                                                                  total 38.3 m
+    # 50 m keeps ~12 m of margin on that. It admits ~102 of the 1235 objects here;
+    # 80 m admitted 212 and left the process at the interpreter-lock ceiling (91.5%
+    # of a core, ~62 points of it ingestion), which is what capped the loop.
+    # Raise it if max_speed, the horizon or the detour bound grow.
+    # 0.0 disables the gate (parse everything), which is the f1tenth default.
+    obstacle_ingest_radius: 50.0
     # Distance at which the projection guide starts growing toward its full radius.
     # Without it the projection switches on as a one-tick multi-metre sideways step
     # and the controller tracks that step with a lunge. The OCP keeps the full,

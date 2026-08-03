@@ -47,6 +47,9 @@ _STALE_ODOM_THRESHOLD_S = 0.5  # seconds before odom is considered stale
 # above any plausible publish period (a 1 Hz feed is already slow for avoidance) so a
 # normal feed never trips it.
 _SILENT_OBSTACLE_FEED_S = 2.0
+# Lateral offset below which an obstacle counts as sitting *on* the reference rather
+# than to one side of it, for the projection-merge side test.
+_ON_REFERENCE_TOLERANCE_M = 0.05
 
 
 class ProgressWatchdog:
@@ -224,6 +227,7 @@ class BaseTrajectoryTracker(Node, ABC):
                 'applied_accel', 'applied_steering', 'applied_speed',
                 'tick_interval_ms', 'reference_ms', 'obstacle_ms', 'solver_wall_ms',
                 'pre_log_ms', 'previous_log_write_ms',
+                'reference_cpu_ms', 'obstacle_cpu_ms', 'solver_cpu_ms', 'pre_log_cpu_ms',
                 'avoidance_stop',
             ])
             self._solver_log_fh.flush()
@@ -506,6 +510,10 @@ class BaseTrajectoryTracker(Node, ABC):
                 f"{timing.get('solver_wall_ms', float('nan')):.4f}",
                 f"{timing.get('pre_log_ms', float('nan')):.4f}",
                 f'{previous_log_ms:.4f}',
+                f"{timing.get('reference_cpu_ms', float('nan')):.4f}",
+                f"{timing.get('obstacle_cpu_ms', float('nan')):.4f}",
+                f"{timing.get('solver_cpu_ms', float('nan')):.4f}",
+                f"{timing.get('pre_log_cpu_ms', float('nan')):.4f}",
                 int(bool(getattr(self, '_avoidance_stop_active', False))),
             ])
             self._solver_log_fh.flush()
@@ -635,6 +643,7 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('decompose_obstacle_boxes', False)
         self.declare_parameter('obstacle_max_discs', 3)
         self.declare_parameter('min_obstacle_radius', 0.3)
+        self.declare_parameter('obstacle_ingest_radius', 0.0)
         self.declare_parameter('max_avoidance_offset', 0.0)
         self.declare_parameter('keepout_engagement_distance', 0.0)
         self.declare_parameter('obstacle_topic', 'fake_obstacles/object_array')
@@ -755,6 +764,7 @@ class BaseTrajectoryTracker(Node, ABC):
         self.decompose_obstacle_boxes = bool(self._gp('decompose_obstacle_boxes'))
         self.obstacle_max_discs = max(1, int(self._gp('obstacle_max_discs')))
         self.min_obstacle_radius = max(0.0, float(self._gp('min_obstacle_radius')))
+        self.obstacle_ingest_radius = max(0.0, float(self._gp('obstacle_ingest_radius')))
         self.max_avoidance_offset = max(0.0, float(self._gp('max_avoidance_offset')))
         self.keepout_engagement_distance = max(
             0.0, float(self._gp('keepout_engagement_distance')))
@@ -830,6 +840,9 @@ class BaseTrajectoryTracker(Node, ABC):
         self.obstacles: list = []
         self._obstacle_topic_name = ''
         self._last_obstacle_msg_time = None
+        # None until the first odometry: the ingestion gate cannot know where the ego is,
+        # so it ingests everything rather than silently dropping a real obstacle.
+        self._ingest_gate_xy: Optional[tuple] = None
         self.n_obstacle_states: int = 3
         self.obstacle_states: Optional[np.ndarray] = None
         # Per-obstacle go-around side memory for the keep-out reference projection.
@@ -1166,6 +1179,12 @@ class BaseTrajectoryTracker(Node, ABC):
         rear_x = x - (self.WHEELBASE / 2) * math.cos(yaw)
         rear_y = y - (self.WHEELBASE / 2) * math.sin(yaw)
 
+        # Lock-free snapshot for the obstacle callback's ingestion gate. A tuple rebind is
+        # atomic under CPython, so the reader can never see a torn (x, y) and the callback
+        # stays free of the state mutex — the property that keeps a large feed off the
+        # control thread's lock.
+        self._ingest_gate_xy = (x, y)
+
         with self.mutex:
             self.x, self.y = x, y
             self.yaw = yaw
@@ -1210,17 +1229,35 @@ class BaseTrajectoryTracker(Node, ABC):
         """
         self._last_obstacle_msg_time = time.monotonic()
         obstacles = []
+        # Ingestion gate. Shape->disc conversion is the per-object cost, and on a
+        # map-scale feed it is paid for every object on every message: measured at
+        # ~115 ms of CPU per message for ~1235 objects, which saturates the GIL and
+        # starves the control thread (the reachability cutoff in _select_obstacles
+        # runs per tick, far downstream of this, so it cannot help here). Objects
+        # beyond the gate cannot reach the horizon, so skipping them before the
+        # conversion is free. Disabled at 0.0, which keeps the parse-everything
+        # behaviour every existing test and the f1tenth configs rely on.
+        gate = self.obstacle_ingest_radius
+        gate_xy = self._ingest_gate_xy if gate > 0.0 else None
+        gate_sq = gate * gate
         for obj in data.objects:
             pos = [obj.pose.position.x, obj.pose.position.y, obj.pose.position.z]
+            if gate_xy is not None:
+                dx = pos[0] - gate_xy[0]
+                dy = pos[1] - gate_xy[1]
+                if dx * dx + dy * dy > gate_sq:
+                    continue
             shape = {
                 obj.shape.BOX: 'BOX',
                 obj.shape.SPHERE: 'SPHERE',
                 obj.shape.CYLINDER: 'CYLINDER',
             }.get(obj.shape.type, 'BOX')
 
+            # Planar yaw straight from the quaternion. euler_from_quaternion builds a
+            # 4x4 matrix per object, which is pure overhead at feed scale for one angle.
             quat = obj.pose.orientation
-            yaw = tf_transformations.euler_from_quaternion(
-                [quat.x, quat.y, quat.z, quat.w])[2]
+            yaw = math.atan2(2.0 * (quat.w * quat.z + quat.x * quat.y),
+                             1.0 - 2.0 * (quat.y * quat.y + quat.z * quat.z))
             states, degenerate = obstacle_shape_discs(
                 shape, obj.shape.dimensions, pos, yaw=yaw,
                 decompose_boxes=self.decompose_obstacle_boxes,
@@ -1309,6 +1346,18 @@ class BaseTrajectoryTracker(Node, ABC):
         both sit on the reference: the reference runs through both, so a plain minimum
         distance scores both ~0 and breaks the tie arbitrarily — which can pick the
         farther one and reinstate the very bug this ranking removes.
+
+        Non-intruders only take a slot when they could plausibly *become* relevant within
+        this solve: the vehicle can leave the reference by at most ``max_avoidance_offset``
+        and the obstacle can travel ``|v| * prediction_time``, so anything clear of the
+        window by more than that sum cannot be reached and is dropped. Filling the
+        remaining slots with the merely-nearest detections is harmless on a feed of a
+        handful of objects and actively destructive on a dense one: on a 1235-object CARLA
+        feed every slot was taken by roadside furniture the route clears comfortably, and
+        :meth:`_merge_overlapping_keepouts` then fused those bystanders into a single
+        multi-metre projection circle that swallowed the lane. The cutoff needs a bound on
+        the swerve to prove irrelevance, so an unbounded detour (``max_avoidance_offset``
+        of 0.0) keeps the fill-all behaviour.
         """
         # Bind the cached list ONCE. ``_obstacle_callback`` runs on another executor
         # thread and rebinds ``self.obstacles`` to a fresh list; re-reading the
@@ -1346,7 +1395,27 @@ class BaseTrajectoryTracker(Node, ABC):
         keys = [(0, int(first_stage[i]), 0.0) if bites[i] else (1, 0, float(closest[i]))
                 for i in range(len(obstacles))]
         order = sorted(range(len(obstacles)), key=keys.__getitem__)
-        return [obstacles[i] for i in order[:self._num_obstacles]]
+        reachable = self._reachable_within_solve(obstacles, closest, keepout)
+        return [obstacles[i] for i in order[:self._num_obstacles]
+                if bites[i] or reachable[i]]
+
+    def _reachable_within_solve(self, obstacles: list, closest: np.ndarray,
+                                keepout: np.ndarray) -> np.ndarray:
+        """Whether each non-intruding detection could still bite during this solve.
+
+        The reach is what the vehicle and the obstacle can close between them: the
+        vehicle may leave the reference by at most ``max_avoidance_offset``, and the
+        obstacle covers ``|v| * prediction_time`` — so a static bystander clear of the
+        window by more than the detour bound is unreachable, while a fast crossing actor
+        keeps its slot out to its own travel distance. An unbounded detour bound leaves
+        no bound to argue from, so everything stays reachable (legacy behaviour).
+        """
+        if self.max_avoidance_offset <= 0.0:
+            return np.ones(len(obstacles), dtype=bool)
+        speed = np.array([float(np.hypot(*o.get('velocity', (0.0, 0.0))))
+                          for o in obstacles])
+        reach = self.max_avoidance_offset + speed * float(self.prediction_time)
+        return (closest - keepout) <= reach
 
     def _warn_if_obstacle_feed_silent(self) -> None:
         """Warn (throttled) when obstacle avoidance is configured but nothing arrives.
@@ -1407,7 +1476,8 @@ class BaseTrajectoryTracker(Node, ABC):
 
     def _merge_overlapping_keepouts(self, centres: np.ndarray,
                                     keepouts: np.ndarray,
-                                    obstacle_ids=None):
+                                    obstacle_ids=None,
+                                    sides=None):
         """Group keep-outs whose mutual gap is too narrow to drive through.
 
         Two keep-out circles separated by less than an ego radius leave a corridor
@@ -1417,6 +1487,21 @@ class BaseTrajectoryTracker(Node, ABC):
         *projection only* (the OCP keeps the individual circles, so the real
         detour still hugs the true boundaries), such circles are replaced by one
         enclosing circle so the reference is routed around the group.
+
+        The gap must be one the reference actually uses, and that means the pair has to
+        straddle it. Proximity alone over-merges: a row of roadside furniture running
+        *alongside* the route sits well inside the distance gate, yet the reference
+        threads no gap between consecutive posts, and the enclosing circle about that
+        chain reaches across the carriageway — an intrusion none of its members had,
+        which routes the reference off the road (or, once the detour bound catches it,
+        parks the vehicle in a clear lane). Nearness to both is not enough either: a
+        kerb chain runs parallel to the route, so every reference point is near several
+        posts at once. Pass ``sides`` (the signed side of the reference each obstacle
+        lies on, from :meth:`_keepout_sides`) to merge only pairs on *opposite* sides,
+        which is what "the reference passes between them" means. Sub-discs of one
+        decomposed obstacle are exempt — they are one physical body and must project as
+        one whatever side they fall on. Omit ``sides`` for the legacy distance-only
+        grouping.
 
         Returns ``(proj_centres, proj_radii, groups)`` where ``groups`` lists the
         member indices of each projection circle.
@@ -1434,8 +1519,14 @@ class BaseTrajectoryTracker(Node, ABC):
         for i in range(n):
             for j in range(i + 1, n):
                 d = float(np.hypot(*(centres[i] - centres[j])))
-                if d < keepouts[i] + keepouts[j] + min_corridor:
-                    parent[_find(i)] = _find(j)
+                if d >= keepouts[i] + keepouts[j] + min_corridor:
+                    continue
+                same_parent = (obstacle_ids is not None
+                               and obstacle_ids[i] == obstacle_ids[j])
+                if (sides is not None and not same_parent
+                        and sides[i] * sides[j] > 0.0):
+                    continue
+                parent[_find(i)] = _find(j)
 
         clusters = {}
         for i in range(n):
@@ -1468,6 +1559,26 @@ class BaseTrajectoryTracker(Node, ABC):
                 proj_radii.append(r)
             groups.append(members)
         return np.array(proj_centres), np.array(proj_radii), groups
+
+    def _keepout_sides(self, xref: np.ndarray, centres: np.ndarray) -> np.ndarray:
+        """Which side of the reference each obstacle centre lies on (+1 left, -1 right).
+
+        Measured at the reference stage nearest the centre, so a curving route is
+        handled locally rather than against some average heading. A centre sitting
+        essentially *on* the line returns 0.0, which callers treat as "either side" —
+        it blocks the reference outright, so it can legitimately pair with a neighbour
+        on either hand.
+        """
+        if not centres.size:
+            return np.zeros(0)
+        dx = centres[:, 0][:, None] - xref[0, :][None, :]
+        dy = centres[:, 1][:, None] - xref[1, :][None, :]
+        nearest = np.argmin(np.hypot(dx, dy), axis=1)
+        rows = np.arange(centres.shape[0])
+        yaw = xref[3, :][nearest]
+        lateral = -np.sin(yaw) * dx[rows, nearest] + np.cos(yaw) * dy[rows, nearest]
+        return np.where(np.abs(lateral) < _ON_REFERENCE_TOLERANCE_M,
+                        0.0, np.sign(lateral))
 
     def _engaged_keepout_radii(self, xref: np.ndarray, selected: list,
                                ego_position) -> np.ndarray:
@@ -1576,9 +1687,11 @@ class BaseTrajectoryTracker(Node, ABC):
             ego_pose = (self.x, self.y, self.yaw)
         projection_radii = self._engaged_keepout_radii(
             xref, selected, ego_pose[:2])
+        offsets = self.effective_ego_disc_offsets()
         proj_centres, proj_radii, groups = self._merge_overlapping_keepouts(
             centres, projection_radii,
-            obstacle_ids=[o['id'] for o in selected])
+            obstacle_ids=[o['id'] for o in selected],
+            sides=self._keepout_sides(xref, centres))
         if len(groups) < len(selected):
             self.get_logger().info(
                 f'{len(selected)} obstacle keep-outs merged into {len(groups)} '
@@ -1596,7 +1709,7 @@ class BaseTrajectoryTracker(Node, ABC):
         hints = [self._keepout_side_hints.get(k, 0) for k in hint_keys]
         projected, _, hints = trajectory_utils.project_reference_out_of_keepouts(
             xref.copy(), proj_centres, proj_radii,
-            side_hints=hints, disc_offsets=self.effective_ego_disc_offsets())
+            side_hints=hints, disc_offsets=offsets)
         self._keepout_side_hints = {
             selected[i]['id']: h for g, h in zip(groups, hints) for i in g}
         bound = self.max_avoidance_offset
@@ -1687,6 +1800,7 @@ class BaseTrajectoryTracker(Node, ABC):
         Non-MPC subclasses (e.g. Pure Pursuit) should override this entirely."""
 
         tick_started = time.monotonic()
+        tick_cpu_started = time.thread_time()
         tick_interval_ms = float('nan')
         if self._last_control_tick_monotonic is not None:
             tick_interval_ms = (
@@ -1817,19 +1931,28 @@ class BaseTrajectoryTracker(Node, ABC):
         # Obstacles are ranked against this tick's reference and handed to the OCP, then
         # the same selected set is swept out of the reference — one selection feeding
         # both, so the constraint and the target can never disagree about what is there.
+        # Each phase is timed on two clocks. thread_time() counts only CPU actually
+        # burned by this control thread, so wall >> cpu means the thread was descheduled
+        # or blocked rather than computing — the distinction the wall-only numbers
+        # could not make.
         reference_ms = (time.monotonic() - tick_started) * 1e3
+        reference_cpu_ms = (time.thread_time() - tick_cpu_started) * 1e3
         obstacle_started = time.monotonic()
+        obstacle_cpu_started = time.thread_time()
         self._warn_if_obstacle_feed_silent()
         selected = self._select_obstacles(xref, (x, y, psi))
         self._pack_obstacle_states(selected)
         projected_xref = self._project_reference_out_of_keepouts(
             xref, selected, ego_pose=(x, y, psi))
         obstacle_ms = (time.monotonic() - obstacle_started) * 1e3
+        obstacle_cpu_ms = (time.thread_time() - obstacle_cpu_started) * 1e3
 
         solve_started = time.monotonic()
+        solve_cpu_started = time.thread_time()
         result: SolverResult = self._solver.solve(
             x0, projected_xref, u_prev_snapshot.flatten())
         solver_wall_ms = (time.monotonic() - solve_started) * 1e3
+        solver_cpu_ms = (time.thread_time() - solve_cpu_started) * 1e3
 
         # 11. Track consecutive failures. A failed solve never applies its returned
         #     iterate. The configured failure policy either zeroes immediately or
@@ -1956,6 +2079,10 @@ class BaseTrajectoryTracker(Node, ABC):
             'obstacle_ms': obstacle_ms,
             'solver_wall_ms': solver_wall_ms,
             'pre_log_ms': (time.monotonic() - tick_started) * 1e3,
+            'reference_cpu_ms': reference_cpu_ms,
+            'obstacle_cpu_ms': obstacle_cpu_ms,
+            'solver_cpu_ms': solver_cpu_ms,
+            'pre_log_cpu_ms': (time.thread_time() - tick_cpu_started) * 1e3,
         }, ego_pose=(x, y, psi), safety=safety, safety_reason=safety_reason,
             applied=applied)
 
@@ -2421,6 +2548,13 @@ class BaseTrajectoryTracker(Node, ABC):
                         'Rejected min_obstacle_radius: expected metres >= 0.')
                 else:
                     self.min_obstacle_radius = float(param.value)
+            elif param.name == 'obstacle_ingest_radius':
+                if float(param.value) < 0.0:
+                    success = False
+                    self.get_logger().error(
+                        'Rejected obstacle_ingest_radius: expected metres >= 0.')
+                else:
+                    self.obstacle_ingest_radius = float(param.value)
             elif param.name == 'max_avoidance_offset':
                 if float(param.value) < 0.0:
                     success = False

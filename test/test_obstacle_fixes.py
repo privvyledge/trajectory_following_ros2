@@ -20,7 +20,12 @@ class _Tracker(BaseTrajectoryTracker):
 
 
 def _new_tracker():
-    return _Tracker.__new__(_Tracker)
+    tracker = _Tracker.__new__(_Tracker)
+    # Ingestion-gate defaults: disabled, and no ego fix yet. Both are what a tracker
+    # looks like before the first odometry, so the callback ingests everything.
+    tracker.obstacle_ingest_radius = 0.0
+    tracker._ingest_gate_xy = None
+    return tracker
 
 
 @pytest.mark.parametrize('dimensions', [
@@ -222,3 +227,71 @@ def test_engagement_ramp_removes_the_single_tick_projection_step():
 
     assert max(np.diff(offsets)) < full_displacement / 5.0
     assert offsets[-1] == pytest.approx(full_displacement)
+
+
+def _ingest_obj(obj_id, x, y):
+    return SimpleNamespace(
+        id=obj_id,
+        pose=SimpleNamespace(
+            position=SimpleNamespace(x=x, y=y, z=0.0),
+            orientation=SimpleNamespace(x=0.0, y=0.0, z=0.0, w=1.0)),
+        shape=SimpleNamespace(BOX=1, SPHERE=2, CYLINDER=3, type=1,
+                              dimensions=[1.0, 1.0, 1.0]),
+        twist=SimpleNamespace(linear=SimpleNamespace(x=0.0, y=0.0)))
+
+
+def _ingest_tracker(gate, ego_xy):
+    tracker = _new_tracker()
+    tracker.decompose_obstacle_boxes = False
+    tracker.obstacle_max_discs = 3
+    tracker.min_obstacle_radius = 0.3
+    tracker.get_logger = lambda: SimpleNamespace(warn=lambda *a, **k: None)
+    tracker.obstacle_ingest_radius = gate
+    tracker._ingest_gate_xy = ego_xy
+    return tracker
+
+
+def test_ingest_gate_drops_only_objects_beyond_the_radius():
+    tracker = _ingest_tracker(gate=50.0, ego_xy=(0.0, 0.0))
+
+    tracker._obstacle_callback(SimpleNamespace(objects=[
+        _ingest_obj(1, 10.0, 0.0),    # well inside
+        _ingest_obj(2, 0.0, 49.9),    # just inside
+        _ingest_obj(3, 50.1, 0.0),    # just outside
+        _ingest_obj(4, 400.0, 400.0),  # map-scale bystander
+    ]))
+
+    assert sorted(o['id'] for o in tracker.obstacles) == [1, 2]
+
+
+def test_ingest_gate_disabled_keeps_every_object():
+    tracker = _ingest_tracker(gate=0.0, ego_xy=(0.0, 0.0))
+
+    tracker._obstacle_callback(SimpleNamespace(objects=[
+        _ingest_obj(1, 10.0, 0.0),
+        _ingest_obj(2, 400.0, 400.0),
+    ]))
+
+    assert sorted(o['id'] for o in tracker.obstacles) == [1, 2]
+
+
+def test_ingest_gate_inactive_until_first_odometry():
+    # No ego fix yet: dropping by distance would be guesswork, so nothing is dropped.
+    tracker = _ingest_tracker(gate=50.0, ego_xy=None)
+
+    tracker._obstacle_callback(SimpleNamespace(objects=[
+        _ingest_obj(1, 400.0, 400.0),
+    ]))
+
+    assert [o['id'] for o in tracker.obstacles] == [1]
+
+
+def test_ingest_yaw_matches_euler_from_quaternion():
+    # The fast atan2 yaw must agree with the tf_transformations result it replaced.
+    import tf_transformations
+
+    for yaw in (0.0, 0.7, -1.9, 3.0):
+        qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+        expected = tf_transformations.euler_from_quaternion([0.0, 0.0, qz, qw])[2]
+        got = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
+        assert got == pytest.approx(expected)
