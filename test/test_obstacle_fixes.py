@@ -295,3 +295,35 @@ def test_ingest_yaw_matches_euler_from_quaternion():
         expected = tf_transformations.euler_from_quaternion([0.0, 0.0, qz, qw])[2]
         got = math.atan2(2.0 * qw * qz, 1.0 - 2.0 * qz * qz)
         assert got == pytest.approx(expected)
+
+
+def test_required_detour_offset_is_recorded_for_the_stats_row():
+    """``avoidance_stop`` says the bound was crossed but not by how much.
+
+    "Needs 2.1 m of a 2.0 m bound" and "needs 9 m of a 2.0 m bound" call for opposite
+    responses — raise the bound versus accept that the corridor is blocked — so the
+    magnitude has to reach the CSV, not just the boolean.
+    """
+    tracker = _projection_tracker(max_offset=2.0)
+    obstacle = {'id': 5, 'state': [5.0, 0.0, 1.5], 'velocity': [0.0, 0.0]}
+
+    tracker._project_reference_out_of_keepouts(
+        _straight_reference(), [obstacle], ego_pose=(0.0, 0.0, 0.0))
+
+    assert tracker._avoidance_stop_active
+    # The keep-out (ego 1.5 + obstacle 1.5 + safe 0.4) is centred on the reference,
+    # so clearing it demands more than the 2.0 m bound — which is why it stopped.
+    assert tracker._avoidance_required_offset > 2.0
+
+
+def test_required_detour_offset_resets_when_nothing_is_selected():
+    """A stale offset from an earlier tick would read as a live measurement."""
+    tracker = _projection_tracker(max_offset=2.0)
+    tracker._project_reference_out_of_keepouts(
+        _straight_reference(), [{'id': 5, 'state': [5.0, 0.0, 1.5], 'velocity': [0.0, 0.0]}],
+        ego_pose=(0.0, 0.0, 0.0))
+    assert not np.isnan(tracker._avoidance_required_offset)
+
+    tracker._project_reference_out_of_keepouts(
+        _straight_reference(), [], ego_pose=(0.0, 0.0, 0.0))
+    assert np.isnan(tracker._avoidance_required_offset)

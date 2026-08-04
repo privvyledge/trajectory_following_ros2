@@ -229,6 +229,11 @@ class BaseTrajectoryTracker(Node, ABC):
                 'pre_log_ms', 'previous_log_write_ms',
                 'reference_cpu_ms', 'obstacle_cpu_ms', 'solver_cpu_ms', 'pre_log_cpu_ms',
                 'avoidance_stop',
+                # Appended, never inserted: analysis scripts index this file
+                # positionally as well as by name.
+                'ego_x', 'ego_y', 'ego_yaw',
+                'safety_obstacle_x', 'safety_obstacle_y', 'safety_obstacle_keepout',
+                'avoidance_required_offset', 'avoidance_bound',
             ])
             self._solver_log_fh.flush()
             self.get_logger().info(f'Solver stats logging to {path}')
@@ -331,7 +336,8 @@ class BaseTrajectoryTracker(Node, ABC):
         """
         diag = {'stop': False, 'obstacle_id': -1, 'physical_clearance': float('nan'),
                 'closing_speed': float('nan'), 'stopping_room': float('nan'),
-                'margin': float('nan')}
+                'margin': float('nan'), 'obstacle_x': float('nan'),
+                'obstacle_y': float('nan'), 'obstacle_keepout': float('nan')}
         if not selected:
             return diag
         # No low-speed early-out: a stopped vehicle cannot fire (closing ≈ 0 fails
@@ -391,6 +397,14 @@ class BaseTrajectoryTracker(Node, ABC):
                     'closing_speed': float(closing[worst]),
                     'stopping_room': float(stopping_room[worst]),
                     'margin': float(margin[worst]),
+                    # Position and keep-out radius of the reported pair. A clearance
+                    # scalar cannot distinguish a blocked corridor (stopping is
+                    # correct) from a passable gap the planner declined, because it
+                    # says nothing about WHERE the obstacle sits relative to the
+                    # route. Logging the centre makes that reconstructable offline.
+                    'obstacle_x': float(centre[0]),
+                    'obstacle_y': float(centre[1]),
+                    'obstacle_keepout': keepout,
                 })
         return diag
 
@@ -504,6 +518,10 @@ class BaseTrajectoryTracker(Node, ABC):
                 float('nan'), float('nan'), float('nan'))
             n_sel, sel_id, sel_side, sel_clear, ego_clear = self._obstacle_diag(
                 result, selected or [], ego_pose)
+            # The tick's own pose, not a re-read of self.x/y/yaw, which the odometry
+            # callback may have rebound on another thread since the solve.
+            pose = ego_pose if ego_pose is not None else (
+                float('nan'), float('nan'), float('nan'))
             previous_log_ms = self._last_solver_log_ms
             log_started = time.monotonic()
             self._solver_log_writer.writerow([
@@ -542,6 +560,14 @@ class BaseTrajectoryTracker(Node, ABC):
                 f"{timing.get('solver_cpu_ms', float('nan')):.4f}",
                 f"{timing.get('pre_log_cpu_ms', float('nan')):.4f}",
                 int(bool(getattr(self, '_avoidance_stop_active', False))),
+                f'{pose[0]:.6f}',
+                f'{pose[1]:.6f}',
+                f'{pose[2]:.6f}',
+                f"{safety.get('obstacle_x', float('nan')):.6f}",
+                f"{safety.get('obstacle_y', float('nan')):.6f}",
+                f"{safety.get('obstacle_keepout', float('nan')):.6f}",
+                f"{getattr(self, '_avoidance_required_offset', float('nan')):.6f}",
+                f"{getattr(self, 'max_avoidance_offset', float('nan')):.6f}",
             ])
             self._solver_log_fh.flush()
             self._last_solver_log_ms = (time.monotonic() - log_started) * 1e3
@@ -816,6 +842,8 @@ class BaseTrajectoryTracker(Node, ABC):
         self._progress_watchdog = ProgressWatchdog(self.progress_watchdog_timeout)
         self._avoidance_stop_latch = AvoidanceStopLatch()
         self._avoidance_stop_active = False
+        #: Worst group's required lateral detour on the last projection (diagnostic).
+        self._avoidance_required_offset = float('nan')
         self.dt = self.sample_time = 1.0 / self.control_rate
         if not self.prediction_time:
             self.prediction_time = self.sample_time * self.horizon
@@ -1715,6 +1743,7 @@ class BaseTrajectoryTracker(Node, ABC):
         topic) as the raw reference.
         """
         self._avoidance_stop_active = False
+        self._avoidance_required_offset = float('nan')
         if not selected:
             self._avoidance_stop_latch.clear()
             return xref
@@ -1756,6 +1785,12 @@ class BaseTrajectoryTracker(Node, ABC):
 
         required = self._projection_group_offsets(
             xref, proj_centres, proj_radii, groups, selected)
+        # Worst group's required detour, logged so the stop-vs-swerve decision is
+        # auditable from the CSV: `avoidance_stop` alone says the bound was crossed
+        # but not by how much, and "needs 2.1 m of 2.0" and "needs 9 m of 2.0" call
+        # for opposite fixes (raise the bound vs. the corridor is genuinely blocked).
+        if required:
+            self._avoidance_required_offset = float(max(required.values()))
         active = self._avoidance_stop_latch.update(required, bound)
         if not active:
             return projected

@@ -626,3 +626,35 @@ def test_sub_discs_of_one_obstacle_merge_regardless_of_side():
         centres, tracker._keepout_radii([a, b]), obstacle_ids=[7, 7], sides=sides)
 
     assert len(groups) == 1, 'sub-discs of one parent are exempt from the side test'
+
+
+def test_braking_diagnostics_carry_the_reported_obstacle_position():
+    """The stop-vs-swerve question cannot be answered from a clearance scalar.
+
+    A blocked corridor (stopping is correct) and a passable gap the planner declined
+    produce identical clearance traces; only the obstacle's position relative to the
+    route separates them, and a live CARLA run is the wrong place to discover the
+    column is missing. The centre must be the *reported* obstacle's, so it is written
+    on the same branch that wins the report rank rather than from the last loop
+    iteration.
+    """
+    receding = _obstacle(1, -0.2, 0.0)
+    ahead = _obstacle(2, 1.0, 0.35)
+    tracker = _make_tracker([receding, ahead], num_obstacles=2)
+
+    diag = tracker._obstacle_safety_check(
+        [receding, ahead], ego_pose=(0.0, 0.0, 0.0), speed=1.5, tick_interval_ms=50.0)
+
+    assert diag['obstacle_id'] == 2
+    assert diag['obstacle_x'] == pytest.approx(1.0)
+    assert diag['obstacle_y'] == pytest.approx(0.35)
+    assert diag['obstacle_keepout'] == pytest.approx(
+        EGO_RADIUS + OBSTACLE_RADIUS + SAFE_DISTANCE)
+
+
+def test_braking_diagnostics_position_is_nan_with_nothing_selected():
+    """No selection means no reported pair; a stale position would read as a real one."""
+    tracker = _make_tracker([])
+    diag = tracker._obstacle_safety_check(
+        [], ego_pose=(0.0, 0.0, 0.0), speed=1.5, tick_interval_ms=50.0)
+    assert np.isnan(diag['obstacle_x']) and np.isnan(diag['obstacle_y'])
