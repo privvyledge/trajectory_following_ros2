@@ -45,6 +45,7 @@ def _make_tracker(obstacles, num_obstacles=1, predict_motion=True, solver=None):
     tracker.sample_time = SAMPLE_TIME
     tracker.prediction_time = HORIZON * SAMPLE_TIME
     tracker.MAX_DECEL = -3.0
+    tracker.ENVELOPE_DECEL = 0.0  # 0 = follow |max_decel|
     tracker.n_obstacle_states = 3
     tracker._keepout_side_hints = {}
     tracker._avoidance_stop_latch = AvoidanceStopLatch()
@@ -270,6 +271,43 @@ def test_delayed_tick_widens_the_braking_envelope():
     assert not healthy['stop']
     assert stalled['stop']
     assert stalled['stopping_room'] > healthy['stopping_room']
+
+
+def test_envelope_decel_shrinks_the_envelope_without_touching_max_decel():
+    """``envelope_decel`` overrides the deceleration the stopping-room term assumes.
+
+    The braking distance is ``closing²/(2·decel)``, so a harder emergency decel
+    shrinks the envelope quadratically — that is the whole point of separating it
+    from ``max_decel``, which is a comfort value shaping the reference speed ramp
+    and the stop-before-keep-out profile and must stay put.
+    """
+    # 1.8 m is between the two envelopes: room is 1.275 m at 3 m/s², 1.088 m at 6.
+    obstacle = _obstacle(1, 1.8, 0.0)
+    tracker = _make_tracker([obstacle])
+
+    comfort = tracker._obstacle_safety_check(
+        [obstacle], ego_pose=(0.0, 0.0, 0.0), speed=1.5, tick_interval_ms=400.0)
+    tracker.ENVELOPE_DECEL = 6.0
+    emergency = tracker._obstacle_safety_check(
+        [obstacle], ego_pose=(0.0, 0.0, 0.0), speed=1.5, tick_interval_ms=400.0)
+
+    assert comfort['stop'] and not emergency['stop']
+    assert emergency['stopping_room'] < comfort['stopping_room']
+    assert tracker.MAX_DECEL == -3.0  # untouched
+
+
+def test_envelope_decel_zero_follows_max_decel():
+    """0.0 is the documented 'inherit |max_decel|' sentinel, not a 0 m/s² stop."""
+    obstacle = _obstacle(1, 1.6, 0.0)
+    tracker = _make_tracker([obstacle])
+    tracker.ENVELOPE_DECEL = 0.0
+    inherited = tracker._obstacle_safety_check(
+        [obstacle], ego_pose=(0.0, 0.0, 0.0), speed=1.5, tick_interval_ms=400.0)
+    tracker.ENVELOPE_DECEL = 3.0
+    explicit = tracker._obstacle_safety_check(
+        [obstacle], ego_pose=(0.0, 0.0, 0.0), speed=1.5, tick_interval_ms=400.0)
+
+    assert inherited['stopping_room'] == pytest.approx(explicit['stopping_room'])
 
 
 def test_braking_diagnostics_report_the_obstacle_that_actually_fired():

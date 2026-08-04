@@ -289,6 +289,21 @@ class BaseTrajectoryTracker(Node, ABC):
             pass
         return n_sel, sel_id, sel_side, min_clear, ego_clear
 
+    def _envelope_decel(self) -> float:
+        """Deceleration magnitude (m/s²) the braking envelope reserves room for.
+
+        ``envelope_decel`` when set, else ``|max_decel|``. This is a single
+        definition on purpose: the value that sizes ``stopping_room`` in
+        :meth:`_obstacle_safety_check` MUST be the value
+        :meth:`_safety_brake_command` actually sheds speed at, and the one
+        :meth:`_hold_admissible_command` judges a recovery proposal against.
+        Reserving room for a 6 m/s² stop and then braking at 3 m/s² fires the
+        envelope later *and* stops slower — strictly less safe than either value
+        used consistently.
+        """
+        return max(abs(float(self.ENVELOPE_DECEL)) or abs(float(self.MAX_DECEL)),
+                   1e-3)
+
     def _obstacle_safety_check(self, selected: list, ego_pose,
                                speed: float, tick_interval_ms: float) -> dict:
         """State-based obstacle braking envelope, with per-tick diagnostics.
@@ -296,7 +311,13 @@ class BaseTrajectoryTracker(Node, ABC):
         Fires when the closing speed toward a selected obstacle leaves less
         clearance than the room needed to stop: one reaction tick at the current
         closing speed (the *observed* tick interval, so a cadence stall widens the
-        envelope) plus the braking distance at ``max_decel``.
+        envelope) plus the braking distance at :meth:`_envelope_decel`.
+
+        ``tick_interval_ms`` must be measured in the time base the *dynamics*
+        evolve in — the ROS clock, which follows sim time under ``use_sim_time``.
+        Passing a wall-clock interval under a slowed simulator inflates the
+        reaction window by 1/RTF (CARLA at RTF≈0.2: 0.25 s → 0.42 s, ≈1.3 m of
+        phantom stopping room at 7.8 m/s) and the envelope over-fires.
 
         Returns a dict — ``stop`` (bool), ``obstacle_id``, ``physical_clearance``,
         ``closing_speed``, ``stopping_room``, ``margin`` — describing the most
@@ -324,7 +345,7 @@ class BaseTrajectoryTracker(Node, ABC):
         # turns the distance into per-coordinate magnitudes.
         discs = trajectory_utils.ego_disc_centres(x, y, yaw, offsets).reshape(-1, 2)
         ego_velocity = np.array([speed * np.cos(yaw), speed * np.sin(yaw)])
-        decel = max(abs(float(self.MAX_DECEL)), 1e-3)
+        decel = self._envelope_decel()
         # Reaction window: one observed tick plus the actuation lag — the plant keeps
         # executing the *previous* command while a brake command works through the
         # lag, so measured speed can still be rising for that long after a fire.
@@ -411,7 +432,7 @@ class BaseTrajectoryTracker(Node, ABC):
         discs = trajectory_utils.ego_disc_centres(x, y, yaw, offsets).reshape(-1, 2)
         command_velocity = (float(result.velocity_cmd)
                             * np.array([np.cos(yaw), np.sin(yaw)]))
-        decel = max(abs(float(self.MAX_DECEL)), 1e-3)
+        decel = self._envelope_decel()
         reaction = self.sample_time + self._ENVELOPE_ACTUATION_LAG_S
         margin_gate = float(self._gp('safe_distance'))
         keepouts = self._keepout_radii(selected)
@@ -434,19 +455,25 @@ class BaseTrajectoryTracker(Node, ABC):
     def _safety_brake_command(self, result: SolverResult, speed: float):
         """Bounded-decel stop action: ``(accel, steering, speed)`` for a safety stop.
 
-        Sheds one tick of speed at ``max_decel`` — the same deceleration the
-        envelope's stopping-room formula assumes — while keeping the solver's
+        Sheds one tick of speed at :meth:`_envelope_decel` — the same deceleration
+        the envelope's stopping-room formula assumes — while keeping the solver's
         steering, so braking mid-avoidance-arc does not straighten the wheel the
         way a hard zero did (that straightened lurch is what ratcheted the vehicle
         into contact). Falls back to the last applied steering when the iterate is
         not trusted.
+
+        The returned accel deliberately bypasses ``_input_saturation`` (the caller
+        applies it in place of, not before, saturation), so with
+        ``envelope_decel > |max_decel|`` this publishes a harder decel than normal
+        driving is allowed to plan. That is the point of the separate parameter:
+        an emergency stop is not bound by the comfort limit.
 
         The commanded speed is monotone over a braking sequence: measured speed can
         keep *rising* through the actuation lag right after the envelope fires, and
         ``measured - step`` alone would then command increasing speeds while
         nominally braking. The bound resets whenever a tick publishes normally.
         """
-        decel = max(abs(float(self.MAX_DECEL)), 1e-3)
+        decel = self._envelope_decel()
         step = decel * self.sample_time
         self._brake_speed_bound = max(
             0.0, min(abs(speed), self._brake_speed_bound) - step)
@@ -657,6 +684,13 @@ class BaseTrajectoryTracker(Node, ABC):
         # runs and its diagnostics are logged every tick — it just never intervenes —
         # so an A/B run compares identical CSV columns.
         self.declare_parameter('obstacle_braking_envelope', True)
+        # Deceleration (m/s², magnitude) the braking envelope assumes for a
+        # last-resort stop. 0.0 = follow |max_decel|, which is the historical
+        # behaviour. Kept separate because max_decel is a *comfort* planning value
+        # that also shapes the reference speed ramp and the stop-before-keep-out
+        # profile: raising it globally to shrink the envelope changes normal
+        # driving everywhere. A real vehicle brakes far harder than it plans to.
+        self.declare_parameter('envelope_decel', 0.0)
         self.declare_parameter('progress_watchdog_enabled', True)
         self.declare_parameter('progress_watchdog_timeout', 5.0)
         self.declare_parameter('actuator_feedback_topic', '')
@@ -728,6 +762,7 @@ class BaseTrajectoryTracker(Node, ABC):
         self.MIN_SPEED = self._gp('min_speed')
         self.MAX_ACCEL = self._gp('max_accel')
         self.MAX_DECEL = self._gp('max_decel')
+        self.ENVELOPE_DECEL = self._gp('envelope_decel')
         self.saturate_input = self._gp('saturate_input')
         self.allow_reversing = self._gp('allow_reversing')
         if not self.allow_reversing:
@@ -833,6 +868,8 @@ class BaseTrajectoryTracker(Node, ABC):
         self._consecutive_failures = 0
         self._last_successful_command_monotonic: Optional[float] = None
         self._last_control_tick_monotonic: Optional[float] = None
+        #: Previous tick stamped on the ROS clock (sim time under use_sim_time).
+        self._last_control_tick_ros = None
         self._last_solver_log_ms = float('nan')
 
         self._last_odom_stamp = None
@@ -1807,6 +1844,25 @@ class BaseTrajectoryTracker(Node, ABC):
                 tick_started - self._last_control_tick_monotonic) * 1e3
         self._last_control_tick_monotonic = tick_started
 
+        # Cadence in the time base the *dynamics* evolve in. Under use_sim_time the
+        # ROS clock follows the simulator, so this stays ≈ sample_time even when the
+        # wall interval above is stretched by the sim's real-time factor. The wall
+        # value remains the CSV/cadence-diagnostic column; only the safety envelope's
+        # reaction window uses this one, because reserving stopping distance against
+        # a clock the vehicle does not move in over-brakes by exactly 1/RTF.
+        control_interval_ms = tick_interval_ms
+        try:
+            tick_ros = self.get_clock().now()
+            if self._last_control_tick_ros is not None:
+                delta_ms = (tick_ros - self._last_control_tick_ros).nanoseconds * 1e-6
+                # A paused or backward sim clock yields <= 0; fall back to nominal
+                # rather than to a wall interval that means something else here.
+                control_interval_ms = (delta_ms if delta_ms > 0.0
+                                       else self.sample_time * 1e3)
+            self._last_control_tick_ros = tick_ros
+        except (AttributeError, TypeError, ValueError):
+            pass
+
         # 1. Stale-odometry guard
         if not self._odom_is_fresh():
             if self.initial_pose_received:
@@ -1979,7 +2035,7 @@ class BaseTrajectoryTracker(Node, ABC):
         # Brake on every failed obstacle solve; keep the bounded hold policy for
         # ordinary tracking failures where no selected keep-out is involved.
         safety = self._obstacle_safety_check(
-            selected, (x, y, psi), vel, tick_interval_ms)
+            selected, (x, y, psi), vel, control_interval_ms)
         if not self.obstacle_braking_envelope:
             # Advisory mode (A/B): diagnostics still reach the CSV, but the envelope
             # never intervenes and any latched hold is dropped.
@@ -2524,6 +2580,14 @@ class BaseTrajectoryTracker(Node, ABC):
                 self.MAX_ACCEL = param.value
             elif param.name == 'max_decel':
                 self.MAX_DECEL = param.value
+            elif param.name == 'envelope_decel':
+                if float(param.value) < 0.0:
+                    success = False
+                    self.get_logger().error(
+                        'Rejected envelope_decel: expected a magnitude >= 0 '
+                        '(0 = follow |max_decel|).')
+                else:
+                    self.ENVELOPE_DECEL = float(param.value)
             elif param.name == 'obstacle_braking_envelope':
                 self.obstacle_braking_envelope = bool(param.value)
                 if not self.obstacle_braking_envelope:

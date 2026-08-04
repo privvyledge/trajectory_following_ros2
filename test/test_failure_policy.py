@@ -34,6 +34,7 @@ def _tracker(**overrides):
     tracker.delta_cmd = 0.1
     tracker.velocity_cmd = 0.8
     tracker.MAX_DECEL = -3.0
+    tracker.ENVELOPE_DECEL = 0.0  # 0 = follow |max_decel|
     tracker.MAX_ACCEL = 3.0
     tracker.MIN_STEER_ANGLE = -math.radians(27.0)
     tracker.MAX_STEER_ANGLE = math.radians(27.0)
@@ -261,6 +262,23 @@ def test_safety_brake_command_sheds_speed_and_keeps_solver_steering():
     assert acc == pytest.approx(-3.0)
     assert steer == pytest.approx(0.2)
     assert speed == pytest.approx(0.8 - 3.0 * 0.05)
+
+
+def test_safety_brake_command_sheds_speed_at_the_envelope_decel():
+    """The action must brake at the rate the envelope reserved room for.
+
+    Sizing ``stopping_room`` at 6 m/s² while the brake command sheds speed at
+    3 m/s² fires later *and* stops slower — strictly worse than either value used
+    consistently, and it would silently undo the envelope_decel change.
+    """
+    tracker = _tracker(sample_time=0.05)
+    tracker.ENVELOPE_DECEL = 6.0
+    result = SolverResult(steering_cmd=0.2, is_optimal=True)
+
+    acc, _, speed = tracker._safety_brake_command(result, speed=0.8)
+
+    assert acc == pytest.approx(-6.0)
+    assert speed == pytest.approx(0.8 - 6.0 * 0.05)
 
 
 def test_safety_brake_command_falls_back_to_last_steering_on_bad_iterate():

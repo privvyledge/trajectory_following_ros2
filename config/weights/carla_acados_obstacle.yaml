@@ -32,9 +32,12 @@
     max_iter: 20
 
     # Obstacle avoidance (exact nonlinear con_h). The launch argument remains
-    # authoritative over this overlay; keep num_obstacles:=6 on the launch line.
+    # authoritative over this overlay; keep num_obstacles:=10 on the launch line.
     # The first run after changing the slot count needs generate_mpc_model:=true.
-    num_obstacles: 6
+    # 6 starved on the dense CARLA feed: run A2 held the cap for 74% of its rows
+    # (saturated from row 200) and the struck obstacle never won a slot. At 10 the
+    # cap stopped binding (peak 8-10, ~4% of rows) at no cadence cost.
+    num_obstacles: 10
     obstacle_collision_avoidance_method: euclidean
     # Keep-out = ego_radius + obstacle_radius + safe_distance, enforced at EACH
     # ego collision disc. The default ros-bridge ego (Tesla Model 3-class) is
@@ -123,7 +126,26 @@
     # F1/10 configs (0.66 m keep-outs at 1.5 m/s — there it is load-bearing).
     # Consider re-enabling for live runs with MOVING obstacles until validated.
     # Hot-reloadable: ros2 param set <node> obstacle_braking_envelope true
-    obstacle_braking_envelope: false
+    #
+    # 2026-08-04: re-enabled with an envelope-local decel. Run D2 (envelope on at
+    # the old settings) confirmed the over-braking above — 166 fires, median
+    # applied speed 0.24 m/s, route stalled at idx 148 vs 450-576 with it off —
+    # but two of its causes were defects, not conservatism:
+    #   1. stopping_room was sized at |max_decel| = 3.0 m/s², a *comfort* planning
+    #      decel. A last-resort stop is not bound by it, and the v²/2a term
+    #      dominates the distance (10.1 of a sampled 13.65 m).
+    #   2. the reaction window was measured on the wall clock while CARLA runs at
+    #      RTF≈0.2, inflating it 0.25 s -> 0.42 s (≈1.3 m of phantom stopping room
+    #      at 7.8 m/s). Fixed in base_tracker to use the ROS clock.
+    # envelope_decel sizes the envelope AND the brake action it triggers; it does
+    # NOT touch max_decel, which stays -3.0 so the reference speed ramp and the
+    # stop-before-keep-out profile are unchanged.
+    # KNOWN RESIDUAL: the trigger is still radial closing to the obstacle centre,
+    # which reads a lateral pass-by as head-on (D2: obstacle 208 drew 116 fires
+    # and never came nearer than 0.383 m). If far-field fires persist, the fix is
+    # a CPA/collision-cone gate, not a larger decel.
+    obstacle_braking_envelope: true
+    envelope_decel: 6.0
 
     # Tuned Town01 tracking set (see carla_acados.yaml for the derivation).
     Q:  [5.0, 5.0, 15.0, 0.05]
