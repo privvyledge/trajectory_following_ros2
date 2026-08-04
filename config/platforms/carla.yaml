@@ -30,6 +30,21 @@
     saturate_input: True
     allow_reversing: True
 
+    # Ego collision geometry — physical, so it belongs here rather than only in
+    # config/weights/carla_*_obstacle.yaml (which set the identical values and,
+    # being higher in the stack, still win). Without these the `ego_radius: -1.0`
+    # sentinel in mpc_parameters.yaml resolves to DEFAULT_EGO_RADIUS (2.10 m) and
+    # the single legacy disc [0.0] — which for CARLA is both wrong in size and, more
+    # importantly, one disc on the rear axle of a ~4.8 m car. That is only cosmetic
+    # at num_obstacles: 0, but ENFORCED as soon as num_obstacles > 0.
+    #
+    # Four discs span the ego body from just behind the rear axle to the nose.
+    # NOTE: ego_disc_offsets sets the generated constraint-row count, so changing
+    # it needs generate_mpc_model:=True — exactly like num_obstacles.
+    ego_radius: 1.096
+    ego_disc_offsets: [-0.4125, 0.7625, 1.9375, 3.1125]
+    safe_distance: 0.4
+
     # Frames / topics — CARLA ros-bridge ego. Confirm against `ros2 topic list`.
     global_frame: map
     robot_frame: ego_vehicle

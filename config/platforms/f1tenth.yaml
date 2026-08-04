@@ -31,3 +31,21 @@
 
     saturate_input: True
     allow_reversing: True
+
+    # Ego collision geometry — physical, so it belongs here rather than only in
+    # config/weights/f1tenth_*_obstacle.yaml (which set the identical values and,
+    # being higher in the stack, still win). Without these the `ego_radius: -1.0`
+    # sentinel in mpc_parameters.yaml resolves to DEFAULT_EGO_RADIUS — a *Carla
+    # Model 3* bounding sphere, 2.10 m — giving a 2.60 m keep-out around a 0.58 x
+    # 0.31 m car. That is only cosmetic at num_obstacles: 0 (two huge rings in the
+    # visualizer), but it is ENFORCED the moment num_obstacles > 0, and a 2.6 m
+    # bubble swallows the path and deadlocks avoidance.
+    #
+    # The two discs cover the half-rectangles of the 0.58 x 0.31 m footprint whose
+    # rear axle sits 0.19 m from the tail. Inflating a single radius to the
+    # circumscribing ~0.50 m instead would widen every detour.
+    # NOTE: ego_disc_offsets sets the generated constraint-row count, so changing
+    # it needs generate_mpc_model:=True — exactly like num_obstacles.
+    ego_radius: 0.212
+    ego_disc_offsets: [0.045, 0.335]
+    safe_distance: 0.15
