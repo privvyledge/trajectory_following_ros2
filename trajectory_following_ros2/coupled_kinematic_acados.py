@@ -357,18 +357,35 @@ class AcadosSolverAdapter(BaseSolver):
     def _recover_from_failure(self, x0: np.ndarray, xref: np.ndarray) -> None:
         """Reset the solver after a failed solve and re-seed a clean iterate.
 
-        Zeroes the primal/dual iterate and the QP-solver memory, then seeds the
-        state trajectory from the current state + (keep-out-projected) reference
-        and the inputs with zeros, so the next solve is a well-posed cold start
-        instead of a re-linearization at a degenerate (possibly NaN) iterate.
+        Zeroes the primal/dual iterate and the QP-solver memory, then seeds every
+        stage at the *current state* with zero inputs, so the next solve is a
+        well-posed cold start instead of a re-linearization at a degenerate
+        (possibly NaN) iterate.
+
+        The seed deliberately ignores `xref`. Seeding stages 1..N from the
+        reference looks like the better guess but is the opposite: the reference
+        is anchored `distance_tolerance` (metres) ahead of the vehicle and is
+        pushed laterally aside by the keep-out projection, so stage 0 -> stage 1
+        becomes a metre-scale jump the dynamics cannot make in one `dt`. The
+        seed's dynamics residual is then O(1) instead of ~1e-11, the first QP
+        fails on it, and this method re-installs the *same* seed on the next
+        tick -- a self-sustaining failure latch that freezes the vehicle with
+        metres of clearance and no way out. Measured on two captured failure
+        dumps across five ego speeds: seeding from the reference latched 8 of 10
+        conditions permanently; tiling the current state latched none, escaping
+        to status 0 on the very next solve. An RK4 rollout from x0 was also
+        tried and is worse than tiling (it latched one observed state).
+
+        `xref` is kept in the signature because the recovery is a documented
+        extension point and callers already pass it.
         """
         try:
             self._controller.reset()
         except Exception:  # older interface without reset(): reseeding still helps
             pass
-        self._controller.set(0, 'x', np.asarray(x0, dtype=float))
-        for i in range(1, self._horizon + 1):
-            self._controller.set(i, 'x', np.asarray(xref[:, i], dtype=float))
+        x0 = np.asarray(x0, dtype=float)
+        for i in range(self._horizon + 1):
+            self._controller.set(i, 'x', x0)
         for i in range(self._horizon):
             self._controller.set(i, 'u', np.zeros(2))
 

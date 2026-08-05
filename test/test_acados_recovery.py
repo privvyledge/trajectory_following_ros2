@@ -111,10 +111,10 @@ def test_hard_failure_dump_is_one_shot_and_precedes_clean_reseed(tmp_path):
         np.testing.assert_array_equal(dump['qp_stat'], [3])
         assert dump['status'][0] == '4'
 
-    # Recovery still performs the existing clean reset/reseed after the dump.
+    # Recovery still performs the clean reset/reseed after the dump.
     np.testing.assert_array_equal(controller.states[0], x0)
-    np.testing.assert_array_equal(controller.states[1], xref[:, 1])
-    np.testing.assert_array_equal(controller.states[2], xref[:, 2])
+    np.testing.assert_array_equal(controller.states[1], x0)
+    np.testing.assert_array_equal(controller.states[2], x0)
     np.testing.assert_array_equal(controller.inputs[0], np.zeros(2))
     np.testing.assert_array_equal(controller.inputs[1], np.zeros(2))
 
@@ -122,3 +122,40 @@ def test_hard_failure_dump_is_one_shot_and_precedes_clean_reseed(tmp_path):
     adapter.solve(x0 + 10.0, xref + 10.0, u_prev)
     with np.load(dump_path) as dump:
         np.testing.assert_array_equal(dump['x0'], x0)
+
+
+def test_recovery_seed_is_dynamically_consistent_not_the_reference():
+    """The post-failure re-seed must not snap the horizon onto the reference.
+
+    The reference is anchored `distance_tolerance` metres ahead of the vehicle and
+    is pushed aside by the keep-out projection, so seeding stages 1..N from it puts
+    a metre-scale jump between stage 0 and stage 1 -- a step the dynamics cannot
+    take in one `dt`. The first QP then fails on that seed and the adapter installs
+    the same seed again, latching the failure permanently (the vehicle freezes with
+    metres of clearance). Seeding every stage at the current state keeps the
+    dynamics residual at ~0 and lets the next solve recover.
+    """
+    controller = _FakeController(horizon=3)
+    adapter = _adapter(controller)
+
+    x0 = np.array([1.0, 2.0, 6.9, 0.1])
+    # A reference anchored ~2.5 m ahead and offset laterally, as the live one is.
+    xref = np.array([
+        [3.4, 3.8, 4.2, 4.6],
+        [3.1, 3.5, 3.9, 4.3],
+        [7.7, 7.9, 8.2, 8.2],
+        [0.3, 0.3, 0.3, 0.3],
+    ])
+
+    adapter._recover_from_failure(x0, xref)
+
+    for stage in range(controller.horizon + 1):
+        np.testing.assert_array_equal(controller.states[stage], x0)
+    # The seed must be dynamically benign: no stage-to-stage position jump.
+    steps = [
+        np.linalg.norm(controller.states[s + 1][:2] - controller.states[s][:2])
+        for s in range(controller.horizon)
+    ]
+    assert max(steps) == 0.0
+    for stage in range(controller.horizon):
+        np.testing.assert_array_equal(controller.inputs[stage], np.zeros(2))
