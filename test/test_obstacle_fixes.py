@@ -141,7 +141,90 @@ def test_progress_watchdog_pullaway_trip_release_and_intentional_stop():
     assert watchdog.update(15.0, 20, (1.0, 1.0), 0.15, 1.0, 3.0, 3.0)
     assert not watchdog.update(15.1, 20, (1.6, 1.0), 0.15, 1.0, 3.0, 3.0)
     assert not watchdog.update(30.0, 20, (1.6, 1.0), 0.0, 0.0, -1.0, 3.0)
-    assert not watchdog.update(40.0, 20, (1.6, 1.0), 0.0, -0.5, 1.0, 3.0)
+    # A reverse that is actually under way releases the gate: commanded reverse and
+    # the vehicle measurably moving backwards, but still below the low-speed bound.
+    assert not watchdog.update(40.0, 20, (1.6, 1.0), -0.15, -0.5, 1.0, 3.0)
+
+
+def test_progress_watchdog_trips_while_an_intervention_holds_the_vehicle():
+    """A safety-imposed zero command must not be read as an intentional stop.
+
+    An intervention publishes (0, 0, 0), which satisfies both the intentional-stop
+    and the no-drive-command reset gates, so before `forced_stop` the anchor reset
+    on every tick and the timeout could never elapse -- a vehicle wedged by a
+    latched solver failure sat for 1770 ticks without tripping an 8 s watchdog.
+    """
+    watchdog = ProgressWatchdog(timeout=5.0)
+
+    # Without the flag the same trace never trips, however long it is held.
+    for t in (0.0, 5.0, 60.0, 600.0):
+        assert not watchdog.update(t, 34, (1.0, 2.0), 0.0, 0.0, 0.0, 3.0)
+
+    watchdog.reset()
+    assert not watchdog.update(0.0, 34, (1.0, 2.0), 0.0, 0.0, 0.0, 3.0,
+                               forced_stop=True)
+    assert not watchdog.update(4.9, 34, (1.0, 2.0), 0.0, 0.0, 0.0, 3.0,
+                               forced_stop=True)
+    assert watchdog.update(5.0, 34, (1.0, 2.0), 0.0, 0.0, 0.0, 3.0,
+                           forced_stop=True)
+
+    # Every other release path still works while forced_stop is set.
+    assert not watchdog.update(5.1, 35, (1.0, 2.0), 0.0, 0.0, 0.0, 3.0,
+                               forced_stop=True)          # index advanced
+    assert not watchdog.update(20.0, 35, (1.7, 2.0), 0.0, 0.0, 0.0, 3.0,
+                               forced_stop=True)          # displaced
+    assert not watchdog.update(40.0, 35, (1.7, 2.0), 0.5, 0.0, 0.0, 3.0,
+                               forced_stop=True)          # actually moving
+    assert not watchdog.update(60.0, 35, (1.7, 2.0), 0.0, 0.0, 0.0, 3.0,
+                               forced_stop=True, final_goal_reached=True)
+
+
+def test_progress_watchdog_trips_on_a_reverse_the_plant_never_executes():
+    """A commanded reverse must not release the anchor unless the vehicle moves.
+
+    Replays the terminal signature of both live CARLA runs: the solver returns
+    optimal every tick and commands a full-lock reverse escape at -0.15 m/s, no
+    safety intervention fires, and the vehicle -- in contact with an obstacle --
+    does not move by a millimetre. Keyed on the commanded value alone, the reverse
+    gate reset the anchor on every one of those ticks, so the watchdog stayed
+    silent through more than 160 s of it.
+    """
+    watchdog = ProgressWatchdog(timeout=8.0)
+
+    # The live trace: commanded reverse, measured speed zero, pose pinned.
+    assert not watchdog.update(0.0, 140, (-0.1377, -53.7217), 0.0, -0.15, -3.0, 3.0)
+    assert not watchdog.update(7.9, 140, (-0.1377, -53.7217), 0.0, -0.15, -3.0, 3.0)
+    assert watchdog.update(8.0, 140, (-0.1377, -53.7217), 0.0, -0.15, -3.0, 3.0)
+
+    # A reverse the plant does execute still releases, so backing away is unaffected.
+    watchdog.reset()
+    assert not watchdog.update(0.0, 140, (0.0, 0.0), -0.12, -0.15, -3.0, 3.0)
+    assert not watchdog.update(50.0, 140, (0.0, 0.0), -0.12, -0.15, -3.0, 3.0)
+
+
+def test_progress_watchdog_trips_on_a_sub_deadband_reverse_creep():
+    """A commanded reverse below 0.1 m/s is still an attempt to move, not a stop.
+
+    Replays the live wedge that kept the watchdog silent even after the reverse
+    gate was keyed on measured speed: the command alternates between -0.093 and
+    -0.138 m/s while the pose stays pinned. Half those ticks sit inside the
+    `abs(applied_speed) < 0.1` band shared by the intentional-stop and
+    drive-command gates, so the anchor reset every other tick and the longest
+    non-resetting streak was one tick against an 8 s timeout.
+    """
+    watchdog = ProgressWatchdog(timeout=8.0)
+    pose = (0.0527, -53.1595)
+
+    tripped = False
+    for tick in range(400):                       # 20 s at 20 Hz, live cadence
+        creep = -0.093 if tick % 2 else -0.138    # the measured alternation
+        tripped = watchdog.update(tick * 0.05, 139, pose, 0.0, creep, -2.77, 3.0)
+    assert tripped, 'sub-deadband reverse creep must not read as an intentional stop'
+
+    # A deliberate hold still does not trip: zero command, no reverse creep.
+    watchdog.reset()
+    for tick in range(400):
+        assert not watchdog.update(tick * 0.05, 139, pose, 0.0, 0.0, -1.0, 3.0)
 
 
 def test_avoidance_stop_latch_hysteresis():

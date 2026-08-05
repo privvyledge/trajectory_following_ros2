@@ -66,13 +66,54 @@ class ProgressWatchdog:
     def update(self, now: float, current_idx: int, position, speed: float,
                applied_speed: float, applied_accel: float,
                max_accel: float = 1.0,
-               final_goal_reached: bool = False) -> bool:
-        """Return true once the no-progress condition has held for ``timeout``."""
+               final_goal_reached: bool = False,
+               forced_stop: bool = False) -> bool:
+        """Return true once the no-progress condition has held for ``timeout``.
+
+        ``forced_stop`` marks a zero command *imposed* by a safety intervention or a
+        failed solve, as opposed to one the controller chose. The distinction is
+        load-bearing: without it the watchdog is defeated by the very condition it
+        exists to catch. An intervention publishes ``(0, 0, 0)``, which reads as both
+        an intentional stop and an absence of drive command, so the anchor resets on
+        every tick and the timeout can never elapse -- a vehicle wedged by a latched
+        solver failure sat for 1770 ticks with an 8 s watchdog armed and never tripped
+        it. A forced stop therefore suppresses both of those reset gates; every other
+        gate (goal reached, reverse, index or planar progress, actually moving) still
+        applies, so a deliberate stop at the goal or short of a blocked corridor --
+        which leaves the command path alone -- is unaffected.
+
+        The reverse gate is keyed on *measured* speed, not the commanded value, for
+        the same reason. A reverse escape the plant never executes -- the vehicle in
+        contact with an obstacle, wheels turned, commanding reverse into something
+        solid -- keeps ``applied_speed`` negative forever while nothing moves, and a
+        commanded-only gate resets the anchor on every one of those ticks. Both live
+        runs ended exactly there: full-lock reverse commanded for over 160 s with the
+        vehicle immobile to the last decimal and the watchdog armed and silent. A
+        genuine reverse manoeuvre releases the gate as soon as it is under way (or on
+        the displacement gate), so pulling away backwards is unaffected.
+
+        Keying the reverse gate on measured speed is not sufficient on its own,
+        because the two gates either side of it share a magnitude deadband. A wedge
+        whose commanded reverse creep is *smaller* than 0.1 m/s falls inside the
+        ``abs(applied_speed) < 0.1`` band, so it reads as an intentional stop and as
+        an absence of drive command, and the anchor resets. Measured live: a wedge
+        alternating between -0.093 and -0.138 m/s put 50% of its ticks inside the
+        band, which capped the longest non-resetting streak at a single tick (0.1 s)
+        against an 8 s timeout -- silent through 528 s of a pinned pose. Any
+        commanded reverse is therefore an attempt to move, never an intentional
+        stop: a deliberate hold commands zero or creeps forward, and whether the
+        reverse is real is decided by the measured-speed gate above, not by its
+        magnitude.
+        """
         position = np.asarray(position, dtype=float)
-        intentional_stop = abs(applied_speed) < 0.1 and applied_accel <= 0.0
-        reverse_command = applied_speed < -0.1
+        creeping_backwards = applied_speed < -0.02
+        intentional_stop = (not forced_stop and not creeping_backwards
+                            and abs(applied_speed) < 0.1 and applied_accel <= 0.0)
+        reverse_command = applied_speed < -0.1 and speed < -0.05
         low_speed = abs(speed) < 0.2
-        drive_command = (abs(applied_speed) >= 0.1
+        drive_command = (forced_stop
+                         or creeping_backwards
+                         or abs(applied_speed) >= 0.1
                          or applied_accel > 0.5 * abs(max_accel))
 
         if self._anchor is not None:
@@ -234,6 +275,11 @@ class BaseTrajectoryTracker(Node, ABC):
                 'ego_x', 'ego_y', 'ego_yaw',
                 'safety_obstacle_x', 'safety_obstacle_y', 'safety_obstacle_keepout',
                 'avoidance_required_offset', 'avoidance_bound',
+                # The watchdog verdict on its own, because `safety_reason` cannot
+                # carry it: when an intervention is already holding the vehicle the
+                # reason column keeps that intervention's name, so a wedge and a
+                # correctly-waited transient look identical in every other column.
+                'no_progress',
             ])
             self._solver_log_fh.flush()
             self.get_logger().info(f'Solver stats logging to {path}')
@@ -568,6 +614,7 @@ class BaseTrajectoryTracker(Node, ABC):
                 f"{safety.get('obstacle_keepout', float('nan')):.6f}",
                 f"{getattr(self, '_avoidance_required_offset', float('nan')):.6f}",
                 f"{getattr(self, 'max_avoidance_offset', float('nan')):.6f}",
+                int(bool(getattr(self, '_no_progress_active', False))),
             ])
             self._solver_log_fh.flush()
             self._last_solver_log_ms = (time.monotonic() - log_started) * 1e3
@@ -842,6 +889,9 @@ class BaseTrajectoryTracker(Node, ABC):
         self._progress_watchdog = ProgressWatchdog(self.progress_watchdog_timeout)
         self._avoidance_stop_latch = AvoidanceStopLatch()
         self._avoidance_stop_active = False
+        #: Watchdog verdict for this tick, logged separately from `safety_reason`
+        #: because an intervention already holding the vehicle keeps that column.
+        self._no_progress_active = False
         #: Worst group's required lateral detour on the last projection (diagnostic).
         self._avoidance_required_offset = float('nan')
         self.dt = self.sample_time = 1.0 / self.control_rate
@@ -2151,13 +2201,27 @@ class BaseTrajectoryTracker(Node, ABC):
                 time.monotonic(), self.current_idx, (x, y), vel,
                 applied_speed=applied[2], applied_accel=applied[0],
                 max_accel=self.MAX_ACCEL,
-                final_goal_reached=self.final_goal_reached)
+                final_goal_reached=self.final_goal_reached,
+                forced_stop=bool(safety_reason))
         else:
             self._progress_watchdog.reset()
             no_progress = False
+        self._no_progress_active = bool(no_progress)
         if no_progress and not safety_reason:
             safety_reason = 'no_progress'
             applied = (0.0, 0.0, 0.0)
+        elif no_progress:
+            # An intervention already holds the vehicle at zero, so there is no
+            # command left to take away -- the watchdog's value here is purely that
+            # somebody is told. A wedge under a repeating intervention is otherwise
+            # indistinguishable from correctly waiting out a transient obstacle, and
+            # has previously gone unreported for minutes.
+            self.get_logger().error(
+                f'No progress for {self.progress_watchdog_timeout:.1f} s while '
+                f'"{safety_reason}" holds the vehicle at index {self.current_idx} '
+                f'({x:.2f}, {y:.2f}) -- the intervention is not clearing. Vehicle is '
+                'stopped; operator action is required.',
+                throttle_duration_sec=5.0)
 
         # A safety intervention must freeze the solver warm-start input. Delay this
         # update until every applied-command decision, including the watchdog, is final.

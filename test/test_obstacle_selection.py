@@ -658,3 +658,298 @@ def test_braking_diagnostics_position_is_nan_with_nothing_selected():
     diag = tracker._obstacle_safety_check(
         [], ego_pose=(0.0, 0.0, 0.0), speed=1.5, tick_interval_ms=50.0)
     assert np.isnan(diag['obstacle_x']) and np.isnan(diag['obstacle_y'])
+
+
+# ---------------------------------------------------------------------------
+# The CARLA terminal-stall scene, at CARLA scale.
+#
+# Reconstructed from a logged run in which the vehicle stopped short of a
+# passable corridor and never restarted: the reference projection demanded a
+# 5.9 m lateral detour against a 2.0 m bound, so every tick took the
+# stop-before-the-keep-out branch. Everything below is that scene's geometry
+# driven through the real merge/projection chain, with no ROS and no data files
+# — the poses come from the run's logged geometry block and the disc radii from
+# `obstacle_shape_discs` on the reported dimensions.
+#
+# The scene: a truck stopped essentially on the route centreline, a line of kerb
+# furniture on the near side, and a bollard on the far side of the carriageway.
+# The measured physical corridor between the truck's near edge and the bollard is
+# 4.82 m, and the vehicle needs 2.65 m of it (1.85 m wide + 2 x safe_distance) —
+# so the corridor is passable with ~2.2 m to spare, and the geometrically correct
+# lateral offset is ~3.9 m. What the pipeline actually demands is ~6.95 m.
+#
+# The over-demand is NOT the truck's own projection: the truck alone asks for
+# 3.81 m, which is the right answer. It is the merge fusing the truck with the
+# kerb furniture *behind the vehicle's own side of the road* into one 7.44 m
+# enclosing circle. That distinction decides where a fix belongs, so both halves
+# are pinned below.
+# ---------------------------------------------------------------------------
+
+CARLA_EGO_RADIUS = 1.096
+CARLA_SAFE_DISTANCE = 0.4
+CARLA_DISC_OFFSETS = [-0.4125, 0.7625, 1.9375, 3.1125]
+CARLA_ENGAGEMENT_DISTANCE = 25.0
+CARLA_DETOUR_BOUND = 2.0            # the run's max_avoidance_offset
+
+# Route centreline x in the stall zone; the route runs due south (yaw -pi/2).
+ROUTE_X = -2.007
+ROUTE_Y0 = -184.400
+ROUTE_SPEED = 8.339
+# Vehicle pose while stalled, from the run's logged geometry block.
+STALL_EGO = (1.234420, -181.426559, -0.595800)
+
+TRUCK_ID = 210
+TRUCK_DISC_RADIUS = 2.020267        # 8.468 x 2.891 m box, decomposed into 3 discs
+TRUCK_DISCS = [(-1.964147, -182.701504),
+               (-1.936186, -185.524046),     # the parent centre
+               (-1.908225, -188.346588)]
+# Kerb furniture on the vehicle's own side, well clear of the driving line.
+KERB_NEAR_ID, KERB_NEAR = 3263154216, (-4.440, -184.860)
+KERB_FAR_ID, KERB_FAR = 1133245796, (-4.590, -191.060)
+KERB_NEAR_RADIUS = 0.3              # 0.168 m post, lifted by min_obstacle_radius
+KERB_FAR_RADIUS = 0.326357          # 0.6 x 0.6 m box, above the floor
+# Bollard on the far side of the carriageway — the corridor's other wall.
+BOLLARD_ID, BOLLARD = 2474949318, (4.410, -184.860)
+BOLLARD_RADIUS = 0.3
+
+# Corridor arithmetic, measured from the reported body dimensions.
+CORRIDOR_GAP_M = 4.817              # truck near edge to bollard far edge
+CORRIDOR_NEEDED_M = 2.650           # 1.85 m body + 2 x safe_distance
+CORRECT_OFFSET_M = 3.925            # centre the vehicle in that corridor
+TRUCK_ONLY_OFFSET_M = 3.8055        # what the truck's own projection asks for
+FUSED_OFFSET_M = 6.954              # what the merged circle asks for
+
+
+def _make_carla_tracker(obstacles, num_obstacles=10,
+                        min_obstacle_radius=0.3,
+                        max_avoidance_offset=CARLA_DETOUR_BOUND):
+    """`_make_tracker` at CARLA vehicle scale, with the run's obstacle settings."""
+    del min_obstacle_radius     # applied when building the fixture, not here
+    tracker = _make_tracker(obstacles, num_obstacles=num_obstacles)
+    tracker.max_avoidance_offset = max_avoidance_offset
+    tracker.keepout_engagement_distance = CARLA_ENGAGEMENT_DISTANCE
+    tracker.x, tracker.y, tracker.yaw = STALL_EGO
+    tracker._gp = {'ego_radius': CARLA_EGO_RADIUS,
+                   'safe_distance': CARLA_SAFE_DISTANCE,
+                   'ego_disc_offsets': CARLA_DISC_OFFSETS}.__getitem__
+    return tracker
+
+
+def _stall_scene(kerb_near_radius=KERB_NEAR_RADIUS, bollard_radius=BOLLARD_RADIUS):
+    """The stall scene's detections, in the order the ingestion produced them."""
+    return ([_obstacle(BOLLARD_ID, *BOLLARD, radius=bollard_radius)]
+            + [_obstacle(TRUCK_ID, x, y, radius=TRUCK_DISC_RADIUS)
+               for x, y in TRUCK_DISCS]
+            + [_obstacle(KERB_NEAR_ID, *KERB_NEAR, radius=kerb_near_radius),
+               _obstacle(KERB_FAR_ID, *KERB_FAR, radius=KERB_FAR_RADIUS)])
+
+
+def _stall_xref():
+    """The reference window as the controller had it: due south, one horizon long."""
+    ys = ROUTE_Y0 - ROUTE_SPEED * SAMPLE_TIME * np.arange(HORIZON + 1)
+    return np.vstack([np.full(HORIZON + 1, ROUTE_X), ys,
+                      np.full(HORIZON + 1, ROUTE_SPEED),
+                      np.full(HORIZON + 1, -np.pi / 2)])
+
+
+def _required_offsets(tracker, xref, selected):
+    """Run the merge + projection chain and return (groups, circles, offsets)."""
+    centres = np.array([o['state'][:2] for o in selected], dtype=float)
+    radii = tracker._engaged_keepout_radii(xref, selected, STALL_EGO[:2])
+    sides = tracker._keepout_sides(xref, centres)
+    proj_c, proj_r, groups = tracker._merge_overlapping_keepouts(
+        centres, radii, obstacle_ids=[o['id'] for o in selected], sides=sides)
+    required = tracker._projection_group_offsets(
+        xref, proj_c, proj_r, groups, selected)
+    return groups, (proj_c, proj_r), required
+
+
+def test_stall_scene_fuses_the_truck_with_the_kerb_line():
+    """Characterization: what the pipeline does today, so a fix has to move it.
+
+    Five keep-outs collapse to one 7.44 m enclosing circle straddling the whole
+    carriageway, and the detour it implies (~6.95 m) is more than three times the
+    2.0 m bound — so `_project_reference_out_of_keepouts` takes the stop-short
+    branch on every tick and the vehicle never restarts. Guards the fixture
+    against silent geometry drift, and proves the spec test below fails for the
+    right reason rather than because the scene stopped being the scene.
+    """
+    scene = _stall_scene()
+    tracker = _make_carla_tracker(scene)
+    xref = _stall_xref()
+
+    selected = tracker._select_obstacles(xref, ego_pose=STALL_EGO)
+    groups, (proj_c, proj_r), required = _required_offsets(tracker, xref, selected)
+
+    assert len(selected) == 6
+    fused = max(groups, key=len)
+    assert sorted(selected[i]['id'] for i in fused) == sorted(
+        [TRUCK_ID, TRUCK_ID, TRUCK_ID, KERB_NEAR_ID, KERB_FAR_ID])
+    assert float(proj_r[groups.index(fused)]) == pytest.approx(7.4436, abs=1e-3)
+    assert max(required.values()) == pytest.approx(FUSED_OFFSET_M, abs=0.01)
+    assert max(required.values()) > 3.0 * CARLA_DETOUR_BOUND
+
+
+def test_stall_scene_truck_alone_asks_for_the_geometrically_correct_detour():
+    """The over-demand is the merge, not the truck — which localizes the defect.
+
+    Projected on its own, the truck's keep-out asks for 3.81 m, within 0.12 m of
+    the 3.93 m that centring the vehicle in the measured corridor requires. So the
+    circumscribing-circle inflation on a single body is tolerable here; what is not
+    is fusing that body with furniture on the far kerb. A fix aimed at obstacle
+    radius inflation would therefore not have moved this run.
+    """
+    truck = [o for o in _stall_scene() if o['id'] == TRUCK_ID]
+    tracker = _make_carla_tracker(truck, num_obstacles=3)
+    xref = _stall_xref()
+
+    _, (_, proj_r), required = _required_offsets(tracker, xref, truck)
+
+    assert len(proj_r) == 1, 'the sub-discs of one body are one projection circle'
+    assert max(required.values()) == pytest.approx(TRUCK_ONLY_OFFSET_M, abs=0.01)
+    assert abs(max(required.values()) - CORRECT_OFFSET_M) < 0.25
+
+
+@pytest.mark.xfail(strict=True, reason='F3: the merge fuses the truck with the '
+                                       'near kerb and hides a passable corridor')
+def test_stall_scene_leaves_the_measured_corridor_passable():
+    """Spec: the demanded detour must reflect the corridor that physically exists.
+
+    Between the truck's near edge and the bollard there is 4.82 m of road and the
+    vehicle occupies 2.65 m of it, so a ~3.9 m lateral offset drives through with
+    ~2.2 m to spare. Anything approaching 7 m is not a statement about this scene's
+    geometry — it is the enclosing circle of a group that never blocked a gap the
+    reference uses. Flips loudly when the merge decision moves to lateral intervals
+    per station instead of circle-to-circle distance.
+    """
+    scene = _stall_scene()
+    tracker = _make_carla_tracker(scene)
+    xref = _stall_xref()
+
+    selected = tracker._select_obstacles(xref, ego_pose=STALL_EGO)
+    _, _, required = _required_offsets(tracker, xref, selected)
+
+    assert CORRIDOR_GAP_M - CORRIDOR_NEEDED_M > 2.0, 'the corridor is passable'
+    assert max(required.values()) < CORRECT_OFFSET_M + 0.5
+
+
+def test_the_far_side_bollard_is_held_out_of_the_group_by_the_side_gate():
+    """The far wall of the corridor is *not* what fuses — the near kerb is.
+
+    The truck's centre sub-disc and the bollard are 6.381 m apart against a 6.408 m
+    distance gate, i.e. inside it by 27 mm; on distance alone they would fuse across
+    the carriageway. They do not, because the truck sits 0.074 m off the centreline
+    — just outside `_ON_REFERENCE_TOLERANCE_M` (0.05 m) — so it reports side +1 like
+    the bollard and the same-side gate blocks the pair. Two consequences worth
+    pinning: the bollard projects to a zero detour, and the whole outcome hangs on a
+    24 mm margin in a tolerance constant that was chosen for something else.
+    """
+    scene = _stall_scene()
+    tracker = _make_carla_tracker(scene)
+    xref = _stall_xref()
+    centres = np.array([o['state'][:2] for o in scene], dtype=float)
+    keepouts = tracker._keepout_radii(scene)
+    sides = tracker._keepout_sides(xref, centres)
+    bollard, truck_mid = 0, 2
+
+    gap = float(np.hypot(*(centres[bollard] - centres[truck_mid])))
+    gate = keepouts[bollard] + keepouts[truck_mid] + CARLA_EGO_RADIUS
+
+    assert gap < gate, 'the distance gate alone would fuse them'
+    assert gate - gap == pytest.approx(0.027, abs=0.005)
+    assert sides[bollard] == sides[truck_mid] == 1.0, 'same side: the gate blocks it'
+
+    selected = tracker._select_obstacles(xref, ego_pose=STALL_EGO)
+    groups, _, required = _required_offsets(tracker, xref, selected)
+    assert [BOLLARD_ID] in [[selected[i]['id'] for i in g] for g in groups]
+    assert required[frozenset([BOLLARD_ID])] == pytest.approx(0.0)
+
+
+def test_lowering_the_radius_floor_does_not_dissolve_the_fusion():
+    """The later run lowered `min_obstacle_radius` 0.3 -> 0.1 and did not fix F3.
+
+    The floor only reaches the 0.168 m post, shrinking its keep-out by 0.2 m; the
+    truck and the 0.6 m kerb box are both above the floor and unchanged, so the
+    group and its detour survive intact. Documents that the fusion is driven by the
+    truck's own inflated keep-out plus the merge allowance, not by the floor — the
+    parameter that looks like the obvious lever is not one.
+    """
+    xref = _stall_xref()
+    floored = _stall_scene()
+    lowered = _stall_scene(kerb_near_radius=0.1, bollard_radius=0.1)
+
+    out = {}
+    for label, scene, bound in (('run_g', floored, 2.0), ('run_h', lowered, 3.5)):
+        tracker = _make_carla_tracker(scene, max_avoidance_offset=bound)
+        selected = tracker._select_obstacles(xref, ego_pose=STALL_EGO)
+        groups, _, required = _required_offsets(tracker, xref, selected)
+        out[label] = (max(groups, key=len), max(required.values()), bound)
+
+    for label, (fused, offset, bound) in out.items():
+        assert len(fused) == 5, f'{label}: the group survives the floor change'
+        assert offset == pytest.approx(FUSED_OFFSET_M, abs=0.01)
+        assert offset > bound, f'{label}: still over the bound, so still stop-short'
+
+
+def test_truck_sub_disc_chain_drags_the_kerb_line_in_transitively():
+    """One link is enough: union-find merging has no notion of group extent.
+
+    Only the truck's rear and centre sub-discs are close enough to reach the kerb
+    posts, but the sub-discs are same-parent-merged first, so a single sub-disc
+    to post link pulls the entire 8.5 m truck chain and both posts into one
+    cluster. The resulting enclosing circle spans a region no member ever blocked
+    — which is how a group of five keep-outs, none wider than 3.6 m, becomes a
+    7.44 m circle.
+    """
+    scene = _stall_scene()
+    tracker = _make_carla_tracker(scene)
+    xref = _stall_xref()
+    centres = np.array([o['state'][:2] for o in scene], dtype=float)
+    keepouts = tracker._keepout_radii(scene)
+    sides = tracker._keepout_sides(xref, centres)
+    front_disc, near_post = 1, 4
+
+    reach = float(np.hypot(*(centres[front_disc] - centres[near_post])))
+    gate = keepouts[front_disc] + keepouts[near_post] + CARLA_EGO_RADIUS
+    _, proj_r, groups = tracker._merge_overlapping_keepouts(
+        centres, keepouts, obstacle_ids=[o['id'] for o in scene], sides=sides)
+    fused = max(groups, key=len)
+
+    assert reach < gate, 'this pair does link directly'
+    assert front_disc in fused and near_post in fused
+    assert float(proj_r[groups.index(fused)]) > 2.0 * max(keepouts)
+
+
+@pytest.mark.parametrize('body_gap', [0.62, 0.68, 0.74])
+def test_merge_gate_demands_more_body_gap_than_the_vehicle_needs(body_gap):
+    """Characterization of the merge allowance: it over-demands by one ego radius.
+
+    Two obstacles straddling the reference fuse while their body-to-body gap is
+    under ``2 * (ego_radius + safe_distance) + ego_radius`` — each keep-out already
+    contains one ego radius and one safe distance, and the corridor term then adds a
+    third ego radius on top. What the vehicle actually needs to drive between them
+    is ``2 * ego_radius + 2 * safe_distance`` (its width plus a clearance either
+    side). The parameters here bracket exactly that band: every gap listed is wide
+    enough to drive through and still merges.
+
+    Becomes the spec test, with the assertion inverted, once the decision is made on
+    lateral intervals rather than circle distance.
+    """
+    needed = 2.0 * EGO_RADIUS + 2.0 * SAFE_DISTANCE
+    demanded = 2.0 * (EGO_RADIUS + SAFE_DISTANCE) + EGO_RADIUS
+    assert needed < body_gap < demanded, 'fixture must sit inside the over-demand band'
+
+    half = body_gap / 2.0 + OBSTACLE_RADIUS
+    a = _obstacle(1, 2.0, half)
+    b = _obstacle(2, 2.0, -half)
+    tracker = _make_tracker([a, b], num_obstacles=2)
+    centres = np.array([[2.0, half], [2.0, -half]])
+    sides = tracker._keepout_sides(_straight_xref(), centres)
+
+    _, _, groups = tracker._merge_overlapping_keepouts(
+        centres, tracker._keepout_radii([a, b]), obstacle_ids=[1, 2], sides=sides)
+
+    np.testing.assert_array_equal(sides, [1.0, -1.0])
+    assert len(groups) == 1, (
+        f'{body_gap:.2f} m of body gap is driveable ({needed:.2f} m needed) '
+        f'but the gate merges anything under {demanded:.2f} m')
