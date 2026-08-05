@@ -85,7 +85,11 @@
     # 3.5 was nonetheless REVERTED to 2.0: it converts a deliberate, labelled
     # detour-bound stop (avoidance_stop=1) into an unlabelled stall only the
     # no-progress watchdog catches, it buys no clearance (2.0's minimum approach was
-    # closer, 0.269 m vs 0.399 m), and live it was worse — route index 140 vs 447.
+    # closer, 0.269 m vs 0.399 m), and — decisively — it permitted a 2.26 m reference
+    # swing out of the lane that drove the ego into a light pole at -0.931 m
+    # penetration, the only physical overlap ever recorded on this route. (Route
+    # progress does not separate the two settings: config-identical 2.0 runs reached
+    # index 447 and 139, so the outcome at the pinch is bimodal, not config-driven.)
     max_avoidance_offset: 2.0
     # Floor on every parsed obstacle radius. The default 0.3 is sized for f1tenth
     # perception noise; on this feed 183 of 188 reported objects are BARRIER-class
