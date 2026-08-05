@@ -114,7 +114,14 @@
     # around the obstacle and instead keeps its raw geometry with a braking speed
     # profile, so the car halts short of the keep-out rather than leaving the road
     # (Town01 lanes are ~3.5 m). 0.0 restores the unbounded detour.
+    # Kept in sync with carla_acados_obstacle.yaml, where the reasoning lives: 2.0
+    # bound on 95% of ticks of a measured run and left the car crawling at a median
+    # of 0.18 m/s; the required detour's median was 3.10 m. Raising it to 3.5 was
+    # nonetheless reverted — see the acados overlay for the measurements.
     max_avoidance_offset: 2.0
+    # Floor on every parsed obstacle radius. Kept in sync with the acados overlay:
+    # the 0.3 default inflates a 0.168 m CARLA bollard into a 1.796 m keep-out.
+    # Left at the 0.3 code default for now, same reasoning as the acados overlay.
     # Radius within which a reported object is converted to keep-out discs at all.
     # Kept in sync with carla_acados_obstacle.yaml, where the reasoning lives: the
     # merged feed's whole-level geometry costs ~115 ms of CPU per message to convert,

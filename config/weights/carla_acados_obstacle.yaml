@@ -73,7 +73,28 @@
     # around the obstacle and instead keeps its raw geometry with a braking speed
     # profile, so the car halts short of the keep-out rather than leaving the road
     # (Town01 lanes are ~3.5 m). 0.0 restores the unbounded detour.
+    #
+    # 2.0 was measured to bind on essentially every obstacle on this route, not just
+    # the parked vehicles: over a clean 900 s run the reference was in stop-short mode
+    # on 95% of ticks (3773/3965) and the required detour had a median of 3.10 m. The
+    # result was safe but not driveable — median applied speed 0.18 m/s, 59% of ticks
+    # below 0.5 m/s, stopping at 16-19 m out and then crawling past at 0-1.4 m/s.
+    # 3.5 clears that median with margin. It does permit crossing into the oncoming
+    # lane, which the car already does when squeezing past the parked truck.
+    #
+    # 3.5 was nonetheless REVERTED to 2.0: it converts a deliberate, labelled
+    # detour-bound stop (avoidance_stop=1) into an unlabelled stall only the
+    # no-progress watchdog catches, it buys no clearance (2.0's minimum approach was
+    # closer, 0.269 m vs 0.399 m), and live it was worse — route index 140 vs 447.
     max_avoidance_offset: 2.0
+    # Floor on every parsed obstacle radius. The default 0.3 is sized for f1tenth
+    # perception noise; on this feed 183 of 188 reported objects are BARRIER-class
+    # street furniture, and the floor turns a 0.168 x 0.168 m bollard into a
+    # 0.3 + ego_radius 1.096 + safe_distance 0.4 = 1.796 m keep-out — half a 3.5 m
+    # lane for a 17 cm post. CARLA reports true dimensions, so the floor only needs
+    # to catch the zero-dimension actors it also reports.
+    # Left at the 0.3 code default for now: it was lowered to 0.1 in the same run
+    # whose detour bound is reverted above, and was never separately measured.
     # Radius within which a reported object is converted to keep-out discs at all.
     # The merged CARLA feed carries the whole level's static geometry (~1235 objects
     # -> ~3154 discs), and converting every one of them on every message costs about
