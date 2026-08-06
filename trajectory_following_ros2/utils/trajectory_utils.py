@@ -289,6 +289,10 @@ def project_index_and_lookahead(waypoints, cum_dist, position, floor_index=0,
         genuinely moved away (localization jump) — and the projection falls back
         to the full ungated window so it can re-acquire; a ratchet capture cannot
         trigger this, since there the local segment is the nearest candidate.
+        **Invariant:** however small the budget, the window always contains the
+        waypoint after ``floor_index``. The budget is metres and the thing it
+        gates is an index step, so a single gap wider than the budget would
+        otherwise be uncrossable and freeze the anchor permanently.
     :return: ``(target_indices, distances, proj_index, status)`` where
         ``target_indices`` is a 1-element array with the look-ahead target (empty
         unless ``status`` is ``'ok'``), ``distances`` the matching vehicle
@@ -318,8 +322,26 @@ def project_index_and_lookahead(waypoints, cum_dist, position, floor_index=0,
     # capped by this tick's advance budget (the anchor-ratchet guard — see the
     # max_advance note above)
     span = min(projection_window, max_advance)
+    forward_arc = (cum_dist - s_floor) <= span
+    # The span is an arc-length budget, but what it actually gates is an INDEX
+    # step, and those two only agree while waypoints are dense. One gap wider than
+    # the budget -- a dropout in a recorded route, or any sparsely sampled plan --
+    # collapses the window to {floor_index} alone: the anchor can never cross,
+    # the reference index freezes for the rest of the run, and nothing downstream
+    # notices (status stays 'ok', every solve optimal, no watchdog trips). So
+    # always offer the next waypoint, whatever the budget says.
+    #
+    # This does not weaken the anchor-ratchet guard. With the budget spent the
+    # window holds exactly two candidates, floor_index and its successor, and the
+    # successor is taken only when it is strictly nearer to the vehicle -- so a
+    # stationary or oscillating vehicle walks to the local minimum and stops
+    # there, and the multi-pass cascade the guard exists to prevent (jumping to a
+    # later pass at the window's far edge) remains impossible, since those points
+    # are not in the window at all.
+    if floor_index + 1 < n:
+        forward_arc[floor_index + 1] = True
     window_mask = ((indices >= floor_index)
-                   & ((cum_dist - s_floor) <= span)
+                   & forward_arc
                    & (distances <= max_search_radius))
     window_indices = indices[window_mask]
     if len(window_indices) == 0:
@@ -573,6 +595,49 @@ def get_arc_lengths(waypoints):
     dists_cum = np.cumsum(consecutive_diff)
     dists_cum = np.insert(dists_cum, 0, 0.0)
     return dists_cum
+
+
+def resample_positions_by_arclength(waypoints, spacing):
+    """Fractional source positions that resample a path at uniform arc length.
+
+    Returns an array of *fractional indices* into ``waypoints`` rather than
+    resampled coordinates, so the caller can carry every other column across the
+    same resampling with one ``np.interp`` each (and handle angles with a
+    sin/cos interpolation, which a naive interp on yaw would get wrong at the
+    +/-pi branch).
+
+    Motivation: a recorded route is sampled in *time*, so its spacing follows the
+    driver's speed, and a dropout in the source data leaves a hole no smoother
+    closes -- ``filters.smooth_and_interpolate_coordinates`` fits a spline and
+    evaluates it at the *input* parameter values, returning one point per input
+    point, so it changes where the waypoints are but never how many or how far
+    apart. A hole then survives into the published path, where a wide enough gap
+    can stall a reference-index projection (see ``project_index_and_lookahead``).
+
+    Endpoints are preserved exactly: the first and last waypoints always appear,
+    so resampling cannot move where the route starts or where it ends.
+
+    :param waypoints: (N, 2) path x/y.
+    :param spacing: target arc length between consecutive output points (m).
+    :return: (M,) float array of positions in ``[0, N-1]``, or ``None`` when the
+        path is too short or ``spacing`` is not positive (nothing to do).
+    """
+    waypoints = np.asarray(waypoints, dtype=float)
+    if spacing <= 0.0 or len(waypoints) < 2:
+        return None
+    cum_dist = cumulative_distance_along_path(waypoints[:, :2])
+    total = float(cum_dist[-1])
+    if total <= 0.0:
+        return None
+    # Round to the nearest whole number of segments so the spacing is uniform and
+    # the final point lands exactly on the path end rather than a stub short of it.
+    n_segments = max(1, int(round(total / spacing)))
+    s_new = np.linspace(0.0, total, n_segments + 1)
+    # cum_dist is nondecreasing; np.interp needs it strictly increasing to invert.
+    # Duplicate waypoints produce flat spots, so nudge them apart by an amount far
+    # below any real spacing.
+    s_mono = np.maximum.accumulate(cum_dist + np.arange(len(cum_dist)) * 1e-12)
+    return np.interp(s_new, s_mono, np.arange(len(waypoints), dtype=float))
 
 
 def cumulative_distance_along_path(waypoints):
@@ -1235,34 +1300,56 @@ def generate_reference_trajectory_by_interpolation(trajectory, init_pose, closes
     # the curvature at that spacing, the two are coupled — so march arc length forward
     # one step at a time:
     #     v[h]   = clip( min( profile[h], sqrt(a_lat_max / |kappa[h]|) ), v_floor, v_cap )
-    #     s[h+1] = s[h] + march * dt * v[h]
-    # v_target supplies the upper cap and the travel direction (sign); v_min lifts the
+    #     s[h+1] = s[h] + dt * v[h]
+    #
+    # Arc length ALWAYS advances, whichever way the vehicle is travelling: s indexes
+    # position along the recorded path, and a route that ends by backing up stores that
+    # manoeuvre as *more* arc length, not less. Only the reference SPEED carries the
+    # travel direction, taken per stage from the sign of the recorded profile so a
+    # forward-to-reverse cusp inside the horizon is represented exactly. Walking s
+    # backwards on a negative speed (the previous behaviour) puts the two in direct
+    # contradiction -- at a reverse anchor the reference positions retreat onto the
+    # forward leg, i.e. they move the vehicle the opposite way from the speed reference,
+    # and the tracker resolves that by stopping dead short of the goal with every solve
+    # optimal and no watchdog able to see it.
+    #
+    # v_target supplies the upper cap, and the travel direction wherever there is no
+    # recorded profile to take it from; v_min lifts the
     # noisy near-zero recorded start so the vehicle pulls away (the controller's
     # end-of-path/goal terminator handles the actual stop, so the floor never traps it).
     _curv_limit = a_lat_max is not None and a_lat_max > 0.0
     if v_target is not None and (_curv_limit or use_speed_profile):
         cols = waypoint_keys_to_columns
         cum_dist = trajectory[:, cols['cum_dist']]
-        march = 1.0 if v_target >= 0.0 else -1.0
+        default_direction = 1.0 if v_target >= 0.0 else -1.0
         cap = abs(v_target) if v_max is None else min(abs(v_target), abs(v_max))
         floor = min(max(0.0, v_min), cap)  # floor cannot exceed the cap
         kappa_col = np.abs(trajectory[:, cols['curvature']])
-        speed_col = np.abs(trajectory[:, cols['speed']])
+        signed_speed_col = trajectory[:, cols['speed']]
+        speed_col = np.abs(signed_speed_col)
         eps = 1e-3  # avoids divide-by-zero on straight segments (kappa ~ 0)
+        # Below this the recorded direction is noise (the vehicle is at a standstill or
+        # at the reversal itself), so hold the last committed direction rather than
+        # dithering the sign of the reference speed tick to tick.
+        direction_deadband = 0.05
 
         s = trajectory[closest_index, cols['cum_dist']]
         s_samples = [s]
         v_samples = []
+        direction = default_direction
         for _ in range(horizon):
             v_h = cap
             if use_speed_profile:
                 v_h = min(v_h, float(np.interp(s, cum_dist, speed_col)))
+                recorded = float(np.interp(s, cum_dist, signed_speed_col))
+                if abs(recorded) >= direction_deadband:
+                    direction = 1.0 if recorded > 0.0 else -1.0
             if _curv_limit:
                 kappa = float(np.interp(s, cum_dist, kappa_col))
                 v_h = min(v_h, float(np.sqrt(a_lat_max / max(kappa, eps))))
             v_h = min(max(v_h, floor), cap)
-            v_samples.append(v_h)
-            s = s + march * dt * v_h
+            v_samples.append(direction * v_h)
+            s = s + dt * v_h
             s_samples.append(s)
         v_samples.append(v_samples[-1])  # v_N = v_{N-1}; matches the horizon+1 length
 
@@ -1277,7 +1364,7 @@ def generate_reference_trajectory_by_interpolation(trajectory, init_pose, closes
         waypoint_dict['yaw_ref'] = fix_angle_reference(
             interpolate_angles(interp_to_fit, cum_dist, trajectory[:, cols['yaw']]),
             yaw_init)
-        waypoint_dict['vel_ref'] = march * np.asarray(v_samples)
+        waypoint_dict['vel_ref'] = np.asarray(v_samples)
         return waypoint_dict
 
     if v_target is not None:

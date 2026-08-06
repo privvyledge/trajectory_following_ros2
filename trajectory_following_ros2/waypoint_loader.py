@@ -59,6 +59,18 @@ class WaypointLoaderNode(Node):
                                                                'if there is no valid '
                                                                'transformation to the target frame.'))
         self.declare_parameter('remove_duplicates', True)
+        # Uniform arc-length resampling of the loaded route. `smooth_path` does NOT
+        # do this despite its helper being called "smooth_and_interpolate": a spline
+        # smoother evaluated at its own input parameters returns one point per input
+        # point, so it moves waypoints but never changes their spacing. A route
+        # recorded in time inherits the driver's speed as its spacing, and a dropout
+        # in the source data leaves a hole that survives every stage of loading.
+        # 0.0 = off (publish the recorded sampling unchanged).
+        self.declare_parameter('resample_spacing', 0.0,
+                               ParameterDescriptor(description='Resample the route at this uniform '
+                                                               'arc-length spacing (m) before smoothing. '
+                                                               '0.0 disables resampling. Endpoints are '
+                                                               'preserved exactly.'))
         self.declare_parameter('smooth_path', True)
         self.declare_parameter('smooth_speed', True)
         self.declare_parameter('smooth_yaw', True)
@@ -103,6 +115,7 @@ class WaypointLoaderNode(Node):
         self.publish_if_transform_fails = self.get_parameter('publish_if_transform_fails').value
 
         self.remove_duplicates = self.get_parameter('remove_duplicates').value
+        self.resample_spacing = self.get_parameter('resample_spacing').value
         self.smooth_path = self.get_parameter('smooth_path').value
         self.smooth_speed = self.get_parameter('smooth_speed').value
         self.smooth_yaw = self.get_parameter('smooth_yaw').value
@@ -149,6 +162,74 @@ class WaypointLoaderNode(Node):
     def get_waypoints_from_csv(self, path_to_csv):
         return pd.read_csv(path_to_csv, skipinitialspace=True, encoding='utf-8-sig')
 
+    def _resample_waypoints(self, spacing):
+        """Resample the loaded route at uniform arc length, in place.
+
+        Every column is carried across the same resampling: x/y/z and the scalar
+        columns by linear interpolation, yaw through sin/cos so the +/-pi branch
+        cannot produce a spurious half-turn between two adjacent headings, the
+        quaternion rebuilt from the resampled yaw (a component-wise interpolation
+        of a quaternion is not a rotation), and frame_id taken from the nearest
+        source row since it is categorical.
+        """
+        columns = self.csv_data.columns
+        xy = self.csv_data[["x", "y"]].to_numpy(dtype=float)
+        positions = trajectory_utils.resample_positions_by_arclength(xy, spacing)
+        if positions is None:
+            self.get_logger().warning(
+                f'resample_spacing={spacing} requested but the route is degenerate '
+                f'({len(xy)} points, zero length); publishing it unchanged.')
+            return
+
+        source = np.arange(len(xy), dtype=float)
+        resampled = {}
+        for name in columns:
+            column = self.csv_data[name]
+            if name == 'frame_id' or column.dtype == object:
+                resampled[name] = column.to_numpy()[np.rint(positions).astype(int)]
+            elif name == 'yaw':
+                s = np.interp(positions, source, np.sin(column.to_numpy(dtype=float)))
+                c = np.interp(positions, source, np.cos(column.to_numpy(dtype=float)))
+                resampled[name] = np.arctan2(s, c)
+            else:
+                resampled[name] = np.interp(positions, source, column.to_numpy(dtype=float))
+
+        if {'qx', 'qy', 'qz', 'qw'}.issubset(columns):
+            half = resampled['yaw'] / 2.0
+            zeros = np.zeros_like(half)
+            resampled['qx'], resampled['qy'] = zeros, zeros
+            resampled['qz'], resampled['qw'] = np.sin(half), np.cos(half)
+
+        before = len(xy)
+        self.csv_data = pd.DataFrame(resampled, columns=columns)
+        self.get_logger().info(
+            f'Resampled route at {spacing:.3f} m: {before} -> {len(self.csv_data)} waypoints.')
+
+    def _report_waypoint_spacing(self):
+        """Log the route's waypoint spacing, loudly when it is uneven.
+
+        A hole in a recorded route is invisible everywhere else: it survives
+        smoothing untouched, the published Path looks normal, and downstream the
+        only symptom is a reference index that silently stops advancing. Report it
+        here, where the route is still identifiable by file name.
+        """
+        xy = self.csv_data[["x", "y"]].to_numpy(dtype=float)
+        if len(xy) < 3:
+            return
+        gaps = np.hypot(*np.diff(xy, axis=0).T)
+        median, largest = float(np.median(gaps)), float(gaps.max())
+        # A recorded route's spacing tracks the driver's speed, so a few times the
+        # median is ordinary; an order of magnitude is a dropout, not driving.
+        if median > 0.0 and largest > 10.0 * median:
+            self.get_logger().warning(
+                f'Uneven waypoint spacing in {self.file_path}: largest gap {largest:.3f} m vs '
+                f'{median:.3f} m median, at index {int(np.argmax(gaps))}. This looks like a '
+                f'dropout in the recording rather than driving. Set resample_spacing to even it out.')
+        else:
+            self.get_logger().info(
+                f'Waypoint spacing: {median:.3f} m median, {largest:.3f} m largest '
+                f'({len(xy)} waypoints).')
+
     def waypoint_parser(self):
         """Build Path, speed, and MarkerArray messages from loaded waypoints. Runs once."""
         self._parse_stamp = self.get_clock().now().to_msg()
@@ -193,6 +274,11 @@ class WaypointLoaderNode(Node):
 
         if self.remove_duplicates:
             self.csv_data = self.csv_data.drop_duplicates(subset=["x", "y"], keep='first')
+
+        if self.resample_spacing > 0.0:
+            self._resample_waypoints(self.resample_spacing)
+
+        self._report_waypoint_spacing()
 
         # optional smoothing
         if self.smooth_path:

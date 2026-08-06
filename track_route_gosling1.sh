@@ -68,6 +68,20 @@ TRACK_MAX_SPEED="${TRACK_MAX_SPEED:-0.8}"
 # ideally config/platforms/f1tenth.yaml) and this follows automatically.
 TRACK_MAX_STEER_DEG="${TRACK_MAX_STEER_DEG:-$(python3 -c "import math;print(round(math.degrees($MAX_STEERING),2))")}"
 
+# Uniform arc-length resampling of the route, metres, applied by waypoint_loader
+# before smoothing. On by default HERE rather than in the loader, whose global
+# default stays 0.0 so no existing CARLA or f1tenth route silently changes its
+# waypoint count.
+#
+# 0.05 m matches the ~0.045 m median spacing of the recorded gosling1 drives and
+# equals one tick of travel at 1 m/s / 20 Hz. It exists because these recordings
+# contain dropouts -- figure8 has a single 0.555 m hole against that median --
+# and smoothing does not close them: the spline is evaluated at the input
+# parameter values, so it moves waypoints without ever changing their spacing.
+# A hole wider than the reference projection can step over stalls the reference
+# index silently (every solve optimal, no watchdog).
+TRACK_RESAMPLE_SPACING="${TRACK_RESAMPLE_SPACING:-0.05}"
+
 SESSION_DIR="${SSD_ROOT}/run/track"
 MPC_PID_F="${SESSION_DIR}/mpc.pid"
 MPC_LOG="${SESSION_DIR}/mpc.log"
@@ -180,6 +194,7 @@ do_launch() {
       namespace:="$NS" \
       load_waypoints:=True \
       waypoints_csv:="$csv" \
+      resample_spacing:="$TRACK_RESAMPLE_SPACING" \
       waypoint_target_frame:="$GLOBAL_FRAME" \
       global_frame:="$GLOBAL_FRAME" \
       robot_frame:="$ROBOT_FRAME" \

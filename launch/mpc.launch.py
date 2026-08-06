@@ -63,6 +63,7 @@ def generate_launch_description():
     discrete_integration_method = LaunchConfiguration('discrete_integration_method')
     load_waypoints = LaunchConfiguration('load_waypoints')
     waypoints_csv = LaunchConfiguration('waypoints_csv')
+    resample_spacing = LaunchConfiguration('resample_spacing')
 
     # Constraints
     saturate_input = LaunchConfiguration('saturate_input')
@@ -357,6 +358,16 @@ def generate_launch_description():
             description='Path to the waypoints csv file.'
     )
 
+    resample_spacing_la = DeclareLaunchArgument(
+            'resample_spacing',
+            default_value='0.0',
+            description='waypoint_loader: resample the route at this uniform arc-length '
+                        'spacing (m) before smoothing; 0.0 = publish the recorded sampling '
+                        'unchanged. Smoothing alone does NOT even out spacing, and a gap '
+                        'wider than the reference projection can step over stalls the '
+                        'reference index.'
+    )
+
     saturate_input_la = DeclareLaunchArgument(
             'saturate_input',
             default_value='True',
@@ -648,7 +659,7 @@ def generate_launch_description():
              merge_obstacle_sources_la, obstacle_source_topics_la,
              obstacle_source_qos_la, obstacle_gate_radius_la,
              discrete_model_type_la, discrete_integration_method_la,
-             load_waypoints_la, waypoints_csv_la,
+             load_waypoints_la, waypoints_csv_la, resample_spacing_la,
              saturate_input_la, allow_reversing_la, max_speed_la, min_speed_la, max_accel_la, max_decel_la,
              max_steer_la, min_steer_la, max_steer_rate_la, desired_speed_la,
              mpc_toolbox_la, control_type_la, horizon_la, sample_time_la, prediction_time_la,
@@ -968,6 +979,10 @@ def generate_launch_description():
                 # Only waypoint_loader declares target_frame_id; the controllers do not
                 # auto-declare from overrides, so this is a no-op for them.
                 SetParameter(name='target_frame_id', value=waypoint_target_frame,
+                             condition=IfCondition(load_params_from_args)),
+                # Only waypoint_loader declares this one too.
+                SetParameter(name='resample_spacing',
+                             value=ParameterValue(resample_spacing, value_type=float),
                              condition=IfCondition(load_params_from_args)),
 
                 # # Remap common topics

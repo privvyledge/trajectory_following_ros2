@@ -151,6 +151,8 @@ def generate_launch_description():
     solver_failure_zero_on_saturation = LaunchConfiguration(
         'solver_failure_zero_on_saturation')
     acados_failure_dump_file = LaunchConfiguration('acados_failure_dump_file')
+    forward_escape_enabled = LaunchConfiguration('forward_escape_enabled')
+    forward_escape_speed = LaunchConfiguration('forward_escape_speed')
 
     obstacle_topic = LaunchConfiguration('obstacle_topic')
     footprint_topic = LaunchConfiguration('footprint_topic')
@@ -362,6 +364,30 @@ def generate_launch_description():
         DeclareLaunchArgument('initial_speed', default_value='0.0',
                               description='Simulator initial speed (m/s).'),
         DeclareLaunchArgument(
+            'resample_spacing', default_value='0.0',
+            description='waypoint_loader: resample the route at this uniform arc-length '
+                        'spacing (m) before smoothing; 0.0 = publish the recorded '
+                        'sampling unchanged. Smoothing alone does NOT even out spacing.'),
+        DeclareLaunchArgument(
+            'sim_wheelbase', default_value='0.0',
+            description='Override the SIMULATOR wheelbase only (m); 0.0 = use the '
+                        'platform value for both sides. Use it to model steady-state '
+                        'oversteer: the plant turns more sharply than the kinematic '
+                        'model the controller plans with, as a real vehicle does.'),
+        DeclareLaunchArgument(
+            'steering_time_constant', default_value='0.0',
+            description='Simulator first-order steering actuation lag (s). 0.0 = '
+                        'ideal. Measured on the gosling1 F1/10 as ~0.05 s of '
+                        'first-order lag behind ~0.12 s of transport delay; feed '
+                        'the transport delay to the controller separately via '
+                        'estimated_delay, which this simulator does not model.'),
+        DeclareLaunchArgument(
+            'acceleration_time_constant', default_value='0.0',
+            description='Simulator first-order acceleration actuation lag (s). '
+                        '0.0 = ideal. ~0.07-0.09 s on the gosling1 F1/10, though '
+                        'that chain tracks its command closely enough that the fit '
+                        'is only weakly identified.'),
+        DeclareLaunchArgument(
             'step_on_command', default_value='false',
             description='Lockstep the simulator to the controller: advance physics '
                         'one dt only when a new drive command arrives, instead of '
@@ -422,6 +448,14 @@ def generate_launch_description():
             'acados_failure_dump_file', default_value='',
             description='acados only: write the first hard-failure inputs and solver stats '
                         'to this .npz file before recovery reset (empty = disabled).'),
+        DeclareLaunchArgument(
+            'forward_escape_enabled', default_value='auto',
+            choices=['auto', 'true', 'false'],
+            description='Bounded forward-escape override. auto preserves the loaded '
+                        'YAML value; true/false is authoritative for replay A/B arms.'),
+        DeclareLaunchArgument(
+            'forward_escape_speed', default_value='1.0',
+            description='Maximum bounded escape-reference speed in m/s.'),
     ]
 
     # ---- 1. Static transform: map -> odom (identity) ------------------------
@@ -446,6 +480,7 @@ def generate_launch_description():
         parameters=[{
             'file_path': waypoints_csv,
             'target_frame_id': map_frame,
+            'resample_spacing': LaunchConfiguration('resample_spacing'),
         }],
         remappings=[
             ('waypoint_loader/path', 'trajectory/path'),
@@ -472,8 +507,8 @@ def generate_launch_description():
         'noise_std_y': 0.0,
         'noise_std_v': 0.0,
         'noise_std_psi': 0.0,
-        'steering_time_constant': 0.0,
-        'acceleration_time_constant': 0.0,
+        'steering_time_constant': LaunchConfiguration('steering_time_constant'),
+        'acceleration_time_constant': LaunchConfiguration('acceleration_time_constant'),
     }]
     # Built in an OpaqueFunction so the platform overlay's PHYSICAL vehicle params
     # (wheelbase, steer/speed/accel limits) can be resolved and applied to the
@@ -504,6 +539,17 @@ def generate_launch_description():
                     doc = yaml.safe_load(fh) or {}
                 params = (doc.get('/**', {}) or {}).get('ros__parameters', {}) or {}
                 sim_phys = {k: v for k, v in params.items() if k in physical_keys}
+        # Plant-only wheelbase override, applied after the platform overlay so the
+        # CONTROLLER keeps the platform value while the PLANT turns differently.
+        # That asymmetry is the point: a real car does not obey the kinematic
+        # bicycle it is controlled with. The gosling1 F1/10 rotates 13-18% faster
+        # than Ackermann predicts, and a sim where both sides share one wheelbase
+        # hides that error entirely — it under-turns exactly as the controller
+        # expects, so a route the real car can drive reads as infeasible.
+        # Set it to wheelbase / (measured omega / Ackermann omega).
+        sim_wb = LaunchConfiguration('sim_wheelbase').perform(context)
+        if sim_wb and float(sim_wb) > 0.0:
+            sim_phys = {**sim_phys, 'wheelbase': float(sim_wb)}
         sim_params = [{**simulator_params[0], **sim_phys}]
         return [
             Node(
@@ -580,6 +626,9 @@ def generate_launch_description():
     #   weights.yaml -> sim frames/topics (+ code_gen_directory).
     def _make_controller_nodes(context, *_args, **_kwargs):
         overlays = _overlay_files(context, platforms_dir, weights_dir)
+        escape_mode = forward_escape_enabled.perform(context).lower()
+        escape_override = ({} if escape_mode == 'auto' else
+                           {'forward_escape_enabled': escape_mode == 'true'})
 
         # Backend-agnostic reference-index params (base_tracker) applied to every
         # controller. Placed BEFORE the overlays so a weights file may still pin them
@@ -598,6 +647,8 @@ def generate_launch_description():
             'estimated_delay': ParameterValue(estimated_delay, value_type=float),
             'delay_compensation_method': delay_compensation_method,
             'solver_log_file': solver_log_file,
+            'forward_escape_speed': ParameterValue(
+                forward_escape_speed, value_type=float),
         }
         # Safety/diagnostic flags are explicit launch choices and therefore follow
         # platform/weight overlays rather than being silently overridden by them.
@@ -635,7 +686,8 @@ def generate_launch_description():
                 parameters=_params(
                     casadi_solver_params,
                     {**sim_controller_params, 'code_gen_directory': code_gen_directory,
-                     'use_opti': use_opti, 'num_obstacles': num_obstacles}),
+                     'use_opti': use_opti, 'num_obstacles': num_obstacles,
+                     **escape_override}),
             ),
             Node(
                 condition=LaunchConfigurationEquals('mpc_toolbox', 'acados'),
@@ -649,7 +701,8 @@ def generate_launch_description():
                      'num_obstacles': num_obstacles,
                      'generate_mpc_model': ParameterValue(
                          generate_mpc_model, value_type=bool),
-                     'acados_failure_dump_file': acados_failure_dump_file}),
+                     'acados_failure_dump_file': acados_failure_dump_file,
+                     **escape_override}),
             ),
             Node(
                 condition=LaunchConfigurationEquals('mpc_toolbox', 'do_mpc'),
@@ -657,7 +710,8 @@ def generate_launch_description():
                 executable='coupled_kinematic_do_mpc',
                 name='kinematic_coupled_do_mpc_controller',
                 output='screen',
-                parameters=_params(do_mpc_solver_params, dict(sim_controller_params)),
+                parameters=_params(
+                    do_mpc_solver_params, {**sim_controller_params, **escape_override}),
             ),
             Node(
                 condition=LaunchConfigurationEquals('control_type', 'purepursuit'),
@@ -665,7 +719,7 @@ def generate_launch_description():
                 executable='purepursuit',
                 name='purepursuit_controller',
                 output='screen',
-                parameters=_params({}, dict(sim_controller_params)),
+                parameters=_params({}, {**sim_controller_params, **escape_override}),
             ),
         ]
 

@@ -1,0 +1,55 @@
+/**:
+  ros__parameters:
+    # ---------------------------------------------------------------------------
+    # gosling1 (F1/10) × acados — POST-RECALIBRATION counterpart of
+    # gosling1_acados.yaml. Identical in every respect except max_steer.
+    # Overlay (highest wins): weights > platforms/f1tenth.yaml > base.
+    #
+    #   ros2 launch trajectory_following_ros2 closed_loop_sim.launch.py \
+    #       platform:=f1tenth weights:=gosling1_acados_recal mpc_toolbox:=acados \
+    #       waypoints_csv:=<repo>/data/gosling1_figure8_odomframe.csv
+    #
+    # The 14.32 deg the car runs today is a calibration artifact — the servo
+    # calibration in use was produced on a different F1/10, while this car's
+    # mechanical lock looks closer to 30 deg. 23 deg is the conservative value to
+    # validate against BEFORE recalibrating, so the recalibration is a decision
+    # backed by a simulated result rather than the other way round.
+    # DO NOT run this on hardware until the servo is actually recalibrated: the
+    # driver will clip anything past 14.32 deg silently and the car will simply
+    # under-turn every corner the controller planned.
+    # ---------------------------------------------------------------------------
+    horizon: 25
+    sample_time: 0.05
+    prediction_time: 1.25
+    termination_condition: 0.1
+
+    nlp_solver_type: SQP
+    max_iter: 20
+
+    Q:  [100.0, 100.0, 100.0, 16.0]
+    Qf: [200.0, 200.0, 200.0, 40.0]
+    R:  [0.01, 0.01]
+    Rd: [10.0, 10.0]
+    use_bryson_weights: false
+
+    # The limit the car is under TODAY, not a physical one. It comes from
+    # MAX_STEERING in the robot's live_runs/00_env.sh, whose servo calibration was
+    # produced on a DIFFERENT F1/10; the mechanical lock on this car looks closer
+    # to 30 deg. Commands beyond 0.257 rad (14.71 deg) clip silently inside the
+    # VESC driver, so a controller allowed the platform's 27 deg plans corners this
+    # car will not execute and nothing reports an error.
+    #
+    # 14.32 deg puts the tightest achievable radius at 0.256 / tan(14.32) = 1.00 m
+    # against a recorded route minimum of ~0.85 m, and the recorded drives sat at
+    # full lock for 23-52% of their length — i.e. the routes were driven with no
+    # steering margin left for tracking error. See gosling1_acados_recal.yaml for
+    # the post-recalibration counterpart.
+    max_steer: 23.0
+    min_steer: -23.0
+
+    use_speed_profile: True
+    max_lateral_accel: 3.0
+    min_reference_speed: 0.3
+
+    generate_mpc_model: True
+    build_with_cython: True

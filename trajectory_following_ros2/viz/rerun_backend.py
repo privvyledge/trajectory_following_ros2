@@ -18,6 +18,23 @@ from trajectory_following_ros2.utils.trajectory_utils import resolve_ego_disc_of
 _MULTISINK_MIN_VERSION = (0, 23, 0)
 
 
+def _lan_address() -> str:
+    """This host's outward-facing IP, for a URL another machine can reach.
+
+    Connecting a UDP socket assigns a local address without sending anything, so
+    this picks the interface the default route would use — unlike a hostname
+    lookup, which on many setups resolves to 127.0.0.1. Falls back to localhost
+    when there is no route at all.
+    """
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(('10.255.255.255', 1))
+            return probe.getsockname()[0]
+    except OSError:
+        return 'localhost'
+
+
 def _rerun_version() -> Tuple[int, int, int]:
     """Installed rerun version as a (major, minor, patch) int tuple."""
     parts = []
@@ -175,11 +192,22 @@ class RerunBackend(BaseVizBackend):
             wp = web_port if web_port is not None else 9090
             ws_port = 9877
             rr.serve_web(open_browser=open_browser, web_port=wp, ws_port=ws_port)
+            # Both ports are bound on 0.0.0.0, so the host address works from any
+            # machine on the network. Print it alongside localhost rather than
+            # instead of it: localhost is right when the browser runs on this host,
+            # but it is only *usually* right from Windows against WSL2 (mirrored
+            # networking, an occupied port, or a firewall rule each break the
+            # forward) and wrong from any other machine. Two URLs beat one that
+            # fails with an empty page and no explanation.
+            host = _lan_address()
             print(
-                f'[RerunBackend] Web viewer ready. Open this FULL URL in your browser '
-                f'(bare http://localhost:{wp} shows the empty start page):\n'
+                f'[RerunBackend] Web viewer ready. Open one of these FULL URLs '
+                f'(bare http://<host>:{wp} shows the empty start page — the ?url= '
+                f'data-source suffix is required):\n'
                 f'    http://localhost:{wp}/?url=ws://localhost:{ws_port}\n'
-                f'    (WSL2: localhost forwards to Windows automatically.)',
+                f'    http://{host}:{wp}/?url=ws://{host}:{ws_port}\n'
+                f'    Use the second if the first shows nothing (WSL2 localhost '
+                f'forwarding is not guaranteed), and always from another machine.',
                 flush=True)
             return
 

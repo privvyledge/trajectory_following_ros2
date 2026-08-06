@@ -244,6 +244,61 @@ class TestTrajectoryBudget:
         assert self.tick(t, wp, (0.0, 0.0)) < 5  # ungated re-acquisition at start
 
 
+class TestWideGapIsCrossable:
+    """A waypoint gap wider than the advance budget must not freeze the anchor.
+
+    The budget is metres and what it gates is an index step, so before the
+    forced-successor invariant a single wide gap made the window degenerate to
+    {floor_index} and the reference index stuck there for the rest of the run --
+    silently, with status 'ok'. Seen live on a recorded figure-8 carrying one
+    0.555 m dropout among 0.045 m spacing: three closed-loop runs with different
+    steering limits all stopped at exactly that waypoint.
+    """
+
+    @staticmethod
+    def gapped_path(gap=0.555, spacing=0.045, n=40):
+        xs = np.arange(n, dtype=float) * spacing
+        xs[n // 2:] += gap - spacing          # one wide segment, mid-path
+        return np.stack([xs, np.zeros(n)], axis=1)
+
+    def test_anchor_crosses_a_gap_wider_than_the_budget(self):
+        wp = self.gapped_path()
+        cum = trajectory_utils.cumulative_distance_along_path(wp)
+        floor = len(wp) // 2 - 1
+        assert cum[floor + 1] - cum[floor] > 0.5, 'fixture gap must exceed the budget'
+        # Vehicle sitting on the far side of the gap, budget at its +0.5 m ceiling.
+        _, _, proj, status = trajectory_utils.project_index_and_lookahead(
+            wp, cum, wp[floor + 1:floor + 2], floor_index=floor,
+            lookahead_distance=0.2, projection_window=5.0, max_advance=0.5)
+        assert status == 'ok'
+        assert proj == floor + 1, 'anchor must be able to step across the gap'
+
+    def test_spent_budget_still_admits_only_one_waypoint(self):
+        """The invariant must not become a hole in the anchor-ratchet guard.
+
+        With the budget fully spent the window may offer the successor and
+        nothing beyond it, so a vehicle that is not making progress cannot
+        ratchet forward through a later pass of the path.
+        """
+        wp = np.stack([np.arange(0.0, 4.0, 0.045), np.zeros(89)], axis=1)
+        cum = trajectory_utils.cumulative_distance_along_path(wp)
+        # Vehicle far down the path, but no budget: it may advance one step at most.
+        _, _, proj, _ = trajectory_utils.project_index_and_lookahead(
+            wp, cum, wp[60:61], floor_index=10, lookahead_distance=0.1,
+            projection_window=5.0, max_advance=0.0)
+        assert proj == 11, f'expected a single-waypoint step, advanced to {proj}'
+
+    def test_a_dense_path_is_unaffected_by_the_invariant(self):
+        """Discrimination twin: with no gap the budget alone still decides."""
+        wp = np.stack([np.arange(0.0, 4.0, 0.045), np.zeros(89)], axis=1)
+        cum = trajectory_utils.cumulative_distance_along_path(wp)
+        _, _, proj, _ = trajectory_utils.project_index_and_lookahead(
+            wp, cum, wp[60:61], floor_index=10, lookahead_distance=0.1,
+            projection_window=5.0, max_advance=0.5)
+        # 0.5 m of budget at 0.045 m spacing is ~11 waypoints, not the whole way.
+        assert 11 < proj < 30, f'budget should bound the advance, got {proj}'
+
+
 class TestLocalPathTangent:
     def test_forward_tangent(self):
         wp = np.stack([np.arange(0.0, 1.0, 0.1), np.zeros(10)], axis=1)
