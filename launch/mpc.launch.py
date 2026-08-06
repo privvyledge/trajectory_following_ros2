@@ -18,7 +18,8 @@ from ament_index_python.packages import get_package_share_directory
 from launch.actions import DeclareLaunchArgument, GroupAction
 from launch.conditions import IfCondition, LaunchConfigurationEquals
 from launch.substitutions import LaunchConfiguration, PythonExpression
-from launch_ros.actions import Node, PushRosNamespace, SetParametersFromFile, SetParameter
+from launch_ros.actions import (Node, PushRosNamespace, SetParametersFromFile, SetParameter,
+                                SetRemap)
 from launch_ros.parameter_descriptions import ParameterValue
 
 
@@ -43,6 +44,8 @@ def generate_launch_description():
     log_level = LaunchConfiguration('log_level')
     robot_frame = LaunchConfiguration('robot_frame')
     global_frame = LaunchConfiguration('global_frame')
+    waypoint_target_frame = LaunchConfiguration('waypoint_target_frame')
+    namespaced_tf = LaunchConfiguration('namespaced_tf')
     frequency = LaunchConfiguration('frequency')
     publish_twist_topic = LaunchConfiguration('publish_twist_topic')
     wheelbase = LaunchConfiguration('wheelbase')
@@ -50,6 +53,8 @@ def generate_launch_description():
     use_opti = LaunchConfiguration('use_opti')
     num_obstacles = LaunchConfiguration('num_obstacles')
     obstacle_topic = LaunchConfiguration('obstacle_topic')
+    forward_escape_enabled = LaunchConfiguration('forward_escape_enabled')
+    forward_escape_speed = LaunchConfiguration('forward_escape_speed')
     merge_obstacle_sources = LaunchConfiguration('merge_obstacle_sources', default=False)
     obstacle_source_topics = LaunchConfiguration('obstacle_source_topics')
     obstacle_source_qos = LaunchConfiguration('obstacle_source_qos')
@@ -99,6 +104,7 @@ def generate_launch_description():
     speed_tolerance = LaunchConfiguration('speed_tolerance')
     arclength_index_advance = LaunchConfiguration('arclength_index_advance')
     projection_window = LaunchConfiguration('projection_window')
+    solver_log_file = LaunchConfiguration('solver_log_file')
 
     # #  Topics
     odom_topic = LaunchConfiguration('odom_topic', default="odometry/local")
@@ -200,6 +206,33 @@ def generate_launch_description():
                         'set to "map", '
                         'otherwise use "odom".'
     )
+    namespaced_tf_la = DeclareLaunchArgument(
+            'namespaced_tf',
+            default_value='True',
+            description='Under use_namespace, remap /tf and /tf_static onto the namespaced '
+                        '<ns>/tf and <ns>/tf_static (the Nav2 convention). tf2 builds its '
+                        'listener on the ABSOLUTE /tf, which a PushRosNamespace does NOT '
+                        'redirect, so without this a namespaced controller never sees a robot '
+                        'that publishes /<ns>/tf. That failure is silent, not loud: '
+                        'base_tracker.odom_callback warns once on the failed lookup and then '
+                        'tracks the RAW odom pose as though it were already in global_frame, '
+                        'so a map-frame route runs healthy-looking but offset by the whole '
+                        'map->odom correction. No effect when use_namespace is False (the '
+                        'relative name resolves back to /tf). Set False only for a stack that '
+                        'namespaces its nodes while keeping one global TF tree.'
+    )
+    waypoint_target_frame_la = DeclareLaunchArgument(
+            'waypoint_target_frame',
+            default_value=global_frame,
+            description='TF frame waypoint_loader transforms the loaded CSV into, i.e. the '
+                        'frame the published path carries. It MUST equal global_frame: the '
+                        'controller awaits a TF from the path frame to global_frame before it '
+                        'will accept a path, and tf2 subscribes to the ABSOLUTE /tf, so under '
+                        'use_namespace that lookup cannot see a namespaced /<ns>/tf. Defaults '
+                        'to global_frame so the two cannot silently disagree; the loader\'s own '
+                        'default is "map", which does not match this file\'s "odom" default. '
+                        'Set both to "map" for a run with a global localizer.'
+    )
     frequency_la = DeclareLaunchArgument(
             'frequency',
             default_value='50.0',
@@ -258,6 +291,13 @@ def generate_launch_description():
                         'TF-transformed. Applied AFTER the platform/weights overlays so the '
                         'launch arg is authoritative.'
     )
+    forward_escape_enabled_la = DeclareLaunchArgument(
+            'forward_escape_enabled', default_value='False',
+            description='Enable bounded forward-only recovery from a stationary '
+                        'detour-bound stop. Defaults off; CARLA obstacle overlays opt in.')
+    forward_escape_speed_la = DeclareLaunchArgument(
+            'forward_escape_speed', default_value='1.0',
+            description='Maximum forward speed (m/s) of the bounded escape reference.')
     merge_obstacle_sources_la = DeclareLaunchArgument(
             'merge_obstacle_sources',
             default_value='False',
@@ -482,6 +522,14 @@ def generate_launch_description():
             default_value='0.2',
             description='Distance tolerance for arrival.'
     )
+    solver_log_file_la = DeclareLaunchArgument(
+            'solver_log_file',
+            default_value='',
+            description='Append one CSV row per solve to this file (empty = disabled). '
+                        'Same argument closed_loop_sim.launch.py accepts; it is the '
+                        'primary per-tick diagnostic for a hardware run, where there is '
+                        'no simulator log to fall back on.'
+    )
     arclength_index_advance_la = DeclareLaunchArgument(
             'arclength_index_advance',
             default_value='True',
@@ -593,9 +641,10 @@ def generate_launch_description():
             [declare_use_sim_time_cmd, use_namespace_la, namespace_la, params_file_la,
              load_params_from_file_la, load_params_from_args_la,
              platform_la, weights_la,
-             robot_frame_la, global_frame_la,
+             robot_frame_la, global_frame_la, waypoint_target_frame_la, namespaced_tf_la,
              frequency_la, publish_twist_topic_la, wheelbase_la, ode_type_la,
              use_opti_la, num_obstacles_la, obstacle_topic_la,
+             forward_escape_enabled_la, forward_escape_speed_la,
              merge_obstacle_sources_la, obstacle_source_topics_la,
              obstacle_source_qos_la, obstacle_gate_radius_la,
              discrete_model_type_la, discrete_integration_method_la,
@@ -610,7 +659,7 @@ def generate_launch_description():
              stage_cost_type_la, terminal_cost_type_la,
              generate_mpc_model_la, build_with_cython_la, code_gen_directory_la,
              distance_tolerance_la, speed_tolerance_la,
-             arclength_index_advance_la, projection_window_la,
+             arclength_index_advance_la, projection_window_la, solver_log_file_la,
              declare_log_level_cmd,
              odom_topic_la, ackermann_cmd_topic_la, twist_topic_la, acceleration_topic_la, path_topic_la,
              speed_topic_la, debug_frequency_la,
@@ -640,13 +689,18 @@ def generate_launch_description():
         # 'horizon': horizon,
         # 'sample_time': sample_time,
         # 'prediction_time': prediction_time,
-        'R': R_diagonal,
-        'Rd': Rd_diagonal,
-        'Q': Q_diagonal,
-        'Qf': Qf_diagonal,
         'slack_weights_input_rate': slack_weights_input_rate,
         'slack_scale_input_rate': slack_scale_input_rate,
         'slack_upper_bound_input_rate': slack_upper_bound_input_rate,
+        # NOTE: the cost weights are NOT set here. A node-level
+        # `parameters=` entry outranks every SetParametersFromFile in the group, so
+        # putting them here made `weights:=<file>` silently dead for Q/R/Rd/Qf while
+        # the same file's horizon/max_iter/solver entries applied normally — the
+        # controller ran the launch-arg defaults (Q = [1, 1, 1, 0.01]) on hardware
+        # while sim, which uses closed_loop_sim.launch.py and no such dict, ran the
+        # tuned values. They are SetParameter entries below instead, placed before
+        # the overlays so the documented stack (weights > platform > args > base)
+        # actually holds.
         # 'scale_cost': scale_cost,
         # 'max_iter': max_iterations,
         # 'termination_condition': termination_condition,
@@ -797,6 +851,15 @@ def generate_launch_description():
                         condition=IfCondition(use_namespace),
                         namespace=namespace
                 ),
+                # Follow the namespace onto the TF topics. tf2 constructs its listener on
+                # the ABSOLUTE /tf, which PushRosNamespace does not redirect, so without
+                # these two a namespaced controller silently never receives the transform
+                # a robot publishes on /<ns>/tf. Relative names, so they resolve to
+                # /<ns>/tf under the push and back to /tf without it -- which is why the
+                # condition is on namespaced_tf alone and this is a no-op unnamespaced.
+                # Must precede every node in the group: SetRemap applies to what follows.
+                SetRemap(src='/tf', dst='tf', condition=IfCondition(namespaced_tf)),
+                SetRemap(src='/tf_static', dst='tf_static', condition=IfCondition(namespaced_tf)),
                 # Set common parameters. todo: test passing a list of names and values instead of separate SetParameter
                 SetParametersFromFile(params_file, condition=IfCondition(load_params_from_file)),
                 SetParameter(name='use_sim_time', value=use_sim_time),
@@ -826,13 +889,20 @@ def generate_launch_description():
                 SetParameter(name='solver_type', value='quad', condition=IfCondition(load_params_from_args)),
                 SetParameter(name='solver', value='qrqp', condition=IfCondition(load_params_from_args)),
                 SetParameter(name='normalize_yaw_error', value=True, condition=IfCondition(load_params_from_args)),
-                # SetParameter(name='R', value=R_diagonal, condition=IfCondition(load_params_from_args)),
-                # SetParameter(name='Rd', value=Rd_diagonal, condition=IfCondition(load_params_from_args)),
-                # SetParameter(name='Q', value=Q_diagonal, condition=IfCondition(load_params_from_args)),
-                # SetParameter(name='Qf', value=Qf_diagonal, condition=IfCondition(load_params_from_args)),
-                # SetParameter(name='slack_weights_input_rate', value=[1.0, 1.0], condition=IfCondition(load_params_from_args)),
-                # SetParameter(name='slack_scale_input_rate', value=[1.0, 1.0], condition=IfCondition(load_params_from_args)),
-                # SetParameter(name='slack_upper_bound_input_rate', value=[np.inf, np.inf], condition=IfCondition(load_params_from_args)),
+                # Cost weights and input-rate slacks. These sit here, not in a
+                # node-level `parameters=` dict, so a weights/platform overlay can
+                # still override them (a node-level entry outranks every overlay).
+                SetParameter(name='R', value=ParameterValue(R_diagonal, value_type=List[float]),
+                             condition=IfCondition(load_params_from_args)),
+                SetParameter(name='Rd', value=ParameterValue(Rd_diagonal, value_type=List[float]),
+                             condition=IfCondition(load_params_from_args)),
+                SetParameter(name='Q', value=ParameterValue(Q_diagonal, value_type=List[float]),
+                             condition=IfCondition(load_params_from_args)),
+                SetParameter(name='Qf', value=ParameterValue(Qf_diagonal, value_type=List[float]),
+                             condition=IfCondition(load_params_from_args)),
+                # slack_* stay node-level: no platform/weights file sets them, and the
+                # slack_upper_bound default is [inf, inf], which SetParameter cannot
+                # coerce from its string form.
                 SetParameter(name='slack_objective_is_quadratic', value=False, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='scale_cost', value=scale_cost, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='max_iter', value=max_iterations, condition=IfCondition(load_params_from_args)),
@@ -846,6 +916,15 @@ def generate_launch_description():
                 SetParameter(name='speed_tolerance', value=speed_tolerance, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='arclength_index_advance', value=arclength_index_advance, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='projection_window', value=projection_window, condition=IfCondition(load_params_from_args)),
+                # Skipped entirely when empty rather than passed as an empty string: rcl
+                # rejects a bare `-p solver_log_file:=` ("Couldn't parse parameter override
+                # rule") and the node dies before it starts, so the disabled-by-default case
+                # took down every launch that did not name a log file. The node's own default
+                # is '' == disabled, so not setting it is the correct way to express that.
+                SetParameter(name='solver_log_file', value=solver_log_file,
+                             condition=IfCondition(PythonExpression(
+                                     ["'", load_params_from_args, "'.lower() == 'true' and '",
+                                      solver_log_file, "' != ''"]))),
                 SetParameter(name='odom_topic', value=odom_topic, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='ackermann_cmd_topic', value=ackermann_cmd_topic, condition=IfCondition(load_params_from_args)),
                 SetParameter(name='twist_topic', value=twist_topic, condition=IfCondition(load_params_from_args)),
@@ -877,9 +956,19 @@ def generate_launch_description():
                 # at all, which made a real perception feed (e.g. a CARLA ros-bridge
                 # /carla/<role>/objects) unreachable from the launch line.
                 SetParameter(name='obstacle_collision_avoidance_method', value="euclidean", condition=IfCondition(load_params_from_args)),
+                SetParameter(name='forward_escape_enabled',
+                             value=ParameterValue(forward_escape_enabled, value_type=bool),
+                             condition=IfCondition(load_params_from_args)),
+                SetParameter(name='forward_escape_speed',
+                             value=ParameterValue(forward_escape_speed, value_type=float),
+                             condition=IfCondition(load_params_from_args)),
 
                 # Waypoint Parameters
                 SetParameter(name='file_path', value=waypoints_csv, condition=IfCondition(load_params_from_args)),
+                # Only waypoint_loader declares target_frame_id; the controllers do not
+                # auto-declare from overrides, so this is a no-op for them.
+                SetParameter(name='target_frame_id', value=waypoint_target_frame,
+                             condition=IfCondition(load_params_from_args)),
 
                 # # Remap common topics
                 # SetRemap(src='trajectory/path', dst=path_topic),
