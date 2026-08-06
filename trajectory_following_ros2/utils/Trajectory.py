@@ -61,6 +61,21 @@ import trajectory_following_ros2.utils.trajectory_utils as trajectory_utils
 class Trajectory(object):
     """docstring for ClassName"""
 
+    #: Minimum per-tick displacement (m) that counts as the vehicle "travelling"
+    #: for the counter-branch escape in :meth:`calc_nearest_index`. At a 20 Hz
+    #: control rate this is 0.04 m/s -- below it the vehicle is parked as far as
+    #: the escape is concerned, and a parked vehicle must never escape (that is
+    #: the standoff the anchor-ratchet guard exists to hold).
+    COUNTER_BRANCH_MIN_STEP = 2e-3
+    #: How much of that displacement must lie along the local tangent (cosine)
+    #: before the vehicle counts as moving *along* the branch it is beside,
+    #: rather than drifting across it.
+    COUNTER_BRANCH_MIN_COS = 0.7
+    #: Recorded-speed magnitude (m/s) below which a waypoint is a stationary sample
+    #: carrying no travel direction. Matches ``waypoint_loader``'s
+    #: ``reverse_speed_threshold``, which decides the same question upstream.
+    REVERSE_SPEED_DEADBAND = 0.05
+
     def __init__(self, search_index_number=10, goal_tolerance=0.2, stop_speed=0.5 / 3.6):
         """Constructor for Trajectory"""
         self.state_keys = ['x', 'y', 'speed', 'yaw', 'omega',
@@ -131,6 +146,27 @@ class Trajectory(object):
         # it — the window moves with the anchor).
         self._anchor_advance_budget = 0.0
         self._previous_projection_position = None  # None => ungated first call
+        #: How many times the counter-branch escape has fired (see calc_nearest_index).
+        #: Expect one per reverse cusp actually driven; anything more wants looking at.
+        self.counter_branch_escapes = 0
+
+    def _is_recorded_direction_reversal(self, speeds, anchor_index, local_index):
+        """Does the route's recorded travel direction flip between the two indices?
+
+        True only when one of the two stretches is recorded driving forward and the
+        other recorded driving in reverse -- i.e. a reverse cusp lies between them.
+        Speeds inside the deadband are stationary samples and carry no direction, so
+        they never establish a reversal.
+
+        :param speeds: (N,) signed recorded speed aligned to the waypoints.
+        :param anchor_index: the monotonic projection anchor.
+        :param local_index: the waypoint the vehicle is currently beside.
+        :return: bool.
+        """
+        thr = self.REVERSE_SPEED_DEADBAND
+        lo, hi = sorted((int(anchor_index), int(local_index)))
+        span = np.asarray(speeds[lo:hi + 1], dtype=float)
+        return bool(np.any(span > thr) and np.any(span < -thr))
 
     def calc_nearest_index(self, waypoints=None, state=None, current_index=None, num_neighbours=10,
                            min_search_radius=0.0, max_search_radius=30.0, use_euclidean_distance=True, workers=1):
@@ -153,6 +189,15 @@ class Trajectory(object):
         if self.waypoint_kdtree is None:
             self.waypoint_kdtree = trajectory_utils.generate_kd_tree(waypoints)
 
+        # Signed recorded speed, available only when projecting onto this object's own
+        # trajectory. It is the one thing that marks a reverse cusp -- the yaw does not
+        # flip there, a reversing vehicle does not turn around -- and a bare (N, 2)
+        # waypoint array carries no direction at all, so the counter-branch escape below
+        # stays off in that case rather than guessing.
+        speeds = None
+        if waypoints_is_self and self.trajectory is not None:
+            speeds = self.trajectory[:, self.trajectory_key_to_column['speed']]
+
         if self.arclength_index_advance:
             # Along-track projection: advance by arc length off self.previous_index
             # (the monotonic projection anchor), decoupled from lateral offset.
@@ -171,7 +216,31 @@ class Trajectory(object):
             max_advance = np.inf
             gated = False
             if self._previous_projection_position is not None:
-                tangent = trajectory_utils.local_path_tangent(waypoints[:, :2], self.previous_index)
+                # Measure progress against the tangent where the vehicle actually IS,
+                # not at the anchor it is being gated away from. The two differ
+                # wherever the route doubles back on itself -- above all at a reverse
+                # cusp, where the outbound and return branches lie centimetres apart
+                # and point opposite ways. With the tangent read at the anchor, a
+                # vehicle that has crossed the cusp and is reversing away scores
+                # disp.tangent NEGATIVE against the outbound branch it is no longer
+                # on: the budget drains, max_advance pins to zero, and the anchor can
+                # never reach the far side -- where the tangent that would have scored
+                # it positive lives. A self-sustaining latch, and silent (status stays
+                # 'ok', every solve optimal, no watchdog trips). Reading the tangent at
+                # the ungated projection breaks the circularity: the sample point moves
+                # with the vehicle even while the anchor is held.
+                #
+                # This relaxes only the MEASUREMENT, never the gate -- the advance is
+                # still capped by the budget below, so the multi-pass ratchet guard is
+                # intact. Nor does it weaken that guard's own case: the passes it
+                # defends against run roughly parallel, so their tangents agree and the
+                # accrual is unchanged there.
+                tangent_index = trajectory_utils.nearest_index_in_window(
+                    waypoints[:, :2], cum_dist, pos,
+                    floor_index=self.previous_index,
+                    projection_window=self.projection_window,
+                    max_search_radius=max_search_radius)
+                tangent = trajectory_utils.local_path_tangent(waypoints[:, :2], tangent_index)
                 # A stationary stretch of the route (a parked start or tail) has no local
                 # direction, so there is no such thing as along-track progress to measure
                 # there and the guard has nothing to judge with. Leave the advance ungated
@@ -179,6 +248,59 @@ class Trajectory(object):
                 # zero strands the anchor inside the pile, and the vehicle then drives
                 # past a reference that never advances. The projection window still bounds
                 # how far an ungated tick may move the anchor.
+                # Counter-branch escape. Even with the accrual repaired above, a cusp
+                # still strands the anchor: it sits in a local distance MINIMUM on the
+                # outbound branch, and every index between it and the return branch is
+                # farther from the vehicle, so nearest-in-window will not walk across.
+                # Crossing has to happen in one step, and it cannot be afforded --
+                # where a route doubles back, arc length accrues about twice as fast as
+                # displacement, so 0.4 m of reversing has to buy ~1.05 m of arc against
+                # a budget capped at 0.5. No cap that leaves the ratchet guard meaningful
+                # can fund it.
+                #
+                # So detect the condition instead of trying to pay for it, on all three
+                # of these together:
+                #   - the anchor's tangent runs counter to the tangent where the vehicle
+                #     actually is, so the two describe opposed stretches of route;
+                #   - the vehicle is measurably moving, not parked; and
+                #   - it is moving ALONG the stretch it is now beside.
+                # Then the anchor is not merely lagging, it is on the wrong branch of a
+                # route that doubles back, and no budget should hold it there --
+                # re-project ungated (the projection window and the monotonic floor
+                # still bound the result).
+                #
+                # and it does so on a stretch where the ROUTE ITSELF reverses.
+                #
+                # That last condition is what makes the escape safe, and it is not
+                # optional. The out-and-back pass pair the ratchet guard exists to
+                # defend is also counter-running, and half of an oscillation also looks
+                # like travelling along the captured pass -- both were measured to
+                # escape on the motion test alone. What no forward-driving geometry can
+                # produce is a sign change in the recorded speed: a U-turn, a lap, and
+                # two parallel passes all keep one travel direction throughout, so only
+                # a genuine reverse cusp puts a recorded forward stretch and a recorded
+                # reverse stretch on opposite sides of the anchor. The route declares
+                # the cusp; the vehicle's motion says it has crossed it.
+                anchor_tangent = trajectory_utils.local_path_tangent(
+                    waypoints[:, :2], self.previous_index)
+                if (tangent is not None and anchor_tangent is not None
+                        and speeds is not None
+                        and self._is_recorded_direction_reversal(
+                            speeds, self.previous_index, tangent_index)
+                        and float(anchor_tangent @ tangent) < 0.0):
+                    step = pos - self._previous_projection_position
+                    step_len = float(np.linalg.norm(step))
+                    if (step_len >= self.COUNTER_BRANCH_MIN_STEP
+                            and float(step @ tangent) >= self.COUNTER_BRANCH_MIN_COS * step_len):
+                        # Fall through ungated; the budget restarts at the new anchor.
+                        tangent = None
+                        # Counted, not silent. The failure this escape exists for gave no
+                        # sign of itself -- status 'ok', every solve optimal, no watchdog
+                        # -- so leaving its remedy equally invisible would just move the
+                        # blind spot. A run that fires this far from a cusp, or fires
+                        # repeatedly, is reporting that the escape is being abused.
+                        self.counter_branch_escapes += 1
+
                 if tangent is not None:
                     disp = pos - self._previous_projection_position
                     # The 1.5 gain on the ACCRUAL gives persistent catch-up

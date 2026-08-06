@@ -225,6 +225,38 @@ def local_path_tangent(waypoints, index, max_scan=20, min_baseline=TANGENT_MIN_B
     return None
 
 
+def nearest_index_in_window(waypoints, cum_dist, position, floor_index=0,
+                            projection_window=5.0, max_search_radius=np.inf):
+    """Nearest waypoint to ``position`` in the forward arc window off ``floor_index``.
+
+    The *ungated* projection: the same forward-only, arc-length-bounded window
+    ``project_index_and_lookahead`` uses, without the anchor-ratchet cap. It is
+    not a reference anchor and must not be fed back as one — it exists so a
+    caller can ask "which part of the path is the vehicle actually beside right
+    now", independently of how far the ratchet guard is willing to let the
+    anchor move this tick.
+
+    :param waypoints: (N, 2) path x/y.
+    :param cum_dist: (N,) cumulative arc length aligned to ``waypoints``.
+    :param position: (2,) vehicle x/y.
+    :param floor_index: monotonic lower bound on the search.
+    :param projection_window: forward arc-length span (m) to search.
+    :param max_search_radius: cap on the vehicle-to-waypoint distance considered.
+    :return: waypoint index; ``floor_index`` when nothing is within range.
+    """
+    n = len(waypoints)
+    floor_index = int(min(max(floor_index, 0), n - 1))
+    indices = np.arange(n)
+    distances = get_distance(np.asarray(position, dtype=float).reshape(1, 2), waypoints)
+    window_mask = ((indices >= floor_index)
+                   & ((cum_dist - cum_dist[floor_index]) <= projection_window)
+                   & (distances <= max_search_radius))
+    window_indices = indices[window_mask]
+    if len(window_indices) == 0:
+        return floor_index
+    return int(window_indices[np.argmin(distances[window_indices])])
+
+
 def project_index_and_lookahead(waypoints, cum_dist, position, floor_index=0,
                                 lookahead_distance=0.0, projection_window=5.0,
                                 max_search_radius=np.inf, max_advance=np.inf):

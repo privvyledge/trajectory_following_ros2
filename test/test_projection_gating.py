@@ -334,5 +334,134 @@ class TestLocalPathTangent:
             'fixture cannot detect the failure: jitter happened to align with the route')
 
 
+def reverse_cusp_trajectory(step=0.05, out_length=2.0, back_to=0.2, offset=0.02,
+                            fwd_speed=0.9, rev_speed=-0.25):
+    """A route driven out, then backed up along (nearly) the same line.
+
+    Models the tail of the recorded gosling1 routes: the driver stops and reverses,
+    so the return branch retraces the outbound one a couple of centimetres away and
+    runs the opposite direction, and the only thing distinguishing the two is the
+    sign of the recorded speed -- the yaw is continuous across the cusp, because a
+    reversing vehicle does not turn around.
+
+    Returns a full (N, 9) trajectory array in ``Trajectory``'s column order, so the
+    signed speed column is populated the way the live path has it.
+    """
+    xs_out = np.arange(0.0, out_length + 1e-9, step)
+    out = np.stack([xs_out, np.zeros_like(xs_out)], axis=1)
+    xs_back = np.arange(out_length - step, back_to - 1e-9, -step)
+    back = np.stack([xs_back, np.full_like(xs_back, offset)], axis=1)
+    wp = np.concatenate([out, back], axis=0)
+
+    traj = np.zeros((len(wp), 9), dtype=float)
+    traj[:, 0], traj[:, 1] = wp[:, 0], wp[:, 1]
+    traj[:len(out), 2] = fwd_speed
+    traj[len(out):, 2] = rev_speed
+    traj[:, 6] = trajectory_utils.cumulative_distance_along_path(wp)
+    return traj, len(out)
+
+
+class TestReverseCuspEscape:
+    """The counter-branch escape: crossing a reverse cusp without stranding the anchor.
+
+    At a cusp the anchor sits in a local distance MINIMUM on the outbound branch --
+    every index between it and the return branch is farther from the vehicle, so the
+    nearest-in-window projection will not walk across, and the arc that must be
+    crossed costs about twice the displacement that funds it. Left alone the anchor
+    freezes for the rest of the run, silently: status stays 'ok', every solve
+    optimal, no watchdog trips, and the vehicle parks partway down its own tail.
+    """
+
+    def make_traj(self, traj):
+        t = Trajectory(goal_tolerance=0.3)
+        t.trajectory = traj
+        t.projection_window = 5.0
+        t.arclength_index_advance = True
+        return t
+
+    def tick(self, t, pos):
+        t.state[0, 0], t.state[0, 1] = pos
+        indices, _ = t.calc_nearest_index(min_search_radius=0.3, max_search_radius=30.0)
+        return t.previous_index, (int(indices[0]) if len(indices) else None)
+
+    def drive(self, t, positions):
+        anchor = target = None
+        for pos in positions:
+            anchor, target = self.tick(t, pos)
+        return anchor, target
+
+    def out_and_back_positions(self, turnaround=1.6, back_to=0.8, offset=0.01, step=0.0125):
+        """Drive out, stop SHORT of the route's own cusp, then reverse back beside it.
+
+        Turning around short of the recorded cusp is what builds the barrier, and it
+        is what the real runs do (the measured leg turned ~0.4 m early). It leaves the
+        anchor on the outbound branch with the whole apex between it and the return
+        branch: every index in between is farther from the retreating vehicle than the
+        anchor already is, so the projection cannot walk across, and the arc it would
+        have to jump is roughly twice the displacement that funds it.
+        """
+        out = [(x, 0.0) for x in np.arange(0.0, turnaround + 1e-9, step)]
+        back = [(x, offset) for x in np.arange(turnaround, back_to - 1e-9, -step)]
+        return out + back
+
+    def test_anchor_crosses_the_cusp(self):
+        traj, cusp = reverse_cusp_trajectory()
+        t = self.make_traj(traj)
+        anchor, target = self.drive(t, self.out_and_back_positions())
+        assert anchor > cusp, (
+            'anchor stranded on the outbound branch at %d (cusp %d)' % (anchor, cusp))
+        assert target is not None and target > cusp, (
+            'reference target %s never reached the reverse branch' % (target,))
+        assert t.counter_branch_escapes == 1, (
+            'expected exactly one escape at the one cusp, got %d'
+            % (t.counter_branch_escapes,))
+
+    def test_anchor_strands_without_the_escape(self):
+        """Discrimination twin: the fixture MUST strand when the escape cannot fire.
+
+        Raising the movement threshold out of reach disables only the escape, leaving
+        the repaired budget accrual in place -- so this pins the escape specifically,
+        not the accrual fix that precedes it.
+        """
+        traj, cusp = reverse_cusp_trajectory()
+        t = self.make_traj(traj)
+        t.COUNTER_BRANCH_MIN_STEP = 1e9
+        anchor, _ = self.drive(t, self.out_and_back_positions())
+        assert anchor <= cusp, (
+            'fixture cannot detect the failure: anchor crossed at %d without the escape'
+            % (anchor,))
+
+    def test_parked_short_of_the_cusp_does_not_escape(self):
+        """A stationary vehicle must never escape, cusp in the route or not."""
+        traj, cusp = reverse_cusp_trajectory()
+        t = self.make_traj(traj)
+        self.drive(t, [(x, 0.0) for x in np.arange(0.0, 1.5 + 1e-9, 0.0125)])
+        parked = t.previous_index
+        assert parked <= cusp
+        for _ in range(300):
+            anchor, _ = self.tick(t, (1.5, 0.0))
+        assert anchor <= cusp, 'parked vehicle escaped across the cusp'
+        assert anchor - parked <= 1, 'parked vehicle crept along the route'
+        assert t.counter_branch_escapes == 0
+
+    def test_forward_only_uturn_does_not_escape(self):
+        """The speed-sign gate: same doubling-back geometry, no recorded reversal.
+
+        A tight U-turn driven entirely forwards produces counter-running branches
+        centimetres apart -- the tangent test alone cannot tell it from a cusp. Only
+        the recorded speed can, and here it never changes sign, so an oscillating
+        vehicle between the branches must stay held by the ratchet guard.
+        """
+        traj, cusp = reverse_cusp_trajectory()
+        traj[:, 2] = np.abs(traj[:, 2])  # same path, all of it driven forwards
+        t = self.make_traj(traj)
+        self.drive(t, [(x, 0.0) for x in np.arange(0.0, 1.5 + 1e-9, 0.0125)])
+        for k in range(300):
+            anchor, _ = self.tick(t, (1.5 + (0.05 if k % 2 else -0.05), 0.01))
+        assert anchor <= cusp, (
+            'oscillation escaped across a forward-only U-turn at %d' % (anchor,))
+        assert t.counter_branch_escapes == 0
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
