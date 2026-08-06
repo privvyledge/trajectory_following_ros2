@@ -54,19 +54,54 @@ ROBOT_FRAME="${ROBOT_FRAME:-base_link}"
 # this one bounds what the solver may command.
 TRACK_MAX_SPEED="${TRACK_MAX_SPEED:-0.8}"
 
-# Steering cap, DEGREES at the road wheel, derived from the single MAX_STEERING
-# (radians) in 00_env.sh so there is one place to change after a recalibration.
+# Steering cap, DEGREES at the road wheel.
 #
 # Deliberately NOT the platform YAML's 27 deg, which its own comment flags as a
-# guess: with the servo calibration MAX_STEERING was chosen for
-# (servo = -1.4 * angle + 0.56, servo_max 0.92), anything beyond
-# (0.92 - 0.56) / 1.4 = 0.257 rad clips inside the VESC driver. A solver allowed
-# 27 deg plans turns the servo silently refuses, then tracks against a predicted
-# yaw rate the car never achieves.
+# guess. The competing number is the servo calibration: MAX_STEERING in 00_env.sh
+# was chosen for (servo = -1.4 * angle + 0.56, servo_max 0.92), so on paper
+# anything beyond (0.92 - 0.56) / 1.4 = 0.257 rad = 14.72 deg clips inside the
+# VESC driver, and a solver allowed more plans turns the servo silently refuses
+# while tracking a predicted yaw rate the car never achieves.
 #
-# After the VESC/steering recalibration: update MAX_STEERING in 00_env.sh (and
-# ideally config/platforms/f1tenth.yaml) and this follows automatically.
-TRACK_MAX_STEER_DEG="${TRACK_MAX_STEER_DEG:-$(python3 -c "import math;print(round(math.degrees($MAX_STEERING),2))")}"
+# 23 deg is used anyway, on the evidence of the recordings rather than the
+# calibration constants: the gosling1 drives sit at or near full lock for 23-52%
+# of each route, and reconstructing them needs ~23 deg. Capping at 14.72 makes
+# every one of those corners infeasible by construction -- measured in sim as ~3x
+# worse figure-8 CTE p95 with steering saturated ~55% of the time, against ~5% at
+# 23. If the servo really does clip at 14.72 the run is no worse off than the cap
+# would have made it; if it does not, the cap was throwing away the only steering
+# authority these routes need.
+#
+# UNVERIFIED ON THE CAR (2026-08-06): which of the two numbers is real has never
+# been measured. The first hardware run should compare commanded steering against
+# the actuator/odometry response above ~15 deg and settle it -- if the response
+# flattens there, recalibrate the servo before driving these routes for tracking
+# numbers, because the prediction/actual mismatch is silent.
+#
+# HOW the cap is applied matters, and the obvious way does not work. In
+# mpc.launch.py the per-platform/per-backend overlays are applied LAST --
+# "weights > platform > args > base" by its own comment -- so the
+# `max_steer:=...` launch argument below is OVERRIDDEN by config/platforms/
+# f1tenth.yaml's `max_steer: 27.0`. Passing the launch arg alone silently gives
+# 27 deg: not the requested cap, and the very value the note above rejects.
+#
+# The weights overlay is the only lever that outranks the platform file, so the
+# cap travels with WEIGHTS. gosling1_acados_recal is f1tenth_acados plus exactly
+# `max_steer/min_steer: +/-23` (diffed -- the cost matrices are identical), which
+# also makes this the configuration the sim legs were validated against.
+#
+# So: change the cap by pointing WEIGHTS at a file that pins it, and verify on
+# the running node (assert_effective_steer_cap below does this automatically).
+# After a real VESC/steering recalibration, update MAX_STEERING in 00_env.sh,
+# config/platforms/f1tenth.yaml and the weights file together.
+TRACK_MAX_STEER_DEG="${TRACK_MAX_STEER_DEG:-23.0}"
+
+# Weights overlay. Defaults per backend to the one carrying the steering cap
+# above; f1tenth_${BACKEND} would leave the platform's 27 deg in force.
+case "$BACKEND" in
+  acados) WEIGHTS="${WEIGHTS:-gosling1_acados_recal}" ;;
+  *)      WEIGHTS="${WEIGHTS:-f1tenth_${BACKEND}}" ;;
+esac
 
 # Uniform arc-length resampling of the route, metres, applied by waypoint_loader
 # before smoothing. On by default HERE rather than in the loader, whose global
@@ -170,6 +205,70 @@ check_localizer() {
   fi
 }
 
+# ---------------------------------------------------- post-launch asserts ----
+# Read back what the node ACTUALLY resolved. A parameter can be shadowed between
+# the launch line and the node -- the overlays in mpc.launch.py are applied after
+# the individual launch args, and a node-level `parameters=` entry outranks both
+# -- so the launch command is not evidence of anything. Every value here has a
+# silent failure mode: the wrong steering cap plans turns the servo refuses, an
+# unapplied resample_spacing leaves a waypoint hole that freezes the reference
+# index with every solve still optimal, and allow_reversing=false quietly makes
+# the reverse tail of these routes untrackable.
+assert_live_params() {
+  local node="/${NS}/$(case "$BACKEND" in
+        acados) echo acados_mpc_node ;;
+        casadi) echo casadi_mpc_node ;;
+        do_mpc) echo do_mpc_node ;;
+        *) echo "${BACKEND}_mpc_node" ;; esac)"
+  local loader="/${NS}/waypoint_loader"
+
+  # The node needs a moment past process start before its parameter services answer.
+  local i
+  for i in $(seq 1 10); do
+    ros2 node list 2>/dev/null | grep -qx "$node" && break
+    sleep 1
+  done
+
+  banner "effective parameters (read from the running node, not the launch line)"
+  local bad=0
+  _p() {  # _p <node> <param> <expected|-> ; prints and flags mismatches
+    local got; got=$(timeout 10 ros2 param get "$1" "$2" 2>/dev/null \
+                     | sed 's/.*value is: //')
+    if [[ -z "$got" ]]; then
+      err "  $2: could not read from $1"; bad=1; return
+    fi
+    if [[ "$3" != "-" ]] && ! python3 -c "
+import sys
+try: sys.exit(0 if abs(float('$got')-float('$3'))<1e-6 else 1)
+except ValueError: sys.exit(0 if '$got'.strip().lower()=='$3'.strip().lower() else 1)"; then
+      err "  $2 = $got   (EXPECTED $3)"; bad=1
+    else
+      printf '  %-24s %s\n' "$2" "$got"
+    fi
+  }
+
+  _p "$node"   max_steer               "$TRACK_MAX_STEER_DEG"
+  _p "$node"   min_steer               "-${TRACK_MAX_STEER_DEG}"
+  _p "$node"   max_speed               "$TRACK_MAX_SPEED"
+  _p "$node"   allow_reversing         true
+  _p "$node"   arclength_index_advance true
+  _p "$node"   control_rate            "$CONTROL_RATE"
+  _p "$node"   global_frame            "$GLOBAL_FRAME"
+  _p "$loader" resample_spacing        "$TRACK_RESAMPLE_SPACING"
+
+  if [[ "$bad" -ne 0 ]]; then
+    err "at least one parameter did not resolve as requested — do NOT drive.
+         The overlays in mpc.launch.py (weights > platform > args > base) are the
+         usual cause; the platform file pins max_steer 27, so only a weights file
+         can change it. Current WEIGHTS=$WEIGHTS"
+  else
+    info "all checked parameters resolved as requested"
+  fi
+
+  # Resampling is only observable in the loader's own spacing report.
+  grep -iE "spacing|resampl" "$MPC_LOG" | tail -4 || true
+}
+
 # ---------------------------------------------------------------- launch ----
 do_launch() {
   local csv; csv="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
@@ -189,7 +288,7 @@ do_launch() {
       mpc_toolbox:="$BACKEND" \
       control_type:=mpc \
       platform:=f1tenth \
-      weights:="f1tenth_${BACKEND}" \
+      weights:="$WEIGHTS" \
       use_namespace:=True \
       namespace:="$NS" \
       load_waypoints:=True \
@@ -218,6 +317,7 @@ do_launch() {
   fi
   info "controller running (pid $pid)"
   printf '  %-22s %s\n' "log" "$MPC_LOG" "solver csv" "$SOLVER_CSV"
+  assert_live_params
   warn "the car will move as soon as it receives the path. Deadman ready."
 }
 
