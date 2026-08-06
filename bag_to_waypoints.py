@@ -177,9 +177,15 @@ def read_bag(uri, storage_id, odom_topic, actuator_topics, tf_topic=None):
 def trim_reverse_tail(odom, min_speed):
     """Drop a trailing reverse manoeuvre.
 
-    All three of the 2026-08-05 gosling1 drives end with the driver backing the
-    car up. Kept in the route that becomes a negative reference speed at the
-    goal, so the controller reverses on arrival instead of stopping.
+    Off by default, and it should stay off for any drive whose reverse was
+    driven deliberately: reversing is a supported feature of this controller
+    (signed ``vx`` reference, ``allow_reversing``, the loader's reverse-aware
+    yaw recomputation), so a route that ends by backing up is a route that
+    exercises it, not a recording artifact. Use this flag only when the tail is
+    genuinely incidental -- e.g. the driver repositioning the car after the run
+    was already over -- and you want the route to end on the last forward
+    motion.
+
     Only the tail is trimmed -- a mid-route reverse is part of the driven line
     and is left alone.
     """
@@ -399,6 +405,17 @@ def main():
                     'or --pose-topic to name the composed pose topic'
                     % (pose_topic, args.correction_bag))
             print('  map-frame pose   : %d samples from %s' % (len(odom), pose_topic))
+            # A localizer that publishes pose only leaves twist at zero, which
+            # yields a route of zero reference speeds -- structurally valid and
+            # silently undrivable. AMCL's pose_map copied twist from
+            # odometry/local; do not assume a later localizer does the same.
+            if max(abs(r[9]) for r in odom) < 1e-9:
+                raise SystemExit(
+                    '%s in %s carries no twist (vx identically zero); the '
+                    'waypoint vx/speed columns would all be zero. Re-run with '
+                    "--map-frame map to compose that bag's map->odom onto the "
+                    "primary bag's odometry instead, which keeps its twist."
+                    % (pose_topic, args.correction_bag))
     else:
         odom, series, tf = read_bag(args.bag, args.storage, odom_topic, actuator, tf_topic)
 
