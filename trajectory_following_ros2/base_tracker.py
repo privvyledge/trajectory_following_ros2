@@ -1052,8 +1052,12 @@ class BaseTrajectoryTracker(Node, ABC):
         self.acc_cmd = self.delta_cmd = self.velocity_cmd = 0.0
         # Breakaway-floor latch: engaged while the vehicle is stalled against a
         # command that wants motion, released once it is measurably rolling.
+        # `_breakaway_sign` is the commanded direction captured at engage; a change
+        # in it releases the latch, which the measured speed cannot do reliably at
+        # standstill because it dithers across zero.
         self._breakaway_active = False
         self._breakaway_applied = 0.0
+        self._breakaway_sign = 0.0
         self.jerk_cmd: Optional[float] = None
         self.delta_rate_cmd: Optional[float] = None
 
@@ -2713,6 +2717,7 @@ class BaseTrajectoryTracker(Node, ABC):
         else:
             self._breakaway_active = False
             self._breakaway_applied = 0.0
+            self._breakaway_sign = 0.0
 
         # A safety intervention must freeze the solver warm-start input. Delay this
         # update until every applied-command decision, including the watchdog, is final.
@@ -2982,6 +2987,19 @@ class BaseTrajectoryTracker(Node, ABC):
         the solver's one-step command has grown past the floor on its own and the
         handover is continuous.
 
+        **The direction-reversal release is keyed on the commanded sign, not the
+        measured one.** A stopped vehicle's measured speed dithers around zero
+        (-0.005..+0.005 m/s on this odometry), so testing ``measured*command < 0``
+        releases the latch on any negative noise sample and the next tick re-engages
+        via ``stalled`` -- the exact fire/release pulse train the latch exists to
+        prevent. Measured on the car: 21.6% of the ticks that should have held
+        passed through at the un-floored creep, median unbroken hold 2 ticks
+        (0.10 s), so the actuator saw 0.25/0.15/0.25/0.15 at ~10 Hz. The commanded
+        sign is noise-free and is what "the solver reversed direction" actually
+        means. A *measured* reversal still releases, but only once the vehicle is
+        genuinely moving the other way (past the stopped deadband) rather than
+        merely dithering -- that covers rolling backwards against a forward push.
+
         The caller must only invoke this on a tick no intervention has claimed: it
         raises a magnitude and would otherwise resurrect a command that a safety
         path deliberately zeroed.
@@ -2990,24 +3008,31 @@ class BaseTrajectoryTracker(Node, ABC):
         floor = self.breakaway_speed
         if floor <= 0.0:
             self._breakaway_active = False
+            self._breakaway_sign = 0.0
             return velocity_cmd
 
         release = self.breakaway_release_speed or 0.5 * floor
         wants_motion = abs(velocity_cmd) > 1e-3
         stalled = abs(measured_speed) < self.breakaway_engage_speed
+        cmd_sign = math.copysign(1.0, velocity_cmd)
 
         if not wants_motion:
             # A commanded stop is a stop; never floor it back into motion.
             self._breakaway_active = False
+            self._breakaway_sign = 0.0
             return velocity_cmd
         if self._breakaway_active and (
                 abs(measured_speed) >= release
-                or measured_speed * velocity_cmd < 0.0):
+                or cmd_sign != self._breakaway_sign
+                or (measured_speed * velocity_cmd < 0.0 and not stalled)):
             # Rolling, or the solver reversed direction while we were pushing the
             # old one -- in both cases the floor has done its job and must let go.
+            # Both reversal tests are deadbanded against standstill noise: the
+            # commanded sign inherently, the measured one via `not stalled`.
             self._breakaway_active = False
         elif stalled:
             self._breakaway_active = True
+            self._breakaway_sign = cmd_sign
 
         if not self._breakaway_active:
             return velocity_cmd
@@ -3232,6 +3257,7 @@ class BaseTrajectoryTracker(Node, ABC):
                     return SetParametersResult(successful=False)
                 self.breakaway_speed = param.value
                 self._breakaway_active = False
+                self._breakaway_sign = 0.0
             elif param.name == 'breakaway_engage_speed':
                 if param.value < 0.0:
                     self.get_logger().error(

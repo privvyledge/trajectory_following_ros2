@@ -29,6 +29,7 @@ class _Stub:
         self.MAX_SPEED = max_speed
         self._breakaway_active = False
         self._breakaway_applied = 0.0
+        self._breakaway_sign = 0.0
 
     def get_logger(self):
         return _Logger()
@@ -101,6 +102,42 @@ def test_handover_does_not_step_the_command_down():
             f'published {published:.3f} at measured {measured:.3f} is below the '
             'dropout speed -- the release would re-stall the drivetrain')
     assert not s._breakaway_active
+
+
+def test_holds_through_standstill_measurement_noise():
+    """A stopped vehicle's measured speed dithers across zero, and that must not
+    be read as the solver reversing.
+
+    Keying the reversal release on ``measured*command < 0`` releases the latch on
+    any negative noise sample; the next tick re-engages via the stalled branch, so
+    the actuator sees floor/creep/floor/creep. Measured on the car: 21.6% of the
+    ticks that should have held passed through at the un-floored creep, median
+    unbroken hold 2 ticks (0.10 s) -- the pulse train the latch exists to prevent.
+    """
+    s = _Stub(floor=0.25)
+    # Real trace shape: stopped, solver asking for its one-step creep every tick,
+    # measured speed dithering either side of zero well inside the engage deadband.
+    dither = [0.004, -0.001, 0.003, -0.003, 0.001, -0.005, 0.006, -0.002,
+              0.000, -0.004, 0.002, -0.001]
+    published = [s.apply(0.150, v) for v in dither]
+
+    assert all(p == 0.25 for p in published), (
+        f'floor dropped out on {sum(1 for p in published if p != 0.25)} of '
+        f'{len(published)} stopped ticks: {published}')
+    assert s._breakaway_active
+
+
+def test_a_real_measured_reversal_still_releases():
+    """The deadband on the measured-reversal test must not disable it outright:
+    a vehicle genuinely rolling backwards against a forward push still releases."""
+    s = _Stub(floor=0.25)
+    assert s.apply(0.15, 0.0) == 0.25          # engage forward from rest
+    assert s.apply(0.15, -0.002) == 0.25       # noise -- holds
+    # -0.08 is past the engage deadband but short of the 0.125 release speed, so
+    # only the measured-reversal branch can let go here.
+    out = s.apply(0.15, -0.08)                 # actually rolling backwards
+    assert not s._breakaway_active
+    assert out == 0.15
 
 
 def test_releases_when_the_solver_reverses_direction():
