@@ -47,6 +47,18 @@
     max_steer: 23.0
     min_steer: -23.0
 
+    # Speed ceiling for a gosling1 route run. Pinned HERE rather than passed as a
+    # launch argument for the same reason as max_steer above: platforms/f1tenth.yaml
+    # sets max_speed 1.5 and the platform overlay is applied after the launch args,
+    # so `max_speed:=...` on the command line is silently discarded — measured on the
+    # car 2026-08-06, where a run launched with 0.8 read back 1.5 on the node.
+    #
+    # 1.0 against a recorded route profile of ~0.7 m/s leaves headroom for the
+    # reference-anchor overshoot (~1.14x forward, ~1.31x reverse) without letting a
+    # transient run away at the platform's 1.5.
+    max_speed: 1.0
+    min_speed: -1.0
+
     use_speed_profile: True
     max_lateral_accel: 3.0
     min_reference_speed: 0.3

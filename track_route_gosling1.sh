@@ -47,12 +47,34 @@ CONTROL_RATE="${CONTROL_RATE:-20.0}"
 #   2. A localizer must actually be publishing map->odom. Nothing in the
 #      controller can tell "no localizer" from "localizer at identity", so
 #      check_stack probes for the transform before the car is allowed to move.
-GLOBAL_FRAME="${GLOBAL_FRAME:-odom}"
+#   3. 'map' is the default because an odom-frame route is only valid inside the
+#      session that recorded it. odom has no external datum -- its origin AND its
+#      heading are fixed at EKF init, wherever the car sat and pointed when the
+#      stack came up -- so replaying one after a restart drives the recorded path
+#      ROTATED by the difference between the two sessions' init headings, and
+#      nothing detects it: TF resolves, the controller tracks the wrong route to
+#      centimetres, every diagnostic reads healthy. Measured 2026-08-06 with the
+#      car parked on the route start: position matched to 7 mm, but waypoint 0
+#      heads -31.0 deg against odom's -0.2 deg, and the straight 2.0 m reverse
+#      tail came out 45.7 deg off the X axis. The 31 deg heading error then
+#      pinned steering at the cap for 172 s -- over the 0.2 m distance_tolerance
+#      reference anchor it demands an impossible radius, with no yaw authority at
+#      v=0 to work it off.
+#      Set GLOBAL_FRAME=odom explicitly to drive a *_odomframe.csv route in the
+#      same session that recorded it.
+GLOBAL_FRAME="${GLOBAL_FRAME:-map}"
 ROBOT_FRAME="${ROBOT_FRAME:-base_link}"
 
 # Speed cap for the run. Independent of the joystick MAX_SPEED in 00_env.sh --
 # this one bounds what the solver may command.
-TRACK_MAX_SPEED="${TRACK_MAX_SPEED:-0.8}"
+#
+# Like the steering cap below, this CANNOT be set from the launch line:
+# config/platforms/f1tenth.yaml pins max_speed 1.5 and the platform overlay is
+# applied after the launch args, so `max_speed:=0.8` reads back as 1.5 on the
+# running node (measured on the car 2026-08-06). The value lives in the weights
+# file that WEIGHTS points at; this variable only tells assert_live_params what
+# to expect, so change the two together.
+TRACK_MAX_SPEED="${TRACK_MAX_SPEED:-1.0}"
 
 # Steering cap, DEGREES at the road wheel.
 #
@@ -161,10 +183,19 @@ check_csv() {
 }
 
 check_stack() {
-  local missing=0 t
+  # Discovery on this box is intermittently slow, and one cold `ros2 topic list`
+  # can return an incomplete graph -- `check` has passed and `launch` failed this
+  # same assert seconds later while odometry was publishing normally. Retry
+  # before believing a silence, exactly as the parameter reads below do.
+  local missing=0 t i topics=''
+  for i in 1 2 3 4; do
+    topics=$(timeout 20 ros2 topic list 2>/dev/null)
+    grep -qx "/${NS}/odometry/local" <<<"$topics" && grep -qx "/${NS}/drive" <<<"$topics" && break
+    sleep 2
+  done
   for t in "odometry/local" "drive"; do
-    if ! ros2 topic list 2>/dev/null | grep -qx "/${NS}/${t}"; then
-      err "topic /${NS}/${t} is not present"; missing=1
+    if ! grep -qx "/${NS}/${t}" <<<"$topics"; then
+      err "topic /${NS}/${t} is not present (4 attempts)"; missing=1
     fi
   done
   [[ "$missing" -eq 0 ]] || die "vehicle stack is not up. Start it with 25_drive_session.sh launch"
@@ -191,18 +222,91 @@ check_localizer() {
   info "probing for ${target}->odom on /${NS}/tf (the controller cannot detect its absence)"
   # tf2_echo never exits on success, so timeout's status is meaningless here --
   # it returns 124 either way. The output is what distinguishes the two.
-  local probe
-  probe=$(timeout 10 ros2 run tf2_ros tf2_echo "$target" odom \
-            --ros-args -r /tf:="/${NS}/tf" -r /tf_static:="/${NS}/tf_static" 2>&1 | head -20)
+  #
+  # 10 s was too tight: the listener has to see the frame published before it
+  # will answer, and a live AMCL took ~5 s to resolve here while the probe was
+  # already reporting 'frame does not exist'. A too-short window is worse than
+  # no probe -- it sends the operator to restart a localizer that is running.
+  # Do NOT merge stderr and truncate with head: the CycloneDDS config in
+  # 00_env.sh emits an unbounded 'ddsi_udp_conn_write ... retcode -3' stream for
+  # every unreachable static peer, which filled the whole window and made a
+  # working localizer read as absent. Match the transform out of stdout instead
+  # and let grep -m1 close the pipe.
+  local probe i
+  for i in 1 2; do
+    probe=$(timeout 20 ros2 run tf2_ros tf2_echo "$target" odom \
+              --ros-args -r /tf:="/${NS}/tf" -r /tf_static:="/${NS}/tf_static" \
+              2>/dev/null | grep -m1 -A4 'Translation')
+    grep -q 'Translation' <<<"$probe" && break
+  done
   if grep -q 'Translation' <<<"$probe"; then
     info "localizer is publishing ${target}->odom"
+    # Print the correction itself. A localizer that came up but never got an
+    # initial pose sits at identity, which is indistinguishable from a healthy
+    # one in a pass/fail probe and reproduces the exact failure this guard
+    # exists to prevent.
+    info "  correction $(grep -m1 '^- Translation' <<<"$probe"), $(grep -m1 'RPY (degree)' <<<"$probe" | sed 's/^- //')"
   else
-    die "no ${target}->odom transform on /${NS}/tf after 10 s.
+    die "no ${target}->odom transform on /${NS}/tf after 2 x 20 s.
          A '${target}'-frame route needs a live localizer. Without one the
          controller does not fail -- it tracks the raw odom pose as though it
          were already '${target}', i.e. off by the whole correction.
          Start the localizer, or drive an odom-frame route (data/*_odomframe.csv)."
   fi
+}
+
+# A transform existing proves nothing about the car being where the route
+# starts, and that gap has now ended two runs. 2026-08-05: an odom-frame route
+# replayed after an EKF re-datum put waypoint 0 at -31 deg against the car's
+# -0.2 deg. 2026-08-06: a localizer that came up without an initial pose sat at
+# identity, leaving the car 0.74 m and 83 deg from waypoint 0 with a map->odom
+# transform publishing normally the whole time. Both read as healthy everywhere
+# else, and both end the same way: the reference is anchored distance_tolerance
+# (0.2 m) ahead, a large heading error there demands a radius the car cannot
+# turn, and at v=0 there is no yaw authority to work it off, so steering pins at
+# the cap and the pose never changes.
+check_start_pose() {
+  local csv="$1" target="$2"
+
+  info "comparing the car's ${target} pose against waypoint 0"
+  local probe
+  probe=$(timeout 20 ros2 run tf2_ros tf2_echo "$target" "$ROBOT_FRAME" \
+            --ros-args -r /tf:="/${NS}/tf" -r /tf_static:="/${NS}/tf_static" \
+            2>/dev/null | grep -m1 -A4 'Translation')
+  if ! grep -q 'Translation' <<<"$probe"; then
+    err "could not read ${target}->${ROBOT_FRAME}; skipping the start-pose comparison"
+    return 0
+  fi
+
+  local car_xy car_yaw
+  car_xy=$(grep -m1 '^- Translation' <<<"$probe" | tr -d '[],' | awk '{print $3, $4}')
+  # '- Rotation: in RPY (radian) 0.000 0.000 -1.492' once the brackets are gone,
+  # so yaw is field 8. Field 6 is the roll term and parses as a clean 0.0 -- a
+  # wrong-but-plausible heading, which is the worst kind for a safety gate.
+  car_yaw=$(grep -m1 'RPY (radian)' <<<"$probe" | tr -d '[],' | awk '{print $8}')
+
+  python3 - "$csv" $car_xy "$car_yaw" <<'PY' || die "the car is not at the route start."
+import csv, math, sys
+
+path, cx, cy, cyaw = sys.argv[1], *map(float, sys.argv[2:5])
+with open(path) as fh:
+    row = next(iter(csv.DictReader(fh)))
+wx, wy, wyaw = float(row['x']), float(row['y']), float(row['yaw'])
+
+dpos = math.hypot(cx - wx, cy - wy)
+dyaw = abs(math.degrees(math.atan2(math.sin(cyaw - wyaw), math.cos(cyaw - wyaw))))
+print(f"  car        {cx: .3f} {cy: .3f}  {math.degrees(cyaw): .1f} deg")
+print(f"  waypoint 0 {wx: .3f} {wy: .3f}  {math.degrees(wyaw): .1f} deg")
+print(f"  offset     {dpos:.3f} m, {dyaw:.1f} deg")
+
+# The heading term is the one that wedges the car; position error the reference
+# anchor can absorb, heading error at standstill it cannot.
+if dpos > 0.75 or dyaw > 30.0:
+    print('  FAIL: park the car on the route start, or re-seed the localizer.')
+    sys.exit(1)
+if dpos > 0.30 or dyaw > 15.0:
+    print('  WARN: larger than a clean start; expect a slow, wide first metre.')
+PY
 }
 
 # ---------------------------------------------------- post-launch asserts ----
@@ -220,7 +324,8 @@ assert_live_params() {
         casadi) echo casadi_mpc_node ;;
         do_mpc) echo do_mpc_node ;;
         *) echo "${BACKEND}_mpc_node" ;; esac)"
-  local loader="/${NS}/waypoint_loader"
+  # The loader's node name is waypoint_loader_node, not the executable name.
+  local loader="/${NS}/waypoint_loader_node"
 
   # The node needs a moment past process start before its parameter services answer.
   local i
@@ -232,10 +337,18 @@ assert_live_params() {
   banner "effective parameters (read from the running node, not the launch line)"
   local bad=0
   _p() {  # _p <node> <param> <expected|-> ; prints and flags mismatches
-    local got; got=$(timeout 10 ros2 param get "$1" "$2" 2>/dev/null \
-                     | sed 's/.*value is: //')
+    # The parameter service answers intermittently on a loaded box -- a single
+    # timeout is indistinguishable from a genuinely missing parameter, and
+    # reporting "could not read" for a value that is in fact correct is how a
+    # real mismatch gets lost in the noise. Retry before believing a silence.
+    local got i
+    for i in 1 2 3 4; do
+      got=$(timeout 20 ros2 param get "$1" "$2" 2>/dev/null | sed 's/.*value is: //')
+      [[ -n "$got" ]] && break
+      sleep 2
+    done
     if [[ -z "$got" ]]; then
-      err "  $2: could not read from $1"; bad=1; return
+      err "  $2: could not read from $1 after 4 attempts"; bad=1; return
     fi
     if [[ "$3" != "-" ]] && ! python3 -c "
 import sys
@@ -280,8 +393,25 @@ do_launch() {
   check_csv "$csv"
   check_stack
   check_localizer "$GLOBAL_FRAME"
+  check_start_pose "$csv" "$GLOBAL_FRAME"
 
   banner "launching $BACKEND MPC on /${NS}"
+
+  # Rerun on the car is 0.22.x, which is SINGLE-SINK: asking for both a web
+  # viewer and a .rrd gets you the viewer and a silently dropped recording. So
+  # a recording path forces serve_web off rather than letting the two fight.
+  # The argument is only passed when non-empty -- rcl rejects a bare
+  # `-p name:=` with "Couldn't parse parameter override rule" and takes the
+  # whole launch down with it.
+  local viz_args=()
+  if [[ -n "${VIZ_RECORDING_PATH:-}" ]]; then
+    mkdir -p "$(dirname "$VIZ_RECORDING_PATH")"
+    viz_args+=(viz_recording_path:="$VIZ_RECORDING_PATH" viz_serve_web:=false)
+    info "rerun recording -> $VIZ_RECORDING_PATH (web viewer off; 0.22 cannot do both)"
+  else
+    viz_args+=(viz_serve_web:="${VIZ_SERVE_WEB:-true}")
+  fi
+
   # waypoint_target_frame is pinned to global_frame so the loader and the
   # controller cannot disagree about the path frame.
   nohup ros2 launch trajectory_following_ros2 mpc.launch.py \
@@ -304,7 +434,8 @@ do_launch() {
       min_steer:="-${TRACK_MAX_STEER_DEG}" \
       solver_log_file:="$SOLVER_CSV" \
       load_visualizer:="${LOAD_VIZ:-false}" \
-      viz_serve_web:="${VIZ_SERVE_WEB:-true}" \
+      viz_backend:="${VIZ_BACKEND:-rerun}" \
+      "${viz_args[@]}" \
       viz_spawn_viewer:=false \
       > "$MPC_LOG" 2>&1 &
   echo $! > "$MPC_PID_F"
@@ -325,6 +456,12 @@ do_launch() {
 do_status() {
   local pid; pid="$(read_pid "$MPC_PID_F")"
   if alive "$pid"; then info "controller up (pid $pid)"; else warn "controller down"; fi
+
+  # SOLVER_CSV is stamped with the invocation time, so the name computed by a
+  # `status` call is never the one `launch` gave the node -- status silently
+  # printed nothing at all. Read the newest file in the session dir instead.
+  local newest; newest="$(ls -t "$SESSION_DIR"/solver_*.csv 2>/dev/null | head -1)"
+  [[ -n "$newest" ]] && SOLVER_CSV="$newest"
 
   # Cadence is judged from the solver CSV's own tick interval, never from
   # `ros2 topic hz` -- the CLI subscriber is itself a load on a busy box.
@@ -393,7 +530,8 @@ do_tmux() {
 cmd="${1:-}"; shift || true
 case "$cmd" in
   check)  print_env; check_csv "${1:?usage: $0 check <waypoints.csv>}"; check_stack
-          check_localizer "$GLOBAL_FRAME" ;;
+          check_localizer "$GLOBAL_FRAME"
+          check_start_pose "$1" "$GLOBAL_FRAME" ;;
   launch) do_launch "${1:?usage: $0 launch <waypoints.csv>}" ;;
   status) do_status ;;
   stop)   do_stop ;;

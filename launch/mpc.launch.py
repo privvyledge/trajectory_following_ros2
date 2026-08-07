@@ -32,6 +32,7 @@ def generate_launch_description():
     namespace = LaunchConfiguration('namespace', default='')
     load_visualizer = LaunchConfiguration('load_visualizer', default=False)
     viz_spawn_viewer = LaunchConfiguration('viz_spawn_viewer', default=True)
+    viz_backend = LaunchConfiguration('viz_backend', default='both')
     viz_recording_path = LaunchConfiguration('viz_recording_path', default='')
     viz_serve_web = LaunchConfiguration('viz_serve_web', default=False)
     viz_web_port = LaunchConfiguration('viz_web_port', default=9090)
@@ -613,6 +614,15 @@ def generate_launch_description():
             default_value='True',
             description='Spawn the Rerun viewer process automatically when the visualizer starts.'
     )
+    viz_backend_la = DeclareLaunchArgument(
+            'viz_backend',
+            default_value='both',
+            description="Visualization backend: 'rerun' | 'native' (matplotlib) | 'both'. Pick by "
+                        'where the pixels are drawn, not by habit. On a headless machine choose '
+                        "'rerun': the native backend has no display to render into, warns "
+                        '"Starting a Matplotlib GUI outside of the main thread will likely fail", '
+                        'and over ssh renders through X11 forwarding at the cost of a full core.'
+    )
     viz_recording_path_la = DeclareLaunchArgument(
             'viz_recording_path',
             default_value='',
@@ -674,7 +684,8 @@ def generate_launch_description():
              declare_log_level_cmd,
              odom_topic_la, ackermann_cmd_topic_la, twist_topic_la, acceleration_topic_la, path_topic_la,
              speed_topic_la, debug_frequency_la,
-             load_visualizer_la, viz_spawn_viewer_la, viz_recording_path_la,
+             load_visualizer_la, viz_spawn_viewer_la, viz_backend_la,
+             viz_recording_path_la,
              viz_serve_web_la, viz_web_port_la, viz_web_open_browser_la,
              viz_actuator_feedback_topic_la, viz_reference_cmd_topic_la]
     )
@@ -842,6 +853,7 @@ def generate_launch_description():
             name='trajectory_visualizer_node',
             output='screen',
             parameters=[{
+                'viz_backend': ParameterValue(viz_backend, value_type=str),
                 'spawn_viewer': ParameterValue(viz_spawn_viewer, value_type=bool),
                 'recording_path': ParameterValue(viz_recording_path, value_type=str),
                 'serve_web': ParameterValue(viz_serve_web, value_type=bool),

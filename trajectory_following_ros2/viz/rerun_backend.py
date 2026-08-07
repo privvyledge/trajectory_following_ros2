@@ -179,6 +179,16 @@ class RerunBackend(BaseVizBackend):
         # on WSL2 — no VK_ICD_FILENAMES / lavapipe workaround needed in this mode.
         # serve_web is single-sink on rerun < 0.23, so it is mutually exclusive
         # with a .rrd recording; keep the web viewer and warn if both were asked.
+        #
+        # NOTE: this branch RETURNS, so a serve_web request never reaches
+        # _configure_multisink below -- the tee is wired only for the
+        # spawn_viewer/connect_addr paths. Upgrading rerun alone will therefore
+        # NOT give web viewer + .rrd together; that needs this branch rewritten
+        # in terms of serve_grpc() + serve_web_viewer() + set_sinks(). Measured
+        # 2026-08-06: set_sinks/GrpcSink/FileSink do not exist before 0.24, and
+        # 0.24 requires numpy >= 2 (0.23.1 is the last release accepting
+        # numpy 1.x), so on a numpy-1 image the sinks stay mutually exclusive
+        # whatever this code does.
         if serve_web:
             if recording_path:
                 warnings.warn(
