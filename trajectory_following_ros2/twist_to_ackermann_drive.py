@@ -22,6 +22,9 @@ class Twist2Ackermann(Node):
         self.declare_parameter('frame_id', 'base_link',
                                ParameterDescriptor(description='The commands reference frame.'))
         self.declare_parameter('cmd_angle_instead_rotvel', False)
+        self.declare_parameter(
+            'max_steering_angle', 0.4,
+            ParameterDescriptor(description='Symmetric steering angle limit in radians.'))
 
         # get parameters
         self.WHEELBASE = self.get_parameter('wheelbase').value
@@ -29,6 +32,9 @@ class Twist2Ackermann(Node):
         self.ackermann_cmd_topic = self.get_parameter('ackermann_cmd_topic').value
         self.frame_id = self.get_parameter('frame_id').value
         self.cmd_angle_instead_rotvel = self.get_parameter('cmd_angle_instead_rotvel').value
+        self.MAX_STEERING_ANGLE = self.get_parameter('max_steering_angle').value
+        if not math.isfinite(self.MAX_STEERING_ANGLE) or self.MAX_STEERING_ANGLE <= 0.0:
+            raise ValueError('max_steering_angle must be a positive finite value')
 
         # initialize variables
 
@@ -77,12 +83,12 @@ class Twist2Ackermann(Node):
             self.get_logger().info('Saturating speed. ')
             longitudinal_velocity = -3.0
 
-        if steering_angle > 0.4:
+        if steering_angle > self.MAX_STEERING_ANGLE:
             self.get_logger().info('Saturating steering_angle. ')
-            steering_angle = 0.4
-        if steering_angle < -0.4:
+            steering_angle = self.MAX_STEERING_ANGLE
+        if steering_angle < -self.MAX_STEERING_ANGLE:
             self.get_logger().info('Saturating steering_angle. ')
-            steering_angle = -0.4
+            steering_angle = -self.MAX_STEERING_ANGLE
         # End saturation
 
         ackermann_cmd = AckermannDriveStamped()
@@ -98,7 +104,7 @@ class Twist2Ackermann(Node):
             return 0.
 
         radius = longitudinal_speed / desired_yaw_rate
-        steering_angle = math.atan2(self.WHEELBASE, radius) if radius != 0 else 0.0
+        steering_angle = math.atan(self.WHEELBASE / radius) if radius != 0 else 0.0
         return steering_angle
 
 
