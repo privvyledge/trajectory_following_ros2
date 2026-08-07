@@ -8,6 +8,7 @@ import pytest
 from trajectory_following_ros2.base_tracker import (
     AvoidanceStopLatch,
     BaseTrajectoryTracker,
+    ForwardEscapeRecovery,
     ProgressWatchdog,
     obstacle_shape_discs,
 )
@@ -179,6 +180,55 @@ def test_progress_watchdog_trips_while_an_intervention_holds_the_vehicle():
                                forced_stop=True, final_goal_reached=True)
 
 
+def test_progress_watchdog_trip_must_be_rearmed_or_it_never_releases():
+    """A held trip is unrecoverable, so the caller must reset the anchor on it.
+
+    The watchdog is fed the command the solver *proposed*, because that is the
+    intent to move -- but on a trip the caller publishes zero instead. Nothing
+    about that zero reaches the watchdog, so it keeps re-reading a non-zero
+    proposal and the trip condition holds forever, while every release gate
+    (index advance, displacement, measured motion) needs the vehicle to move and
+    the published zero is what stops it.
+
+    Measured on hardware: one joystick deadman release past the timeout froze a
+    run for 234 s / 4686 ticks, every solve optimal, and pressing the deadman
+    again could not recover it.
+    """
+    frozen = dict(current_idx=249, position=(0.155, -2.738), speed=0.0,
+                  applied_speed=0.15, applied_accel=3.0, max_accel=3.0)
+
+    def tick(watchdog, t):
+        return watchdog.update(t, frozen['current_idx'], frozen['position'],
+                               frozen['speed'], frozen['applied_speed'],
+                               frozen['applied_accel'], frozen['max_accel'])
+
+    # Held: trips once and then stays tripped for as long as it is asked.
+    held = ProgressWatchdog(timeout=5.0)
+    assert not tick(held, 0.0)
+    assert tick(held, 5.0)
+    assert all(tick(held, t) for t in (5.1, 60.0, 240.0, 3600.0))
+
+    # Re-armed on each trip, as the caller does: a pulse train, not a latch. The
+    # vehicle is commanded normally on every tick between pulses, so one that can
+    # move gets the chance to.
+    rearmed = ProgressWatchdog(timeout=5.0)
+    trips = []
+    t = 0.0
+    while t <= 30.0:
+        if tick(rearmed, t):
+            trips.append(t)
+            rearmed.reset()
+        t = round(t + 0.05, 2)
+    # One pulse per timeout, and the other 99 ticks in 100 carry a real command.
+    assert 5 <= len(trips) <= 6, trips
+    assert all(5.0 <= b - a <= 5.1 for a, b in zip(trips, trips[1:])), trips
+
+    # And a vehicle that starts moving again releases it outright.
+    rearmed.reset()
+    assert not rearmed.update(35.0, 249, (0.155, -2.738), 0.0, 0.15, 3.0, 3.0)
+    assert not rearmed.update(40.0, 250, (0.9, -2.738), 0.6, 0.5, 1.0, 3.0)
+
+
 def test_progress_watchdog_trips_on_a_reverse_the_plant_never_executes():
     """A commanded reverse must not release the anchor unless the vehicle moves.
 
@@ -238,6 +288,83 @@ def test_avoidance_stop_latch_hysteresis():
     assert latch.update({}, 2.0) == set()
 
 
+def test_forward_escape_requires_continuous_stationary_time_and_all_entry_gates():
+    recovery = ForwardEscapeRecovery()
+    group = frozenset({9})
+
+    assert not recovery.observe_stationary(0.0, 0.0)
+    assert not recovery.observe_stationary(0.8, 0.11)
+    assert not recovery.observe_stationary(1.7, 0.0)
+    assert recovery.observe_stationary(2.7, 0.0)
+    assert recovery.entry_allowed(True, {group}, 2.0, 1.6, 0.05)
+    assert not recovery.entry_allowed(True, {group}, 2.0, 1.59, 0.05)
+    assert not recovery.entry_allowed(True, {group}, 2.0, 2.1, 0.049)
+
+
+def test_forward_escape_group_absence_is_time_debounced():
+    recovery = ForwardEscapeRecovery(group_absence_time=0.5)
+    recovery.activate({9}, 2.1)
+
+    assert not recovery.group_absence_expired(1.0, False)
+    assert not recovery.group_absence_expired(1.49, False)
+    assert recovery.group_absence_expired(1.5, False)
+    assert not recovery.group_absence_expired(2.0, True)
+
+
+def test_forward_escape_continues_for_brief_group_dropout_then_aborts():
+    tracker = _projection_tracker(max_offset=2.0)
+    tracker._gp = {'ego_radius': 1.096, 'safe_distance': 0.4,
+                   'ego_disc_offsets': [0.0]}.__getitem__
+    tracker.forward_escape_enabled = True
+    tracker.forward_escape_speed = 1.0
+    tracker.MAX_ACCEL = 3.0
+    tracker._forward_escape = ForwardEscapeRecovery(group_absence_time=0.5)
+    tracker._forward_escape.activate({9}, 2.1)
+    tracker._forward_escape_active = True
+    tracker.current_idx = 0
+    tracker.path = np.column_stack((np.linspace(0.0, 20.0, 81), np.zeros(81)))
+    tracker.obstacles = []
+    raw = _straight_reference()
+
+    brief = tracker._reference_with_forward_escape(
+        raw, [], ego_pose=(0.0, 2.1, 0.0), speed=0.0, now=1.0)
+    assert tracker._forward_escape.active
+    assert tracker._forward_escape_active
+    assert np.max(brief[2, :]) == pytest.approx(1.0)
+
+    tracker._reference_with_forward_escape(
+        raw, [], ego_pose=(0.0, 2.1, 0.0), speed=0.0, now=1.49)
+    assert tracker._forward_escape.active
+
+    tracker._reference_with_forward_escape(
+        raw, [], ego_pose=(0.0, 2.1, 0.0), speed=0.0, now=1.5)
+    assert not tracker._forward_escape.active
+    assert not tracker._forward_escape_active
+
+
+def test_forward_escape_reference_never_widens_and_respects_acceleration():
+    raw = _straight_reference()
+    escaped = ForwardEscapeRecovery.displaced_reference(
+        raw, signed_offset=2.1, taper_start=15, speed=1.0,
+        max_accel=3.0, dt=0.05)
+
+    offsets = escaped[1, :] - raw[1, :]
+    assert np.all(np.diff(np.abs(offsets)) <= 1e-12)
+    assert np.max(np.abs(offsets)) == pytest.approx(2.1)
+    assert offsets[-1] == pytest.approx(0.0)
+    assert escaped[2, 0] == 0.0
+    assert np.all(np.diff(escaped[2, :]) <= 3.0 * 0.05 + 1e-12)
+    assert np.max(escaped[2, :]) <= 1.0
+
+
+def test_watchdog_does_not_zero_the_first_forward_escape_ticks():
+    watchdog = ProgressWatchdog(timeout=8.0)
+    for tick in range(20):
+        assert not watchdog.update(
+            tick * 0.05, 139, (0.0, 0.0), 0.0,
+            applied_speed=1.0, applied_accel=3.0, max_accel=3.0)
+
+
 def _projection_tracker(max_offset=0.0, engagement=0.0):
     tracker = _new_tracker()
     tracker._gp = {'ego_radius': 1.5, 'safe_distance': 0.4,
@@ -258,6 +385,224 @@ def _projection_tracker(max_offset=0.0, engagement=0.0):
 def _straight_reference():
     x = np.linspace(0.0, 10.0, 26)
     return np.vstack([x, np.zeros_like(x), np.full_like(x, 4.0), np.zeros_like(x)])
+
+
+def test_forward_escape_replaces_stop_short_reference_only_after_safe_entry():
+    tracker = _projection_tracker(max_offset=2.0)
+    tracker._gp = {'ego_radius': 1.096, 'safe_distance': 0.4,
+                   'ego_disc_offsets': [-0.4125, 0.7625, 1.9375, 3.1125]}.__getitem__
+    tracker.forward_escape_enabled = True
+    tracker.forward_escape_speed = 1.0
+    tracker.MAX_ACCEL = 3.0
+    tracker._forward_escape = ForwardEscapeRecovery()
+    tracker._forward_escape_active = False
+    tracker.current_idx = 0
+    tracker.path = np.column_stack((np.linspace(0.0, 20.0, 81), np.zeros(81)))
+    obstacle = {'id': 9, 'state': [5.0, -0.55, 1.216],
+                'velocity': [0.0, 0.0]}
+    tracker.obstacles = [obstacle]
+    raw = _straight_reference()
+
+    stopped = tracker._reference_with_forward_escape(
+        raw, [obstacle], ego_pose=(0.0, 2.1, 0.0), speed=0.0, now=0.0)
+    escaped = tracker._reference_with_forward_escape(
+        raw, [obstacle], ego_pose=(0.0, 2.1, 0.0), speed=0.0, now=1.0)
+
+    assert np.all(stopped[2, tracker._first_keepout_intrusion(raw, [obstacle]):] == 0.0)
+    assert tracker._forward_escape.active
+    assert tracker._forward_escape_active
+    assert np.max(escaped[2, :]) == pytest.approx(1.0)
+    assert np.max(np.abs(escaped[1, :] - raw[1, :])) == pytest.approx(2.1)
+    assert tracker._forward_escape_clearance(escaped, tracker.obstacles) >= 0.05
+
+
+def test_forward_escape_corridor_checks_unselected_cached_obstacles():
+    tracker = _projection_tracker(max_offset=2.0)
+    tracker._gp = {'ego_radius': 1.096, 'safe_distance': 0.4,
+                   'ego_disc_offsets': [0.0]}.__getitem__
+    candidate = ForwardEscapeRecovery.displaced_reference(
+        _straight_reference(), 2.1, None, 1.0, 3.0, 0.05)
+    selected = {'id': 9, 'state': [5.0, -0.55, 1.216], 'velocity': [0.0, 0.0]}
+    unseen_blocker = {'id': 10, 'state': [5.0, 2.1, 0.3], 'velocity': [0.0, 0.0]}
+
+    assert tracker._forward_escape_clearance(candidate, [selected]) > 0.05
+    assert tracker._forward_escape_clearance(
+        candidate, [selected, unseen_blocker]) < 0.05
+
+
+def test_forward_escape_precheck_failure_aborts_immediately():
+    tracker = _projection_tracker(max_offset=2.0)
+    tracker._gp = {'ego_radius': 1.096, 'safe_distance': 0.4,
+                   'ego_disc_offsets': [0.0]}.__getitem__
+    tracker.forward_escape_enabled = True
+    tracker.forward_escape_speed = 1.0
+    tracker.MAX_ACCEL = 3.0
+    tracker._forward_escape = ForwardEscapeRecovery()
+    tracker._forward_escape_active = False
+    tracker.current_idx = 0
+    tracker.path = np.column_stack((np.linspace(0.0, 20.0, 81), np.zeros(81)))
+    obstacle = {'id': 9, 'state': [5.0, -0.55, 1.216],
+                'velocity': [0.0, 0.0]}
+    blocker = {'id': 10, 'state': [5.0, 2.1, 0.3],
+               'velocity': [0.0, 0.0]}
+    tracker.obstacles = [obstacle]
+    raw = _straight_reference()
+    tracker._reference_with_forward_escape(
+        raw, [obstacle], ego_pose=(0.0, 2.1, 0.0), speed=0.0, now=0.0)
+    tracker._reference_with_forward_escape(
+        raw, [obstacle], ego_pose=(0.0, 2.1, 0.0), speed=0.0, now=1.0)
+    assert tracker._forward_escape.active
+
+    tracker.obstacles = [obstacle, blocker]
+    tracker._reference_with_forward_escape(
+        raw, [obstacle], ego_pose=(0.0, 2.1, 0.0), speed=0.0, now=1.05)
+
+    assert not tracker._forward_escape.active
+    assert not tracker._forward_escape_active
+
+
+def test_forward_escape_relief_changes_only_constraint_pack_copies():
+    tracker = _projection_tracker(max_offset=2.0)
+    tracker._gp = {'ego_radius': 1.096, 'safe_distance': 0.4,
+                   'ego_disc_offsets': [0.0]}.__getitem__
+    tracker._forward_escape = ForwardEscapeRecovery(clearance_floor=0.05)
+    tracker._forward_escape.activate({9}, 2.1)
+    tracker._forward_escape_active = True
+    tracker._forward_escape_relief_ids = frozenset({9})
+    selected = [
+        {'id': 9, 'state': [5.0, -0.55, 1.216], 'velocity': [0.0, 0.0]},
+        {'id': 10, 'state': [8.0, 0.0, 0.3], 'velocity': [0.0, 0.0]},
+    ]
+
+    packed = tracker._constraint_obstacles(selected)
+
+    assert packed[0]['state'][2] == pytest.approx(0.866)
+    assert packed[1] is selected[1]
+    assert selected[0]['state'][2] == pytest.approx(1.216)
+
+
+def test_forward_escape_resolves_drifted_group_to_binding_obstacle():
+    tracker = _projection_tracker(max_offset=2.0)
+    tracker._gp = {'ego_radius': 1.096, 'safe_distance': 0.4,
+                   'ego_disc_offsets': [0.0]}.__getitem__
+    tracker.forward_escape_enabled = True
+    tracker.forward_escape_speed = 1.0
+    tracker.MAX_ACCEL = 3.0
+    tracker._forward_escape = ForwardEscapeRecovery()
+    tracker._forward_escape_active = False
+    tracker.current_idx = 0
+    tracker.path = np.column_stack((np.linspace(0.0, 20.0, 81), np.zeros(81)))
+    binding = {'id': 208, 'state': [5.0, -0.55, 1.216],
+               'velocity': [0.0, 0.0]}
+    merged_member = {'id': 17, 'state': [30.0, 30.0, 0.3],
+                     'velocity': [0.0, 0.0]}
+    bystander = {'id': 2969149464, 'state': [40.0, 40.0, 0.3],
+                 'velocity': [0.0, 0.0]}
+    selected = [binding, merged_member, bystander]
+    tracker.obstacles = selected
+    binding_latch = frozenset({208, 2})
+    bystander_latch = frozenset({2969149464})
+    current_required = {
+        frozenset({208, 17}): 2.4,
+        frozenset({2969149464, 33}): 1.0,
+    }
+    stop_groups = {bystander_latch, binding_latch}
+    assert next(iter(stop_groups)) == bystander_latch
+    tracker._avoidance_stop_latch = SimpleNamespace(
+        active_groups=stop_groups, release_ratio=0.8)
+
+    def project(raw, unused_selected, unused_pose):
+        tracker._avoidance_required_offsets = current_required
+        return raw
+
+    tracker._project_reference_out_of_keepouts = project
+    raw = _straight_reference()
+    tracker._reference_with_forward_escape(
+        raw, selected, ego_pose=(0.0, 2.1, 0.0), speed=0.0, now=0.0)
+    tracker._reference_with_forward_escape(
+        raw, selected, ego_pose=(0.0, 2.1, 0.0), speed=0.0, now=1.0)
+
+    assert tracker._forward_escape.group == frozenset({208, 17})
+    assert tracker._forward_escape.anchor_group == frozenset({208})
+    assert tracker._forward_escape_active
+    assert {obstacle['id'] for obstacle in
+            tracker._forward_escape_group_obstacles(selected)} == {208, 17}
+    assert tracker._forward_escape_relief_ids == frozenset({208})
+    packed = tracker._constraint_obstacles(selected)
+    assert packed[0]['state'][2] == pytest.approx(0.866)
+    assert packed[1] is merged_member
+    assert packed[2] is bystander
+
+
+def test_forward_escape_relief_follows_corridor_intrusion_not_latch():
+    tracker = _projection_tracker(max_offset=2.0)
+    messages = []
+    tracker.get_logger = lambda: SimpleNamespace(
+        info=lambda message, **unused: messages.append(message))
+    tracker._gp = {
+        'ego_radius': 1.096,
+        'safe_distance': 0.4,
+        'ego_disc_offsets': [-0.4125, 0.7625, 1.9375, 3.1125],
+    }.__getitem__
+    tracker.forward_escape_enabled = True
+    tracker.forward_escape_speed = 1.0
+    tracker.MAX_ACCEL = 3.0
+    tracker._forward_escape = ForwardEscapeRecovery()
+    tracker._forward_escape_active = False
+    tracker.current_idx = 0
+    tracker.path = np.column_stack((np.linspace(0.0, 20.0, 81), np.zeros(81)))
+    binding = {'id': 208, 'state': [3.5, -0.55, 1.216],
+               'velocity': [0.0, 0.0]}
+    latched_clear = {'id': 2969149464, 'state': [3.3, -3.0, 0.3],
+                     'velocity': [0.0, 0.0]}
+    clear = {'id': 2637532943, 'state': [8.0, 8.0, 0.3],
+             'velocity': [0.0, 0.0]}
+    selected = [binding, latched_clear, clear]
+    tracker.obstacles = selected
+    latch = frozenset({2969149464})
+    tracker._avoidance_stop_latch = SimpleNamespace(
+        active_groups={latch}, release_ratio=0.8)
+    required = {
+        frozenset({208}): 1.519,
+        latch: 2.4,
+        frozenset({2637532943}): 0.0,
+    }
+
+    def project(raw, unused_selected, unused_pose):
+        tracker._avoidance_required_offsets = required
+        return raw
+
+    tracker._project_reference_out_of_keepouts = project
+    x = np.linspace(0.0, 1.25, 26)
+    raw = np.vstack([
+        x, np.zeros_like(x), np.full_like(x, 1.0), np.zeros_like(x)])
+    tracker._reference_with_forward_escape(
+        raw, selected, ego_pose=(0.0, 2.1, 0.0), speed=0.0, now=0.0)
+    tracker._reference_with_forward_escape(
+        raw, selected, ego_pose=(0.0, 2.1, 0.0), speed=0.0, now=1.0)
+
+    assert tracker._forward_escape.anchor_group == latch
+    assert tracker._forward_escape_relief_ids == frozenset({208})
+    assert {obstacle['id'] for obstacle in
+            tracker._forward_escape_astern_obstacles(selected)} == {
+                208, 2969149464}
+    packed = tracker._constraint_obstacles(selected)
+    assert packed[0]['state'][2] == pytest.approx(0.866)
+    assert packed[1] is latched_clear
+    assert packed[2] is clear
+    assert any('ids=[208]' in message for message in messages)
+
+    moved_binding = dict(binding)
+    moved_binding['state'] = [3.5, -8.0, 1.216]
+    moved = [moved_binding, latched_clear, clear]
+    tracker.obstacles = moved
+    tracker._projection_candidate = (
+        lambda current, unused_selected, unused_pose: (current, required))
+    tracker._reference_with_forward_escape(
+        raw, moved, ego_pose=(0.0, 2.1, 0.0), speed=0.0, now=1.05)
+
+    assert tracker._forward_escape.active
+    assert tracker._forward_escape_relief_ids == frozenset()
 
 
 def test_large_detour_returns_raw_geometry_with_stopping_speed_ramp():

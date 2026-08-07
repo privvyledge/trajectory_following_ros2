@@ -136,6 +136,10 @@
     # because a CARLA ego can legitimately sit near-stationary at full throttle for
     # ~5 s while pulling away from the spawn.
     progress_watchdog_timeout: 8.0
+    # Opt-in recovery for a stationary detour-bound stop: preserve the lateral
+    # offset the vehicle already occupies and command no additional outward room.
+    forward_escape_enabled: true
+    forward_escape_speed: 1.0
     # Slack penalties are restart-only generated-cost settings. The linear term
     # keeps shallow margin use expensive; the quadratic term dominates deep
     # penetration while retaining a recovery path if the initial state is already

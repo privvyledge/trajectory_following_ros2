@@ -1293,6 +1293,7 @@ Note: replaying a bag with a backward clock jump resets lap progress when `loop 
 | `stage_cost_type` / `terminal_cost_type` | `EXTERNAL` | `EXTERNAL` \| `NONLINEAR_LS` \| `LINEAR_LS` |
 | `code_gen_directory` | `<share>/data/mpc` | path |
 | `global_frame` | `odom` | frame |
+| `waypoint_target_frame` | follows `global_frame` | frame `waypoint_loader` transforms the CSV into — **must equal `global_frame`** (`mpc.launch.py` only) |
 | `robot_frame` | `base_link` | frame |
 | `odom_topic` | `odometry/local` | topic |
 | `arclength_index_advance` | `True` | `True` \| `False` |

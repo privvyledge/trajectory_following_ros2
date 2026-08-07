@@ -143,6 +143,10 @@
     # because a CARLA ego can legitimately sit near-stationary at full throttle for
     # ~5 s while pulling away from the spawn.
     progress_watchdog_timeout: 8.0
+    # Opt-in recovery for a stationary detour-bound stop: preserve the lateral
+    # offset the vehicle already occupies and command no additional outward room.
+    forward_escape_enabled: true
+    forward_escape_speed: 1.0
     # SLACK-WEIGHT LEVER: the keep-out is soft/slacked so it stays feasible when
     # the reference is briefly inside the bubble. Raising this hardens avoidance —
     # try 1000 -> 10000 -> 100000 to force progressively larger deviation. A single

@@ -144,6 +144,11 @@ class AvoidanceStopLatch:
     def clear(self) -> None:
         self._active.clear()
 
+    @property
+    def active_groups(self) -> set:
+        """Return a copy of the currently latched obstacle-id groups."""
+        return set(self._active)
+
     def update(self, required_offsets: dict, bound: float) -> set:
         if bound <= 0.0:
             self.clear()
@@ -158,6 +163,106 @@ class AvoidanceStopLatch:
             elif required > bound:
                 self._active.add(key)
         return set(self._active)
+
+
+class ForwardEscapeRecovery:
+    """ROS-free state for a bounded, forward-only escape from a stop-short wedge."""
+
+    def __init__(self, stationary_speed: float = 0.1,
+                 stationary_time: float = 1.0, offset_ratio: float = 0.8,
+                 clearance_floor: float = 0.05,
+                 group_absence_time: float = 0.5):
+        self.stationary_speed = float(stationary_speed)
+        self.stationary_time = float(stationary_time)
+        self.offset_ratio = float(offset_ratio)
+        self.clearance_floor = float(clearance_floor)
+        self.group_absence_time = float(group_absence_time)
+        self._stationary_since = None
+        self._group_missing_since = None
+        self.active = False
+        self.group = frozenset()
+        self.anchor_group = frozenset()
+        self.entry_offset = 0.0
+        self.side_hint = 0
+
+    def reset(self) -> None:
+        self._stationary_since = None
+        self._group_missing_since = None
+        self.active = False
+        self.group = frozenset()
+        self.anchor_group = frozenset()
+        self.entry_offset = 0.0
+        self.side_hint = 0
+
+    def observe_stationary(self, now: float, speed: float) -> bool:
+        """Return whether measured speed has stayed below the entry limit long enough."""
+        if abs(float(speed)) >= self.stationary_speed:
+            self._stationary_since = None
+            return False
+        if self._stationary_since is None:
+            self._stationary_since = float(now)
+        return float(now) - self._stationary_since >= self.stationary_time
+
+    def activate(self, group, signed_offset: float, side_hint: int = 0,
+                 anchor_group=None) -> None:
+        """Commit the obstacle group and the already-occupied side of the route."""
+        self.active = True
+        self.group = frozenset(group)
+        self.anchor_group = frozenset(
+            group if anchor_group is None else anchor_group)
+        self.entry_offset = float(signed_offset)
+        self.side_hint = int(np.sign(side_hint or signed_offset))
+
+    def group_absence_expired(self, now: float, present: bool) -> bool:
+        """Return whether the committed group has stayed absent past its debounce."""
+        if present:
+            self._group_missing_since = None
+            return False
+        if self._group_missing_since is None:
+            self._group_missing_since = float(now)
+            return False
+        return float(now) - self._group_missing_since >= self.group_absence_time
+
+    def entry_allowed(self, stationary: bool, stop_groups: set, bound: float,
+                      signed_offset: float, corridor_clearance: float) -> bool:
+        """Evaluate all non-configuration entry gates without mutating state."""
+        return bool(
+            not self.active
+            and stationary
+            and stop_groups
+            and bound > 0.0
+            and abs(float(signed_offset)) >= self.offset_ratio * float(bound)
+            and np.isfinite(corridor_clearance)
+            and corridor_clearance >= self.clearance_floor)
+
+    @staticmethod
+    def displaced_reference(xref: np.ndarray, signed_offset: float,
+                            taper_start: Optional[int], speed: float,
+                            max_accel: float, dt: float) -> np.ndarray:
+        """Build a parallel reference whose offset magnitude never increases."""
+        escaped = xref.copy()
+        count = xref.shape[1]
+        offsets = np.full(count, float(signed_offset))
+        if taper_start is not None and 0 <= taper_start < count:
+            remaining = count - taper_start
+            offsets[taper_start:] = np.linspace(signed_offset, 0.0, remaining)
+
+        yaw = xref[3, :]
+        escaped[0, :] += -np.sin(yaw) * offsets
+        escaped[1, :] += np.cos(yaw) * offsets
+        for stage in range(count - 1):
+            dx = escaped[0, stage + 1] - escaped[0, stage]
+            dy = escaped[1, stage + 1] - escaped[1, stage]
+            if dx * dx + dy * dy > 1e-12:
+                escaped[3, stage] = math.atan2(dy, dx)
+        if count > 1:
+            escaped[3, -1] = escaped[3, -2]
+
+        target = max(0.0, float(speed))
+        accel = max(0.0, float(max_accel))
+        escaped[2, :] = np.minimum(target, accel * max(float(dt), 0.0)
+                                   * np.arange(count))
+        return escaped
 
 
 def obstacle_shape_discs(shape: str, dimensions, position, yaw: float = 0.0,
@@ -280,6 +385,8 @@ class BaseTrajectoryTracker(Node, ABC):
                 # reason column keeps that intervention's name, so a wedge and a
                 # correctly-waited transient look identical in every other column.
                 'no_progress',
+                # Appended for compatibility with positional analysis scripts.
+                'forward_escape_active',
             ])
             self._solver_log_fh.flush()
             self.get_logger().info(f'Solver stats logging to {path}')
@@ -615,6 +722,7 @@ class BaseTrajectoryTracker(Node, ABC):
                 f"{getattr(self, '_avoidance_required_offset', float('nan')):.6f}",
                 f"{getattr(self, 'max_avoidance_offset', float('nan')):.6f}",
                 int(bool(getattr(self, '_no_progress_active', False))),
+                int(bool(getattr(self, '_forward_escape_active', False))),
             ])
             self._solver_log_fh.flush()
             self._last_solver_log_ms = (time.monotonic() - log_started) * 1e3
@@ -746,6 +854,8 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('obstacle_ingest_radius', 0.0)
         self.declare_parameter('max_avoidance_offset', 0.0)
         self.declare_parameter('keepout_engagement_distance', 0.0)
+        self.declare_parameter('forward_escape_enabled', False)
+        self.declare_parameter('forward_escape_speed', 1.0)
         self.declare_parameter('obstacle_topic', 'fake_obstacles/object_array')
         self.declare_parameter('obstacle_collision_avoidance_method', 'euclidean')
         # Propagate each obstacle over the horizon at the constant velocity reported in
@@ -876,6 +986,8 @@ class BaseTrajectoryTracker(Node, ABC):
         self.max_avoidance_offset = max(0.0, float(self._gp('max_avoidance_offset')))
         self.keepout_engagement_distance = max(
             0.0, float(self._gp('keepout_engagement_distance')))
+        self.forward_escape_enabled = bool(self._gp('forward_escape_enabled'))
+        self.forward_escape_speed = max(0.0, float(self._gp('forward_escape_speed')))
         self.obstacle_braking_envelope = bool(self._gp('obstacle_braking_envelope'))
         self.progress_watchdog_enabled = bool(self._gp('progress_watchdog_enabled'))
         self.progress_watchdog_timeout = max(
@@ -889,11 +1001,15 @@ class BaseTrajectoryTracker(Node, ABC):
         self._progress_watchdog = ProgressWatchdog(self.progress_watchdog_timeout)
         self._avoidance_stop_latch = AvoidanceStopLatch()
         self._avoidance_stop_active = False
+        self._forward_escape = ForwardEscapeRecovery()
+        self._forward_escape_active = False
+        self._forward_escape_relief_ids = frozenset()
         #: Watchdog verdict for this tick, logged separately from `safety_reason`
         #: because an intervention already holding the vehicle keeps that column.
         self._no_progress_active = False
         #: Worst group's required lateral detour on the last projection (diagnostic).
         self._avoidance_required_offset = float('nan')
+        self._avoidance_required_offsets = {}
         self.dt = self.sample_time = 1.0 / self.control_rate
         if not self.prediction_time:
             self.prediction_time = self.sample_time * self.horizon
@@ -1589,6 +1705,33 @@ class BaseTrajectoryTracker(Node, ABC):
 
         self._solver.update_obstacles(self.obstacle_states)  # type: ignore[attr-defined]
 
+    def _constraint_obstacles(self, selected: list) -> list:
+        """Relieve only escape-corridor intruders for constraint packing."""
+        if not self._forward_escape_active:
+            return selected
+        relief = max(
+            float(self._gp('safe_distance')) - self._forward_escape.clearance_floor,
+            0.0)
+        if relief <= 0.0:
+            return selected
+
+        relief_ids = getattr(self, '_forward_escape_relief_ids', frozenset())
+        adjusted = []
+        for obstacle in selected:
+            if obstacle.get('id') not in relief_ids:
+                adjusted.append(obstacle)
+                continue
+            packed_obstacle = dict(obstacle)
+            state = list(obstacle['state'])
+            state[2] = max(0.0, float(state[2]) - relief)
+            packed_obstacle['state'] = state
+            adjusted.append(packed_obstacle)
+        self.get_logger().info(
+            f'Forward escape constraint relief: ids={sorted(relief_ids)}, '
+            f'radius_reduction={relief:.3f} m',
+            throttle_duration_sec=1.0)
+        return adjusted
+
     def _merge_overlapping_keepouts(self, centres: np.ndarray,
                                     keepouts: np.ndarray,
                                     obstacle_ids=None,
@@ -1774,6 +1917,35 @@ class BaseTrajectoryTracker(Node, ABC):
         stopped[2, :] = speed
         return stopped
 
+    def _projection_candidate(self, xref: np.ndarray, selected: list,
+                              ego_pose) -> tuple[np.ndarray, dict]:
+        """Return the ordinary projected reference and required group offsets."""
+        centres = np.array([o['state'][:2] for o in selected], dtype=float)
+        projection_radii = self._engaged_keepout_radii(
+            xref, selected, ego_pose[:2])
+        offsets = self.effective_ego_disc_offsets()
+        proj_centres, proj_radii, groups = self._merge_overlapping_keepouts(
+            centres, projection_radii,
+            obstacle_ids=[o['id'] for o in selected],
+            sides=self._keepout_sides(xref, centres))
+        if len(groups) < len(selected):
+            self.get_logger().info(
+                f'{len(selected)} obstacle keep-outs merged into {len(groups)} '
+                'projection circle(s): the corridor between them is narrower than '
+                'the vehicle, so the reference is routed around the group.',
+                throttle_duration_sec=5.0)
+        hint_keys = [min(selected[i]['id'] for i in group) for group in groups]
+        hints = [self._keepout_side_hints.get(key, 0) for key in hint_keys]
+        projected, _, hints = trajectory_utils.project_reference_out_of_keepouts(
+            xref.copy(), proj_centres, proj_radii,
+            side_hints=hints, disc_offsets=offsets)
+        self._keepout_side_hints = {
+            selected[i]['id']: hint
+            for group, hint in zip(groups, hints) for i in group}
+        required = self._projection_group_offsets(
+            xref, proj_centres, proj_radii, groups, selected)
+        return projected, required
+
     def _project_reference_out_of_keepouts(self, xref: np.ndarray,
                                            selected: list,
                                            ego_pose=None) -> np.ndarray:
@@ -1794,47 +1966,20 @@ class BaseTrajectoryTracker(Node, ABC):
         """
         self._avoidance_stop_active = False
         self._avoidance_required_offset = float('nan')
+        self._avoidance_required_offsets = {}
         if not selected:
             self._avoidance_stop_latch.clear()
             return xref
 
-        centres = np.array([o['state'][:2] for o in selected], dtype=float)
         if ego_pose is None:
             ego_pose = (self.x, self.y, self.yaw)
-        projection_radii = self._engaged_keepout_radii(
-            xref, selected, ego_pose[:2])
-        offsets = self.effective_ego_disc_offsets()
-        proj_centres, proj_radii, groups = self._merge_overlapping_keepouts(
-            centres, projection_radii,
-            obstacle_ids=[o['id'] for o in selected],
-            sides=self._keepout_sides(xref, centres))
-        if len(groups) < len(selected):
-            self.get_logger().info(
-                f'{len(selected)} obstacle keep-outs merged into {len(groups)} '
-                'projection circle(s): the corridor between them is narrower than '
-                'the vehicle, so the reference is routed around the group.',
-                throttle_duration_sec=5.0)
-        # Carry each obstacle's committed go-around side across ticks by id: the
-        # projection takes hints positionally, but the selection order shifts as the
-        # vehicle moves, so a positional store would leak one obstacle's side to
-        # another. A merged group negotiates one shared side, keyed by its smallest
-        # member id and written back to every member so the commitment survives the
-        # group splitting. Obstacles that drop out are forgotten, matching the
-        # projection's own "negotiation over, next encounter re-decides" reset.
-        hint_keys = [min(selected[i]['id'] for i in g) for g in groups]
-        hints = [self._keepout_side_hints.get(k, 0) for k in hint_keys]
-        projected, _, hints = trajectory_utils.project_reference_out_of_keepouts(
-            xref.copy(), proj_centres, proj_radii,
-            side_hints=hints, disc_offsets=offsets)
-        self._keepout_side_hints = {
-            selected[i]['id']: h for g, h in zip(groups, hints) for i in g}
+        projected, required = self._projection_candidate(xref, selected, ego_pose)
+        self._avoidance_required_offsets = required
         bound = self.max_avoidance_offset
         if bound <= 0.0:
             self._avoidance_stop_latch.clear()
             return projected
 
-        required = self._projection_group_offsets(
-            xref, proj_centres, proj_radii, groups, selected)
         # Worst group's required detour, logged so the stop-vs-swerve decision is
         # auditable from the CSV: `avoidance_stop` alone says the bound was crossed
         # but not by how much, and "needs 2.1 m of 2.0" and "needs 9 m of 2.0" call
@@ -1846,6 +1991,290 @@ class BaseTrajectoryTracker(Node, ABC):
             return projected
         self._avoidance_stop_active = True
         return self._stop_before_keepout_reference(xref, selected)
+
+    def _signed_route_offset(self, position) -> float:
+        """Signed perpendicular offset from the nearby nominal route (+ left)."""
+        point = np.asarray(position, dtype=float)
+        lo = max(0, int(self.current_idx) - 15)
+        hi = min(len(self.path) - 1, int(self.current_idx) + 25)
+        if hi <= lo:
+            return float('nan')
+        starts = np.asarray(self.path[lo:hi, :2], dtype=float)
+        ends = np.asarray(self.path[lo + 1:hi + 1, :2], dtype=float)
+        segments = ends - starts
+        length_sq = np.sum(segments * segments, axis=1)
+        valid = length_sq > 1e-12
+        if not valid.any():
+            return float('nan')
+        starts, segments, length_sq = starts[valid], segments[valid], length_sq[valid]
+        fraction = np.clip(np.sum((point - starts) * segments, axis=1) / length_sq,
+                           0.0, 1.0)
+        projection = starts + fraction[:, None] * segments
+        nearest = int(np.argmin(np.linalg.norm(point - projection, axis=1)))
+        tangent = segments[nearest] / math.sqrt(length_sq[nearest])
+        error = point - projection[nearest]
+        return float(-tangent[1] * error[0] + tangent[0] * error[1])
+
+    def _forward_escape_group_obstacles(self, obstacles: list) -> list:
+        group = self._intersecting_required_group(
+            self._forward_escape.anchor_group,
+            getattr(self, '_avoidance_required_offsets', {}))
+        return [obstacle for obstacle in obstacles if obstacle.get('id') in group]
+
+    def _forward_escape_intrusion_ids(self, xref: np.ndarray,
+                                      obstacles: list) -> frozenset:
+        """Obstacles whose full slacked keep-out the escape corridor enters."""
+        if not obstacles:
+            return frozenset()
+        offsets = self.effective_ego_disc_offsets()
+        intruders = set()
+        for obstacle, keepout in zip(obstacles, self._keepout_radii(obstacles)):
+            centre = np.asarray(obstacle['state'][:2], dtype=float)
+            dx = xref[0, :] - centre[0]
+            dy = xref[1, :] - centre[1]
+            radial = np.arctan2(dy, dx)
+            stand_off = trajectory_utils.rear_axle_keepout_radius(
+                float(keepout), offsets, xref[3, :] - radial)
+            if np.any(np.hypot(dx, dy) < stand_off):
+                intruders.add(obstacle.get('id'))
+        return frozenset(intruders)
+
+    def _forward_escape_astern_obstacles(self, obstacles: list) -> list:
+        """Stable anchor group plus corridor intruders tracked for escape exit."""
+        tracked = set(self._forward_escape.anchor_group)
+        tracked.update(getattr(self, '_forward_escape_relief_ids', frozenset()))
+        return [obstacle for obstacle in obstacles if obstacle.get('id') in tracked]
+
+    @staticmethod
+    def _required_offset_for_group(group, required: dict) -> float:
+        """Return the largest current offset for a group sharing any member."""
+        return max(
+            (float(value) for current, value in required.items()
+             if current & group),
+            default=0.0)
+
+    @staticmethod
+    def _intersecting_required_group(group, required: dict) -> frozenset:
+        """Resolve a stable group anchor to its strongest current merge cluster."""
+        matches = [
+            (frozenset(current), float(value))
+            for current, value in required.items() if current & group
+        ]
+        if not matches:
+            return frozenset(group)
+        current, _ = max(
+            matches,
+            key=lambda item: (
+                item[1],
+                len(item[0] & group),
+                -len(item[0]),
+                tuple(sorted(item[0])),
+            ))
+        return current
+
+    def _forward_escape_group_astern(self, pose, group_obstacles: list) -> bool:
+        """Whether the resolved escape group is behind the ego footprint."""
+        if not group_obstacles:
+            return False
+        x, y, yaw = map(float, pose)
+        tangent = np.array([math.cos(yaw), math.sin(yaw)])
+        rear_extent = (float(np.min(self.effective_ego_disc_offsets()))
+                       - self.effective_ego_radius())
+        for obstacle in group_obstacles:
+            relative = np.asarray(obstacle['state'][:2], dtype=float) - [x, y]
+            along = float(relative @ tangent)
+            if along + float(obstacle['state'][2]) >= rear_extent:
+                return False
+        return True
+
+    def _forward_escape_taper_start(self, xref: np.ndarray,
+                                    group_obstacles: list) -> Optional[int]:
+        for stage in range(xref.shape[1]):
+            pose = (xref[0, stage], xref[1, stage], xref[3, stage])
+            if self._forward_escape_group_astern(pose, group_obstacles):
+                return stage
+        return None
+
+    def _forward_escape_clearance(self, xref: np.ndarray, obstacles: list) -> float:
+        """Minimum physical body clearance along a candidate against the full cache."""
+        if not obstacles:
+            return float('nan')
+        offsets = self.effective_ego_disc_offsets()
+        ego_radius = self.effective_ego_radius()
+        ego_discs = trajectory_utils.ego_disc_centres(
+            xref[0, :], xref[1, :], xref[3, :], offsets)
+        segment = np.hypot(np.diff(xref[0, :]), np.diff(xref[1, :]))
+        arc = np.r_[0.0, np.cumsum(segment)]
+        cruise_speed = max(float(getattr(self, 'forward_escape_speed', 1.0)), 0.1)
+        acceleration = max(float(getattr(self, 'MAX_ACCEL', 1.0)), 1e-6)
+        acceleration_time = cruise_speed / acceleration
+        acceleration_distance = 0.5 * acceleration * acceleration_time**2
+        elapsed = np.where(
+            arc <= acceleration_distance,
+            np.sqrt(2.0 * arc / acceleration),
+            acceleration_time + (arc - acceleration_distance) / cruise_speed,
+        )
+        minimum = float('inf')
+        for obstacle in obstacles:
+            centre = np.asarray(obstacle['state'][:2], dtype=float)
+            velocity = np.asarray(obstacle.get('velocity', [0.0, 0.0]), dtype=float)
+            centres = centre[None, :] + elapsed[:, None] * velocity[None, :]
+            distance_to_discs = np.linalg.norm(
+                ego_discs - centres[:, None, :], axis=2)
+            clearance = (float(np.min(distance_to_discs)) - ego_radius
+                         - float(obstacle['state'][2]))
+            minimum = min(minimum, clearance)
+        return minimum
+
+    def _forward_escape_precheck_candidate(self, ego_pose, group_obstacles: list,
+                                           signed_offset: float) -> Optional[np.ndarray]:
+        """Sample 10 m of the nominal route for the all-obstacle corridor check."""
+        lo = max(0, int(self.current_idx) - 15)
+        hi = min(len(self.path) - 1, int(self.current_idx) + 200)
+        starts = np.asarray(self.path[lo:hi, :2], dtype=float)
+        ends = np.asarray(self.path[lo + 1:hi + 1, :2], dtype=float)
+        if not len(starts):
+            return None
+        segments = ends - starts
+        length_sq = np.sum(segments * segments, axis=1)
+        valid = length_sq > 1e-12
+        if not valid.any():
+            return None
+        point = np.asarray(ego_pose[:2], dtype=float)
+        fractions = np.zeros(len(starts))
+        fractions[valid] = np.clip(
+            np.sum((point - starts[valid]) * segments[valid], axis=1)
+            / length_sq[valid], 0.0, 1.0)
+        projections = starts + fractions[:, None] * segments
+        distance_to_ego = np.linalg.norm(projections - point, axis=1)
+        distance_to_ego[~valid] = np.inf
+        nearest = int(np.argmin(distance_to_ego))
+        polyline = np.vstack([projections[nearest], ends[nearest:]])
+        leg = np.hypot(np.diff(polyline[:, 0]), np.diff(polyline[:, 1]))
+        cumulative = np.r_[0.0, np.cumsum(leg)]
+        if cumulative[-1] < 8.0:
+            return None
+        span = min(10.0, float(cumulative[-1]))
+        samples = np.linspace(0.0, span, max(33, int(math.ceil(span / 0.25)) + 1))
+        x = np.interp(samples, cumulative, polyline[:, 0])
+        y = np.interp(samples, cumulative, polyline[:, 1])
+        yaw = np.empty_like(x)
+        yaw[:-1] = np.arctan2(np.diff(y), np.diff(x))
+        yaw[-1] = yaw[-2]
+        raw = np.vstack([x, y, np.zeros_like(x), yaw])
+        return self._forward_escape_candidate(raw, group_obstacles, signed_offset)
+
+    def _forward_escape_candidate(self, xref: np.ndarray,
+                                  group_obstacles: list,
+                                  signed_offset: float) -> np.ndarray:
+        taper_start = self._forward_escape_taper_start(xref, group_obstacles)
+        return ForwardEscapeRecovery.displaced_reference(
+            xref, signed_offset, taper_start, self.forward_escape_speed,
+            self.MAX_ACCEL, self.sample_time)
+
+    def _reference_with_forward_escape(self, xref: np.ndarray, selected: list,
+                                       ego_pose, speed: float,
+                                       now: float) -> np.ndarray:
+        """Apply the normal projection or replace it with an active forward escape."""
+        stationary = self._forward_escape.observe_stationary(now, speed)
+        self._forward_escape_active = False
+        self._forward_escape_relief_ids = frozenset()
+        if not self.forward_escape_enabled:
+            self._forward_escape.reset()
+            return self._project_reference_out_of_keepouts(xref, selected, ego_pose)
+        if self.forward_escape_speed <= 0.0:
+            self._forward_escape.reset()
+            return self._project_reference_out_of_keepouts(xref, selected, ego_pose)
+
+        obstacle_snapshot = self.obstacles
+        if self._forward_escape.active:
+            if selected:
+                _, required = self._projection_candidate(xref, selected, ego_pose)
+            else:
+                required = {}
+            self._avoidance_required_offsets = required
+            current_group = self._intersecting_required_group(
+                self._forward_escape.anchor_group, required)
+            self._forward_escape.group = current_group
+            group_obstacles = self._forward_escape_group_obstacles(obstacle_snapshot)
+            if self._forward_escape.group_absence_expired(now, bool(group_obstacles)):
+                self._forward_escape.reset()
+                return self._project_reference_out_of_keepouts(xref, selected, ego_pose)
+
+            relevant_required = [value for group, value in required.items()
+                                 if group & self._forward_escape.anchor_group]
+            release_ready = (not relevant_required or
+                             max(relevant_required) <
+                             self._avoidance_stop_latch.release_ratio
+                             * self.max_avoidance_offset)
+            candidate = self._forward_escape_candidate(
+                xref, group_obstacles, self._forward_escape.entry_offset)
+            precheck = self._forward_escape_precheck_candidate(
+                ego_pose, group_obstacles, self._forward_escape.entry_offset)
+            clearance = (self._forward_escape_clearance(precheck, obstacle_snapshot)
+                         if precheck is not None else float('-inf'))
+            if clearance < self._forward_escape.clearance_floor:
+                self._forward_escape.reset()
+                return self._project_reference_out_of_keepouts(xref, selected, ego_pose)
+
+            self._forward_escape_relief_ids = self._forward_escape_intrusion_ids(
+                candidate, obstacle_snapshot)
+            astern_obstacles = self._forward_escape_astern_obstacles(obstacle_snapshot)
+            group_astern = self._forward_escape_group_astern(
+                ego_pose, astern_obstacles)
+            if group_astern and release_ready:
+                self._forward_escape_relief_ids = frozenset()
+                self._forward_escape.reset()
+                return self._project_reference_out_of_keepouts(xref, selected, ego_pose)
+
+            for obstacle_id in current_group:
+                self._keepout_side_hints[obstacle_id] = self._forward_escape.side_hint
+            self._avoidance_stop_active = True
+            self._avoidance_required_offset = (
+                float(max(relevant_required)) if relevant_required else float('nan'))
+            self._forward_escape_active = True
+            return candidate
+
+        projected = self._project_reference_out_of_keepouts(xref, selected, ego_pose)
+        stop_groups = self._avoidance_stop_latch.active_groups
+        signed_offset = self._signed_route_offset(ego_pose[:2])
+        if not (stationary and stop_groups and self.max_avoidance_offset > 0.0
+                and np.isfinite(signed_offset)
+                and abs(signed_offset) >= self._forward_escape.offset_ratio
+                * self.max_avoidance_offset):
+            return projected
+
+        required = getattr(self, '_avoidance_required_offsets', {})
+        latched_group = max(
+            stop_groups,
+            key=lambda key: self._required_offset_for_group(key, required))
+        current_group = self._intersecting_required_group(latched_group, required)
+        anchor_group = frozenset(latched_group & current_group)
+        group_obstacles = [obstacle for obstacle in obstacle_snapshot
+                           if obstacle.get('id') in current_group]
+        if not group_obstacles:
+            return projected
+        candidate = self._forward_escape_candidate(xref, group_obstacles, signed_offset)
+        precheck = self._forward_escape_precheck_candidate(
+            ego_pose, group_obstacles, signed_offset)
+        clearance = (self._forward_escape_clearance(precheck, obstacle_snapshot)
+                     if precheck is not None else float('-inf'))
+        if not self._forward_escape.entry_allowed(
+                stationary, stop_groups, self.max_avoidance_offset,
+                signed_offset, clearance):
+            return projected
+
+        side_hint = next((self._keepout_side_hints.get(obstacle_id, 0)
+                          for obstacle_id in current_group
+                          if self._keepout_side_hints.get(obstacle_id, 0)), 0)
+        self._forward_escape.activate(
+            current_group, signed_offset, side_hint, anchor_group=anchor_group)
+        self._forward_escape_relief_ids = self._forward_escape_intrusion_ids(
+            candidate, obstacle_snapshot)
+        for obstacle_id in current_group:
+            self._keepout_side_hints[obstacle_id] = self._forward_escape.side_hint
+        self._forward_escape_active = True
+        return candidate
 
     def _last_command_is_saturated(self, atol: float = 1e-6) -> bool:
         """Return whether the last applied command sits on any configured limit."""
@@ -2082,9 +2511,10 @@ class BaseTrajectoryTracker(Node, ABC):
         obstacle_cpu_started = time.thread_time()
         self._warn_if_obstacle_feed_silent()
         selected = self._select_obstacles(xref, (x, y, psi))
-        self._pack_obstacle_states(selected)
-        projected_xref = self._project_reference_out_of_keepouts(
-            xref, selected, ego_pose=(x, y, psi))
+        projected_xref = self._reference_with_forward_escape(
+            xref, selected, ego_pose=(x, y, psi), speed=vel,
+            now=tick_started)
+        self._pack_obstacle_states(self._constraint_obstacles(selected))
         obstacle_ms = (time.monotonic() - obstacle_started) * 1e3
         obstacle_cpu_ms = (time.thread_time() - obstacle_cpu_started) * 1e3
 
@@ -2210,6 +2640,24 @@ class BaseTrajectoryTracker(Node, ABC):
         if no_progress and not safety_reason:
             safety_reason = 'no_progress'
             applied = (0.0, 0.0, 0.0)
+            # Re-arm rather than hold the trip. The watchdog is evaluated against
+            # the command the solver *proposed*, because that is the intent to
+            # move; but the command this branch goes on to publish is zero, which
+            # is an intentional stop by the watchdog's own definition. Left
+            # latched the trip is unrecoverable: every release gate (index
+            # advance, planar displacement, measured motion) needs the vehicle to
+            # move, and this zero is precisely what stops it, while the proposal
+            # it keeps re-reading stays non-zero forever. Measured on hardware: a
+            # single joystick deadman release past the timeout froze a run for
+            # 234 s / 4686 ticks with every solve reporting optimal, and pressing
+            # the deadman again could not recover it. Re-arming makes the
+            # intervention duty-cycled -- one zeroed tick, then a fresh timeout
+            # window in which the real command is published -- so a vehicle that
+            # can move does, and one that genuinely cannot is stopped again a
+            # timeout later and keeps reporting. Read the `no_progress` CSV
+            # column as a pulse train: repeated pulses are a real wedge, a lone
+            # pulse is a transient the vehicle drove out of.
+            self._progress_watchdog.reset()
         elif no_progress:
             # An intervention already holds the vehicle at zero, so there is no
             # command left to take away -- the watchdog's value here is purely that
@@ -2347,6 +2795,8 @@ class BaseTrajectoryTracker(Node, ABC):
         self.current_idx = 0
         self.cumulative_distance = 0.0
         self.trajectory.reset_progress()
+        self._forward_escape.reset()
+        self._forward_escape_active = False
 
     def _advance_lap(self) -> bool:
         """Apply the loop policy on reaching the end of the trajectory.
@@ -2727,6 +3177,8 @@ class BaseTrajectoryTracker(Node, ABC):
                     self.max_avoidance_offset = float(param.value)
                     if self.max_avoidance_offset == 0.0:
                         self._avoidance_stop_latch.clear()
+                        self._forward_escape.reset()
+                        self._forward_escape_active = False
             elif param.name == 'keepout_engagement_distance':
                 if float(param.value) < 0.0:
                     success = False
@@ -2734,6 +3186,18 @@ class BaseTrajectoryTracker(Node, ABC):
                         'Rejected keepout_engagement_distance: expected metres >= 0.')
                 else:
                     self.keepout_engagement_distance = float(param.value)
+            elif param.name == 'forward_escape_enabled':
+                self.forward_escape_enabled = bool(param.value)
+                if not self.forward_escape_enabled:
+                    self._forward_escape.reset()
+                    self._forward_escape_active = False
+            elif param.name == 'forward_escape_speed':
+                if float(param.value) < 0.0:
+                    success = False
+                    self.get_logger().error(
+                        'Rejected forward_escape_speed: expected m/s >= 0.')
+                else:
+                    self.forward_escape_speed = float(param.value)
             elif param.name == 'desired_speed':
                 self.desired_speed = param.value
             elif param.name == 'loop':
