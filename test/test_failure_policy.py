@@ -251,7 +251,10 @@ def test_stats_header_and_row_have_matching_widths(tmp_path):
         assert name in header
     assert header.index('safety_stop') == SAFETY_STOP
     assert header.index('applied_accel') == APPLIED.start
-    assert header[-1] == 'forward_escape_active'
+    # New columns are appended, never inserted: the analysis scripts index this
+    # file positionally as well as by name. Assert the tail order explicitly so a
+    # column added in the middle fails here rather than silently shifting them.
+    assert header[-2:] == ['forward_escape_active', 'breakaway_floor']
 
 
 def test_safety_brake_command_sheds_speed_and_keeps_solver_steering():

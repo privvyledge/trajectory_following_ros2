@@ -387,6 +387,10 @@ class BaseTrajectoryTracker(Node, ABC):
                 'no_progress',
                 # Appended for compatibility with positional analysis scripts.
                 'forward_escape_active',
+                # Speed the breakaway floor substituted, 0 when it did not fire.
+                # Its own column because an intervention run is unreadable if the
+                # published speed silently differs from the solver's proposal.
+                'breakaway_floor',
             ])
             self._solver_log_fh.flush()
             self.get_logger().info(f'Solver stats logging to {path}')
@@ -723,6 +727,7 @@ class BaseTrajectoryTracker(Node, ABC):
                 f"{getattr(self, 'max_avoidance_offset', float('nan')):.6f}",
                 int(bool(getattr(self, '_no_progress_active', False))),
                 int(bool(getattr(self, '_forward_escape_active', False))),
+                f"{getattr(self, '_breakaway_applied', 0.0):.6f}",
             ])
             self._solver_log_fh.flush()
             self._last_solver_log_ms = (time.monotonic() - log_started) * 1e3
@@ -815,6 +820,23 @@ class BaseTrajectoryTracker(Node, ABC):
         self.declare_parameter('use_speed_profile', True)    # track the recorded speed profile over the horizon
         self.declare_parameter('max_lateral_accel', 3.0)     # m/s²; curvature speed cap v ≤ sqrt(a_lat/|κ|). 0 disables
         self.declare_parameter('min_reference_speed', 0.3)   # m/s; forward creep floor to lift a noisy near-zero start
+        # Drivetrain breakaway floor. From rest the published speed is the solver's
+        # one-step state, v_measured + a*dt, so it is capped at max_accel*dt no matter
+        # what the reference asks for -- 0.15 m/s at the defaults. Measured on gosling1
+        # (2026-08-07, speed staircase): a stopped motor needs 0.18 m/s forward /
+        # 0.15 m/s reverse to turn reliably ON STANDS, and 0.20-0.26 m/s on the ground.
+        # The ceiling therefore sits below the floor and the vehicle cannot reliably
+        # start itself; when an external event stops it mid-drive, restart takes
+        # 0.5-0.8 s of sub-deadband creep instead of one tick. This republishes the
+        # solver's command at a magnitude the drivetrain actually responds to while it
+        # is stalled, and hands control straight back once the vehicle is rolling.
+        # It is a property of one drivetrain, not of the controller: default 0.0 =
+        # disabled, set it per platform. `min_reference_speed` cannot substitute --
+        # that floors the *reference*, and the published command is derived from the
+        # measured speed, not from the reference.
+        self.declare_parameter('breakaway_speed', 0.0)        # m/s; 0 disables
+        self.declare_parameter('breakaway_engage_speed', 0.05)  # m/s; |v| below this counts as stopped
+        self.declare_parameter('breakaway_release_speed', 0.0)  # m/s; 0 = half of breakaway_speed
         # Reference-index advance mode. True = along-track (arc-length) projection: the
         # target index advances with longitudinal progress even when the vehicle is held
         # laterally off the line (obstacle-avoidance swerve), so it never freezes at a
@@ -973,6 +995,9 @@ class BaseTrajectoryTracker(Node, ABC):
         self.arclength_index_advance = self._gp('arclength_index_advance')
         self.projection_window = self._gp('projection_window')
         self.min_reference_speed = self._gp('min_reference_speed')
+        self.breakaway_speed = self._gp('breakaway_speed')
+        self.breakaway_engage_speed = self._gp('breakaway_engage_speed')
+        self.breakaway_release_speed = self._gp('breakaway_release_speed')
         self.loop = int(self._gp('loop'))
         self.n_ind_search = self._gp('n_ind_search')
         self.smooth_yaw = self._gp('smooth_yaw')
@@ -1025,6 +1050,10 @@ class BaseTrajectoryTracker(Node, ABC):
         self.cumulative_distance = 0.0
 
         self.acc_cmd = self.delta_cmd = self.velocity_cmd = 0.0
+        # Breakaway-floor latch: engaged while the vehicle is stalled against a
+        # command that wants motion, released once it is measurably rolling.
+        self._breakaway_active = False
+        self._breakaway_applied = 0.0
         self.jerk_cmd: Optional[float] = None
         self.delta_rate_cmd: Optional[float] = None
 
@@ -2671,6 +2700,20 @@ class BaseTrajectoryTracker(Node, ABC):
                 'stopped; operator action is required.',
                 throttle_duration_sec=5.0)
 
+        # Breakaway floor. Deliberately placed after every intervention has had its
+        # say -- it raises a magnitude, so applied before them it could resurrect a
+        # command a safety path had zeroed. `safety_reason` covers the braking
+        # envelope, the failure policy and the no-progress watchdog alike, and the
+        # solver's proposal (which the watchdog reads) is left untouched: the floor
+        # changes what the actuator is asked for, not what the controller intended.
+        if not safety_reason:
+            self.velocity_cmd = self._apply_breakaway_floor(
+                self.velocity_cmd, vel)
+            applied = (applied[0], applied[1], self.velocity_cmd)
+        else:
+            self._breakaway_active = False
+            self._breakaway_applied = 0.0
+
         # A safety intervention must freeze the solver warm-start input. Delay this
         # update until every applied-command decision, including the watchdog, is final.
         if not safety_reason and result.is_optimal and not self._u_prev_from_echo:
@@ -2916,6 +2959,71 @@ class BaseTrajectoryTracker(Node, ABC):
     # floating-point arithmetic (common when an NLP constraint is active).
     _SAT_WARN_TOL = 1e-4  # rad / (m/s²) — ~0.006°, well below any real violation. Todo: move to the top
 
+    def _apply_breakaway_floor(self, velocity_cmd, measured_speed):
+        """Raise a stalled command to a magnitude the drivetrain responds to.
+
+        Returns the speed to publish. ``velocity_cmd`` is the command the solver
+        chose *after* saturation; ``measured_speed`` is the signed wheel speed.
+
+        The published speed is the solver's one-step state, ``v_measured + a*dt``,
+        so from rest it cannot exceed ``max_accel*dt`` however large the reference
+        is. On gosling1 that ceiling (0.15 m/s) sits below the measured breakaway
+        floor (0.18 m/s on stands, 0.20-0.26 on the ground), so a stopped vehicle
+        commands a creep the motor ignores, stays stopped, and re-commands the same
+        creep next tick. This lifts the magnitude -- never the sign, never a zero --
+        while that condition holds.
+
+        Latched rather than per-tick because release is the delicate edge: dropping
+        the floor the instant the wheel turns hands the actuator a step back down to
+        the creep, which stalls it again and limit-cycles. Release therefore waits
+        for the vehicle to be rolling at ``breakaway_release_speed`` (default half
+        the floor, which sits at the measured dropout speed -- the drivetrain's own
+        hysteresis is 0.06 m/s, dropout 0.12 against breakaway 0.18), by which point
+        the solver's one-step command has grown past the floor on its own and the
+        handover is continuous.
+
+        The caller must only invoke this on a tick no intervention has claimed: it
+        raises a magnitude and would otherwise resurrect a command that a safety
+        path deliberately zeroed.
+        """
+        self._breakaway_applied = 0.0
+        floor = self.breakaway_speed
+        if floor <= 0.0:
+            self._breakaway_active = False
+            return velocity_cmd
+
+        release = self.breakaway_release_speed or 0.5 * floor
+        wants_motion = abs(velocity_cmd) > 1e-3
+        stalled = abs(measured_speed) < self.breakaway_engage_speed
+
+        if not wants_motion:
+            # A commanded stop is a stop; never floor it back into motion.
+            self._breakaway_active = False
+            return velocity_cmd
+        if self._breakaway_active and (
+                abs(measured_speed) >= release
+                or measured_speed * velocity_cmd < 0.0):
+            # Rolling, or the solver reversed direction while we were pushing the
+            # old one -- in both cases the floor has done its job and must let go.
+            self._breakaway_active = False
+        elif stalled:
+            self._breakaway_active = True
+
+        if not self._breakaway_active:
+            return velocity_cmd
+
+        floored = math.copysign(max(abs(velocity_cmd), floor), velocity_cmd)
+        # The floor is a magnitude, not a licence to leave the speed envelope.
+        floored = float(np.clip(floored, self.MIN_SPEED, self.MAX_SPEED))
+        if floored == velocity_cmd:
+            return velocity_cmd
+        self._breakaway_applied = floored
+        self.get_logger().warn(
+            f'Breakaway floor: publishing {floored:+.3f} m/s for a '
+            f'{velocity_cmd:+.3f} m/s command (measured {measured_speed:+.3f} m/s).',
+            throttle_duration_sec=2.0)
+        return floored
+
     def _input_saturation(self):
         if self.acc_cmd < self.MAX_DECEL - self._SAT_WARN_TOL \
                 or self.acc_cmd > self.MAX_ACCEL + self._SAT_WARN_TOL:
@@ -3117,6 +3225,25 @@ class BaseTrajectoryTracker(Node, ABC):
             elif param.name == 'min_reference_speed':
                 self.min_reference_speed = param.value
                 self._apply_speed_policy()
+            elif param.name == 'breakaway_speed':
+                if param.value < 0.0:
+                    self.get_logger().error(
+                        'breakaway_speed must be >= 0 (0 disables).')
+                    return SetParametersResult(successful=False)
+                self.breakaway_speed = param.value
+                self._breakaway_active = False
+            elif param.name == 'breakaway_engage_speed':
+                if param.value < 0.0:
+                    self.get_logger().error(
+                        'breakaway_engage_speed must be >= 0.')
+                    return SetParametersResult(successful=False)
+                self.breakaway_engage_speed = param.value
+            elif param.name == 'breakaway_release_speed':
+                if param.value < 0.0:
+                    self.get_logger().error(
+                        'breakaway_release_speed must be >= 0 (0 derives it).')
+                    return SetParametersResult(successful=False)
+                self.breakaway_release_speed = param.value
             elif param.name == 'arclength_index_advance':
                 self.arclength_index_advance = param.value
                 self._apply_speed_policy()

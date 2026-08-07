@@ -18,6 +18,25 @@
     max_accel: 3.0
     max_decel: -3.0
 
+    # Drivetrain breakaway floor (0.0 = disabled). A property of this drivetrain,
+    # not of the controller, which is why it lives here rather than in the weights.
+    #
+    # From rest the published speed is the solver's one-step state, v + a*dt, so it
+    # is capped at max_accel*dt = 0.15 m/s however large the reference is. Measured
+    # on gosling1 with a speed staircase (2026-08-07, wheels on stands, >90% of
+    # samples turning): breakaway 0.18 m/s forward, 0.15 reverse; dropout 0.12
+    # forward, 0.15 reverse; nothing turns at all below 0.06. On the ground the
+    # floor is higher -- 0.20-0.26 m/s, read off the command at which drive resumes
+    # after a VESC dropout, and consistent with an earlier ERPM sweep.
+    #
+    # So the ceiling sits BELOW the floor: the vehicle cannot reliably start itself,
+    # and every stall costs 0.5-0.8 s of sub-deadband creep before it happens to
+    # catch. Left at 0.0 until A/B'd on the car; 0.25 is the value the measurements
+    # support. Hot-reloadable, so it can be switched mid-run with `ros2 param set`.
+    breakaway_speed: 0.0
+    breakaway_engage_speed: 0.05    # |v| below this counts as stopped
+    breakaway_release_speed: 0.0    # 0 => half of breakaway_speed (= the dropout speed)
+
     # Steering limits (deg at the road wheel; converted to rad internally).
     # NOTE: 27 is a GUESS for the 4-Tec 2.0 VXL — measure real lock-to-lock and
     # update. max_steer_rate derated from the stock Traxxas 2075 servo.
