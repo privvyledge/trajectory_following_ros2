@@ -45,6 +45,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 
 REPO = os.path.dirname(os.path.abspath(__file__))
 ROUTE_CSV = os.path.join(REPO, 'data', 'carla_town01_moving.csv')
@@ -75,6 +76,13 @@ RESTART_208_STATE = {
     'initial_speed': 0.0,
 }
 RESTART_ROUTE_START_INDEX = 120
+RESTART_WINDOW_TICKS = 240
+# The controller is intentionally lockstepped, but solver throughput is a wall-time
+# property. A prior 30 s run produced only 212 rows, so give the 12 s simulated
+# window a measured wall-time margin. If a loaded host still falls short, continue
+# while rows are arriving and fail only when the solver log itself stops advancing.
+RESTART_MIN_WALL_DURATION_S = 45.0
+RESTART_ROW_STALL_TIMEOUT_S = 60.0
 
 RUN_G_PARAMS = {'max_avoidance_offset': 2.0, 'min_obstacle_radius': 0.3}
 RUN_H_PARAMS = {'max_avoidance_offset': 3.5, 'min_obstacle_radius': 0.1}
@@ -205,6 +213,7 @@ def run_once(args, label, start_index, out_dir):
         # the 1-command-per-dt relationship and makes the run cadence-independent
         # and deterministic, which the replication protocol assumes.
         'step_on_command': 'true',
+        'forward_escape_enabled': ('true' if args.forward_escape == 'on' else 'false'),
         # Per-batch codegen directory. The default is shared, so a second sim that
         # regenerates the OCP (with a different num_obstacles, say) silently replaces
         # the compiled solver this batch keeps starting runs against, and every later
@@ -239,6 +248,9 @@ def run_once(args, label, start_index, out_dir):
             '-p', f'ego_gate_radius:={EGO_GATE_RADIUS}',
             '-p', 'odom_topic:=odometry/local',
             '-p', 'publish_rate:=10.0',
+            # Lockstep advances simulation time independently of executor wall time;
+            # retain replay sources across transient host-load stalls.
+            '-p', 'source_timeout:=10.0',
         ], env, os.path.join(out_dir, f'{label}.aggregator.log')))
 
         procs.append(Proc('sim', [
@@ -246,16 +258,36 @@ def run_once(args, label, start_index, out_dir):
         ] + [f'{k}:={v}' for k, v in launch_args.items()],
             env, os.path.join(out_dir, f'{label}.sim.log')))
 
-        overrides = RUN_G_PARAMS if args.config == 'g' else RUN_H_PARAMS
+        overrides = dict(RUN_G_PARAMS if args.config == 'g' else RUN_H_PARAMS)
+        overrides['forward_escape_enabled'] = args.forward_escape == 'on'
         _apply_overrides(env, overrides,
                          os.path.join(out_dir, f'{label}.params.log'),
                          args.param_wait)
 
-        deadline = time.time() + args.duration
-        while time.time() < deadline:
+        run_duration = (max(args.duration, RESTART_MIN_WALL_DURATION_S)
+                        if args.scenario == 'restart-208' else args.duration)
+        run_started = time.time()
+        minimum_deadline = run_started + run_duration
+        last_rows = -1
+        row_stall_deadline = minimum_deadline + RESTART_ROW_STALL_TIMEOUT_S
+        while True:
             time.sleep(2.0)
             if procs[-1].proc.poll() is not None:
                 break
+            now = time.time()
+            rows = (sum(1 for _ in open(csv_path)) - 1
+                    if os.path.exists(csv_path) else -1)
+            if rows > last_rows:
+                last_rows = rows
+                row_stall_deadline = now + RESTART_ROW_STALL_TIMEOUT_S
+            window_complete = (args.scenario != 'restart-208'
+                               or rows >= RESTART_WINDOW_TICKS)
+            if now >= minimum_deadline and window_complete:
+                break
+            if (args.scenario != 'restart-208' and now >= minimum_deadline
+                    or args.scenario == 'restart-208' and now >= row_stall_deadline):
+                break
+        elapsed_wall_s = time.time() - run_started
 
         resolved = _dump_params(env)
     finally:
@@ -272,18 +304,25 @@ def run_once(args, label, start_index, out_dir):
         'start_state': state,
         'git': git_head(),
         'launch_args': launch_args,
-        'runtime_param_overrides': RUN_G_PARAMS if args.config == 'g' else RUN_H_PARAMS,
+        'runtime_param_overrides': overrides,
         'runtime_overrides_applied_via': 'ros2 param set',
         'resolved_params': resolved,
         'obstacle_208_route_index': OBSTACLE_208_INDEX,
         'ego_gate_radius': EGO_GATE_RADIUS,
         'excluded_object_ids': [EGO_OBJECT_ID],
-        'duration_s': args.duration,
+        'requested_duration_s': run_duration,
+        'elapsed_wall_s': elapsed_wall_s,
         'domain_id': args.domain,
         'csv': csv_path,
     }
     with open(manifest_path, 'w') as handle:
         json.dump(manifest, handle, indent=2)
+    if args.scenario == 'restart-208':
+        rows = sum(1 for _ in open(csv_path)) - 1 if os.path.exists(csv_path) else -1
+        if rows < RESTART_WINDOW_TICKS:
+            raise RuntimeError(
+                f'{label} produced {rows} solver rows; restart-208 requires at least '
+                f'{RESTART_WINDOW_TICKS}. The run is incomplete and must not be gated.')
     return csv_path, manifest_path
 
 
@@ -321,6 +360,8 @@ def main():
     parser.add_argument('--config', choices=('h', 'g'), default='h')
     parser.add_argument('--scenario', choices=('route', 'restart-208'), default='route',
                         help='route batch or the stopped obstacle-208 restart gate')
+    parser.add_argument('--forward-escape', choices=('off', 'on'), default='off',
+                        help='select the forward-escape A/B arm (default: off baseline)')
     parser.add_argument('--domain', type=int, default=44)
     parser.add_argument('--duration', type=float, default=120.0,
                         help='wall seconds per run (a wedge window needs >= 20 s)')
@@ -363,11 +404,16 @@ def main():
         rows = sum(1 for _ in open(csv_path)) - 1 if os.path.exists(csv_path) else -1
         lines.append(f'  {label:10s} {rows:6d} rows  {csv_path}')
         print(lines[-1])
-    # Sentinel file: this batch is driven from a terminal pane (a harness-backgrounded
-    # process only reaches ~11 Hz and the 20 Hz control loop diverges), so completion
-    # has to be observable from outside the pane.
+    # One immutable completion record per invocation. BATCH_DONE remains a convenient
+    # latest-run pointer, but says explicitly that it is not a directory aggregate.
+    stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    summary = (f'Invocation completed {stamp}; this summary covers only the files '
+               f'listed below, not prior CSVs in {out_dir}.\n'
+               + '\n'.join(lines) + '\n')
+    with open(os.path.join(out_dir, f'BATCH_DONE_{stamp}_{os.getpid()}'), 'w') as handle:
+        handle.write(summary)
     with open(os.path.join(out_dir, 'BATCH_DONE'), 'w') as handle:
-        handle.write('\n'.join(lines) + '\n')
+        handle.write(summary)
     return 0
 
 

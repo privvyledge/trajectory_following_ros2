@@ -50,6 +50,16 @@ LIVE_H_CLEARANCE_M = 0.166   # what run_H.csv pinned at when the plant stopped i
 RESTART_FORWARD_YAW = -1.57117
 RESTART_MIN_FORWARD_M = 0.5
 RESTART_POSE = (0.052675, -53.159458)
+RESTART_SCENE_MIN_SHARE = 0.5
+RESTART_BESIDE_RADIUS_M = 6.0
+SOLVER_LOG_COLUMNS = {
+    'ref_idx', 'ego_x', 'ego_y', 'ego_yaw', 'applied_steering',
+    'applied_speed', 'avoidance_stop', 'avoidance_required_offset',
+    'avoidance_bound', 'sel_id', 'physical_clearance', 'status',
+}
+RESTART_SOLVER_LOG_COLUMNS = SOLVER_LOG_COLUMNS | {
+    'n_selected', 'forward_escape_active',
+}
 
 
 def column(rows, name, cast=float):
@@ -63,7 +73,8 @@ def column(rows, name, cast=float):
 
 
 def classify(path, restart_window_s=12.0, control_rate=20.0,
-             restart_min_forward_m=RESTART_MIN_FORWARD_M):
+             restart_min_forward_m=RESTART_MIN_FORWARD_M,
+             escape_arm='auto'):
     rows = list(csv.DictReader(open(path)))
     if not rows:
         return {'run': os.path.basename(path), 'rows': 0, 'mode': 'EMPTY'}
@@ -75,6 +86,8 @@ def classify(path, restart_window_s=12.0, control_rate=20.0,
     required = column(rows, 'avoidance_required_offset')
     bound = column(rows, 'avoidance_bound')
     selected_id = column(rows, 'sel_id')
+    n_selected = column(rows, 'n_selected')
+    escape_active = column(rows, 'forward_escape_active')
     physical_clearance = column(rows, 'physical_clearance')
     status = [r['status'] for r in rows]
 
@@ -138,6 +151,26 @@ def classify(path, restart_window_s=12.0, control_rate=20.0,
     bound_block_share = float(np.nanmean(
         required[restart_slice] > bound[restart_slice] + 1e-6))
     selected_208_share = float(np.nanmean(selected_id[restart_slice] == 208))
+    restart_range_208 = range_208[restart_slice]
+    beside_208 = restart_range_208 < RESTART_BESIDE_RADIUS_M
+    selected_window = selected_id[restart_slice]
+    count_window = n_selected[restart_slice]
+    # Once the progress criterion is reached the target can legitimately rank away
+    # astern. Scene integrity is required through the outcome-attribution tick.
+    integrity_ticks = restart_ticks if restart_tick is None else restart_tick + 1
+    integrity_window = np.arange(restart_ticks) < integrity_ticks
+    expected_selected_count = (float(np.nanmedian(
+        count_window[integrity_window & (selected_window == 208)
+                     & np.isfinite(count_window)]))
+                               if np.any(integrity_window & (selected_window == 208)
+                                         & np.isfinite(count_window)) else float('nan'))
+    count_collapsed = (np.isfinite(count_window)
+                       & np.isfinite(expected_selected_count)
+                       & (count_window <= 0.5 * expected_selected_count))
+    selection_dropout = (integrity_window & beside_208
+                         & ((selected_window != 208) | count_collapsed))
+    selection_dropout_ticks = int(np.count_nonzero(selection_dropout))
+    scene_integrity = selection_dropout_ticks == 0
     min_restart_clearance = (float(np.nanmin(physical_clearance[restart_slice]))
                              if not np.all(np.isnan(physical_clearance[restart_slice]))
                              else float('nan'))
@@ -145,12 +178,28 @@ def classify(path, restart_window_s=12.0, control_rate=20.0,
     restart_window_complete = len(rows) >= expected_restart_ticks
     restart_scene_valid = bool(
         start_pose_error <= 0.5
-        and bound_block_share > 0.0
-        and selected_208_share > 0.0
+        and bound_block_share >= RESTART_SCENE_MIN_SHARE
+        and selected_208_share >= RESTART_SCENE_MIN_SHARE
+        and scene_integrity
         and not math.isnan(min_restart_clearance)
         and min_restart_clearance >= 0.0)
     restart_setup_valid = bool(restart_scene_valid and restart_window_complete)
-    restart_pass = bool(restart_setup_valid and restart_tick is not None)
+    escape_window = escape_active[restart_slice] > 0.5
+    escape_on = escape_arm == 'on' or (escape_arm == 'auto' and bool(escape_window.any()))
+    restart_attributed = bool(
+        restart_tick is not None
+        and (not escape_on or escape_window[restart_tick]))
+    escape_min_clearance = (float(np.nanmin(physical_clearance[restart_slice][escape_window]))
+                            if escape_window.any()
+                            and not np.all(np.isnan(
+                                physical_clearance[restart_slice][escape_window]))
+                            else float('nan'))
+    escape_clearance_valid = bool(
+        not escape_on
+        or (np.isfinite(escape_min_clearance) and escape_min_clearance >= 0.05))
+    restart_pass = bool(
+        restart_setup_valid and restart_tick is not None
+        and restart_attributed and escape_clearance_valid)
 
     return {'run': os.path.basename(path).replace('.csv', ''), 'rows': len(rows),
             'idx_max': int(np.nanmax(idx)), 'stall_ticks': length,
@@ -166,7 +215,14 @@ def classify(path, restart_window_s=12.0, control_rate=20.0,
             'restart_latch_share': round(latch_share, 3),
             'restart_bound_block_share': round(bound_block_share, 3),
             'restart_selected_208_share': round(selected_208_share, 3),
+            'restart_expected_selected_count': round(expected_selected_count, 3),
+            'restart_selection_dropout_ticks': selection_dropout_ticks,
+            'restart_scene_integrity': scene_integrity,
             'restart_min_clearance_m': round(min_restart_clearance, 3),
+            'restart_escape_active_ticks': int(np.count_nonzero(escape_window)),
+            'restart_escape_min_clearance_m': round(escape_min_clearance, 3),
+            'restart_escape_attributed': restart_attributed,
+            'restart_escape_clearance_valid': escape_clearance_valid,
             'restart_start_pose_error_m': round(start_pose_error, 3),
             'restart_scene_valid': restart_scene_valid,
             'restart_setup_valid': restart_setup_valid,
@@ -180,6 +236,8 @@ def _print_restart_gate(results, window_s, min_forward_m):
     header = ('run', 'rows', 'restart_forward_m', 'restart_reverse_m', 'restart_tick',
               'restart_latch_share', 'restart_bound_block_share',
               'restart_selected_208_share', 'restart_min_clearance_m',
+              'restart_selection_dropout_ticks', 'restart_scene_integrity',
+              'restart_escape_active_ticks', 'restart_escape_attributed',
               'restart_scene_valid', 'restart_window_complete',
               'restart_setup_valid', 'restart_pass')
     print(' '.join(f'{h:>26}' for h in header))
@@ -201,6 +259,21 @@ def _print_restart_gate(results, window_s, min_forward_m):
     return 0
 
 
+def _solver_trace_paths(pattern, required_columns=SOLVER_LOG_COLUMNS):
+    """Return matching solver traces, skipping unrelated CSVs with a notice."""
+    paths = []
+    for path in sorted(glob.glob(pattern)):
+        with open(path, newline='') as handle:
+            fields = set(csv.DictReader(handle).fieldnames or [])
+        missing = sorted(required_columns - fields)
+        if missing:
+            print(f'Skipping {path}: not a solver log (missing: '
+                  f'{", ".join(missing)}).', file=sys.stderr)
+            continue
+        paths.append(path)
+    return paths
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('paths', nargs='?', default='data/phase2_runH/*.csv')
@@ -211,11 +284,16 @@ def main(argv=None):
     parser.add_argument('--control-rate', type=float, default=20.0)
     parser.add_argument('--restart-min-forward', type=float,
                         default=RESTART_MIN_FORWARD_M)
+    parser.add_argument('--forward-escape', choices=('auto', 'on', 'off'),
+                        default='auto',
+                        help='require progress attribution for an escape-enabled arm')
     args = parser.parse_args(argv)
 
-    paths = sorted(glob.glob(args.paths))
+    required_columns = (RESTART_SOLVER_LOG_COLUMNS
+                        if args.target == 'restart-208' else SOLVER_LOG_COLUMNS)
+    paths = _solver_trace_paths(args.paths, required_columns)
     results = [classify(p, args.restart_window, args.control_rate,
-                        args.restart_min_forward) for p in paths]
+                        args.restart_min_forward, args.forward_escape) for p in paths]
     if not results:
         print(f'No CSV files matched {args.paths!r}.', file=sys.stderr)
         return 2
