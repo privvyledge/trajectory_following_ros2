@@ -34,6 +34,7 @@ def generate_launch_description():
     viz_spawn_viewer = LaunchConfiguration('viz_spawn_viewer', default=True)
     viz_backend = LaunchConfiguration('viz_backend', default='both')
     viz_recording_path = LaunchConfiguration('viz_recording_path', default='')
+    viz_connect_addr = LaunchConfiguration('viz_connect_addr', default='')
     viz_serve_web = LaunchConfiguration('viz_serve_web', default=False)
     viz_web_port = LaunchConfiguration('viz_web_port', default=9090)
     viz_web_open_browser = LaunchConfiguration('viz_web_open_browser', default=True)
@@ -628,6 +629,16 @@ def generate_launch_description():
             default_value='',
             description='Path to save a .rrd Rerun recording file. Empty = no file saved.'
     )
+    viz_connect_addr_la = DeclareLaunchArgument(
+            'viz_connect_addr',
+            default_value='',
+            description='TCP address (host:port) of an already-running rerun process to stream '
+                        'to, instead of spawning a viewer or serving the web viewer here. This '
+                        'is how to get a live web viewer AND a .rrd at the same time on rerun '
+                        '<0.23, whose SDK has a single sink: run tools/rerun_tee.sh, then set '
+                        'viz_connect_addr:=127.0.0.1:9876 with viz_spawn_viewer:=false, '
+                        'viz_serve_web:=false and an empty viz_recording_path.'
+    )
     viz_serve_web_la = DeclareLaunchArgument(
             'viz_serve_web',
             default_value='False',
@@ -685,7 +696,7 @@ def generate_launch_description():
              odom_topic_la, ackermann_cmd_topic_la, twist_topic_la, acceleration_topic_la, path_topic_la,
              speed_topic_la, debug_frequency_la,
              load_visualizer_la, viz_spawn_viewer_la, viz_backend_la,
-             viz_recording_path_la,
+             viz_recording_path_la, viz_connect_addr_la,
              viz_serve_web_la, viz_web_port_la, viz_web_open_browser_la,
              viz_actuator_feedback_topic_la, viz_reference_cmd_topic_la]
     )
@@ -856,6 +867,7 @@ def generate_launch_description():
                 'viz_backend': ParameterValue(viz_backend, value_type=str),
                 'spawn_viewer': ParameterValue(viz_spawn_viewer, value_type=bool),
                 'recording_path': ParameterValue(viz_recording_path, value_type=str),
+                'connect_addr': ParameterValue(viz_connect_addr, value_type=str),
                 'serve_web': ParameterValue(viz_serve_web, value_type=bool),
                 'web_port': ParameterValue(viz_web_port, value_type=int),
                 'web_open_browser': ParameterValue(viz_web_open_browser, value_type=bool),

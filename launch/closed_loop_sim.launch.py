@@ -167,6 +167,7 @@ def generate_launch_description():
     launch_visualizer = LaunchConfiguration('launch_visualizer')
     viz_spawn_viewer = LaunchConfiguration('viz_spawn_viewer')
     viz_recording_path = LaunchConfiguration('viz_recording_path')
+    viz_connect_addr = LaunchConfiguration('viz_connect_addr')
     viz_video_path = LaunchConfiguration('viz_video_path')
     viz_serve_web = LaunchConfiguration('viz_serve_web')
     viz_web_port = LaunchConfiguration('viz_web_port')
@@ -351,6 +352,13 @@ def generate_launch_description():
                         'live view while recording, set viz_spawn_viewer:=false and open the '
                         'file in a separate viewer (it tails as it grows): rerun /tmp/traj.rrd. '
                         'rerun >=0.23 tees both automatically.'),
+        DeclareLaunchArgument(
+            'viz_connect_addr', default_value='',
+            description='TCP address (host:port) of an already-running rerun process to stream '
+                        'to. Combined with tools/rerun_tee.sh this gives a live web viewer AND '
+                        'a .rrd at once on rerun <0.23, whose SDK has only one sink: start the '
+                        'tee, then pass viz_connect_addr:=127.0.0.1:9876 with '
+                        'viz_spawn_viewer:=false and an empty viz_recording_path.'),
         DeclareLaunchArgument(
             'viz_video_path', default_value='',
             description='Optional video output path for the native (matplotlib) backend '
@@ -780,6 +788,7 @@ def generate_launch_description():
                 'odom_topic': odom_topic,
                 'spawn_viewer': viz_spawn_viewer,
                 'recording_path': viz_recording_path,
+                'connect_addr': viz_connect_addr,
                 'native_video_path': viz_video_path,
                 'serve_web': viz_serve_web,
                 'web_port': viz_web_port,

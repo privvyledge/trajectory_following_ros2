@@ -17,6 +17,9 @@ from functools import partial
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy
+from rclpy.time import Time
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
 
 from std_msgs.msg import Float32
 from geometry_msgs.msg import PointStamped, AccelWithCovarianceStamped, PolygonStamped
@@ -49,6 +52,14 @@ class VisualizerNode(Node):
         self._last_ego_xy = None
         self._ref_first_yaw = None
 
+        # Odometry arrives in the localizer's frame (odom); the route, predicted path,
+        # reference window and goal all arrive in the controller's global_frame. Drawing
+        # them in one world without transforming the pose offsets the vehicle by the
+        # whole map->odom correction whenever those frames differ.
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self._warned_pose_frame = False
+
         self._backends: list = []
         self._init_backends()
 
@@ -74,6 +85,12 @@ class VisualizerNode(Node):
         self.declare_parameter('reference_cmd_topic',     '')
         self.declare_parameter('obstacle_topic',          'fake_obstacles/object_array')
         self.declare_parameter('footprint_topic',          '')
+        # Frame every spatial entity is drawn in. The odometry pose is transformed into
+        # it before logging, exactly as the controller's odom_callback does. Empty ('')
+        # adopts the frame the route Path arrives in, which is the controller's
+        # global_frame by construction — so this needs no launch wiring to be correct,
+        # and set it explicitly only when running the visualizer with no route.
+        self.declare_parameter('global_frame',             '')
         # The drawn keep-out must match the one the solver enforces
         # (ego_radius + obstacle_radius + safe_distance), so these are fetched from the
         # controller at startup and the viz_* values below are only a fallback for when
@@ -231,6 +248,7 @@ class VisualizerNode(Node):
         self.reference_cmd_topic = gp('reference_cmd_topic')
         self.obstacle_topic = gp('obstacle_topic')
         self.footprint_topic = gp('footprint_topic')
+        self.global_frame = str(gp('global_frame')).strip()
         self.controller_node_name = gp('controller_node_name')
         # Fallbacks only — _setup_keepout_sync replaces these with the controller's
         # live values once it is reachable.
@@ -376,6 +394,7 @@ class VisualizerNode(Node):
         q = msg.pose.pose.orientation
         _, _, yaw = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
         speed = msg.twist.twist.linear.x
+        x, y, yaw = self._to_global_frame(x, y, yaw, msg.header.frame_id)
 
         self._log('log_vehicle_pose', x, y, yaw, speed, stamp=msg.header.stamp)
 
@@ -391,9 +410,44 @@ class VisualizerNode(Node):
             heading_err = math.degrees(math.atan2(math.sin(ry - yaw), math.cos(ry - yaw)))
             self._log('log_errors', cte, heading_err)
 
+    def _to_global_frame(self, x, y, yaw, pose_frame):
+        """Transform a planar pose into the frame the route is drawn in.
+
+        Mirrors BaseTrajectoryTracker.odom_callback: latest cached TF entry (so this
+        stays non-blocking at 50 Hz), and on failure one warning followed by the raw
+        pose. That fallback is silent by design after the first line, which is why a
+        missing localizer shows up as a plausible-looking but wrong overlay.
+        """
+        with self._mutex:
+            target = self.global_frame
+        if not target or not pose_frame or pose_frame == target:
+            return x, y, yaw
+        try:
+            tf = self.tf_buffer.lookup_transform(target, pose_frame, Time())
+        except Exception:
+            if not self._warned_pose_frame:
+                self.get_logger().warn(
+                    f'odom frame "{pose_frame}" != global_frame "{target}"; TF not yet '
+                    'available — drawing the raw odom pose, which is offset from the '
+                    'route by the whole correction until the transform appears.')
+                self._warned_pose_frame = True
+            return x, y, yaw
+        t = tf.transform.translation
+        r = tf.transform.rotation
+        _, _, tf_yaw = tf_transformations.euler_from_quaternion([r.x, r.y, r.z, r.w])
+        c, s = math.cos(tf_yaw), math.sin(tf_yaw)
+        return c * x - s * y + t.x, s * x + c * y + t.y, yaw + tf_yaw
+
     def _full_path_cb(self, msg: Path):
         if not msg.poses:
             return
+        # The route defines the drawing frame when global_frame was left empty.
+        if not self.global_frame and msg.header.frame_id:
+            with self._mutex:
+                self.global_frame = msg.header.frame_id
+            self.get_logger().info(
+                f'Drawing in frame "{msg.header.frame_id}" (adopted from '
+                f'{self.path_topic}).')
         pts = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
         self._log('log_full_path', pts, stamp=msg.header.stamp)
 
