@@ -1,4 +1,4 @@
-"""Probe bug-365: is the persistent status-4 latch a property of the STATE or of solver memory?
+"""Probe: is the persistent status-4 latch a property of the STATE or of solver memory?
 
 Takes a first-failure dump as the geometry/reference fixture and re-solves it from a
 freshly created solver under a sweep of ego speeds, including the v=0 standstill the
@@ -61,7 +61,7 @@ def patch_recovery(adapter, mode, wheelbase, dt):
     """Swap the adapter's post-failure re-seed for a candidate strategy.
 
     'ref' is the shipped behaviour (stage 0 at x0, stages 1..N on the reference).
-    The alternatives keep reset() -- which bug-149 needs to clear a NaN iterate --
+    The alternatives keep reset() -- which is what clears a NaN iterate --
     and only change what is seeded afterwards.
     """
     if mode == 'ref':

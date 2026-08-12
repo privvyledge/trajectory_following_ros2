@@ -6,7 +6,7 @@ terminal wedge abeam obstacle 208. It cannot, by construction, and the target wa
 misread from the start:
 
   * `run_H.csv` contains **zero status-4 rows in the entire run** -- the wedge was
-    never a solver failure, so it was never bug-365 either.
+    never a solver failure, so it was never the recovery-seed latch either.
   * Its last 3220 ticks (~161 s) are byte-identical: every solve optimal, a full-lock
     reverse escape commanded at -0.15 m/s, `safety_reason` empty, and the pose frozen
     to the last decimal at 0.166 m clearance. `run_G.csv` ends the same way over 2234
