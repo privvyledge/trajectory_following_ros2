@@ -8,7 +8,7 @@ Topology, matching the vehicle exactly::
             -> closed_loop_sim.launch.py  (waypoint_loader + simulator + acados MPC)
 
 The dynamic capture is source 0 so its ids pass through the aggregator unchanged --
-the F2 obstacle stays id 208, as run G and run H logged it. Dynamic object 197 is the
+the wedge obstacle stays id 208, as run G and run H logged it. Dynamic object 197 is the
 **ego vehicle** (the capture was taken after it wedged, so it sits on the stall pose);
 it is excluded, exactly as the live bridge excluded it.
 
@@ -60,8 +60,9 @@ CONTROLLER_NODE = '/kinematic_coupled_acados_controller'
 # (295 objects, verified by phase2_topology_check.py against the merged capture).
 EGO_GATE_RADIUS = 80.0
 
-# Route index whose waypoint is nearest obstacle 208 at (-2.600, -55.000): the F2
-# scene's obstacle. The segment target for "clearly past and rejoined" is this + 60.
+# Route index whose waypoint is nearest obstacle 208 at (-2.600, -55.000): the
+# obstacle the car wedged beside. The segment target for "clearly past and
+# rejoined" is this + 60.
 OBSTACLE_208_INDEX = 136
 
 # Task-B restart gate. The pose is the byte-stable run-I tail after the controller

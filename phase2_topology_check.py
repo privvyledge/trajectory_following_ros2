@@ -59,7 +59,7 @@ def main():
             '--ros-args',
             # Dynamic FIRST: the aggregator namespaces ids as
             # source_index * stride + id, so source 0 passes ids through unchanged.
-            # That keeps the F2 obstacle at its live id 208 (as run G/H logged it)
+            # That keeps the wedge obstacle at its live id 208 (as run G/H logged it)
             # instead of 10208. The static capture's ids already diverge from the
             # live feed's, so nothing is lost by namespacing that source.
             '-p', f"snapshot_files:=['{DYNAMIC_JSON}','{STATIC_JSON}']",

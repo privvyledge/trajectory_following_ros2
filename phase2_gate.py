@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Phase 2 qualification gates for the captured CARLA obstacle-208 scene.
 
-RE-SCOPED 2026-08-04. The gate previously demanded the harness reproduce F2, the
+RE-SCOPED 2026-08-04. The gate previously demanded the harness reproduce the
 terminal wedge abeam obstacle 208. It cannot, by construction, and the target was
 misread from the start:
 
@@ -126,10 +126,10 @@ def classify(path, restart_window_s=12.0, control_rate=20.0,
     reached_208 = bool(near.any())
 
     stalled = length >= WEDGE_MIN_TICKS and disp < WEDGE_MAX_DISPLACEMENT
-    is_f2 = bool(stalled and dist_208 < 6.0 and commanded > 0.5
+    is_wedge = bool(stalled and dist_208 < 6.0 and commanded > 0.5
                  and float(np.nanmax(avoid[window])) == 0 and pinned > 0.5)
-    if is_f2:
-        mode = 'F2_WEDGE'
+    if is_wedge:
+        mode = 'TERMINAL_WEDGE'
     elif stalled and hard_fail > 0.5:
         mode = 'SOLVER_FAILURE_LATCH'
     elif stalled:
@@ -311,9 +311,9 @@ def main(argv=None):
         print(' '.join(f'{str(r.get(h, "")):>20}' for h in header))
 
     # Diagnostic only -- the wedge is a contact event and is not gated on.
-    f2 = sum(1 for r in results if r['mode'] == 'F2_WEDGE')
+    wedged = sum(1 for r in results if r['mode'] == 'TERMINAL_WEDGE')
     latched = sum(1 for r in results if r['mode'] == 'SOLVER_FAILURE_LATCH')
-    print(f'\ndiagnostic: F2-shaped wedge in {f2}/{len(results)} runs, '
+    print(f'\ndiagnostic: terminal wedge in {wedged}/{len(results)} runs, '
           f'solver-failure latch in {latched}/{len(results)} '
           f'(neither decides the gate)')
 
