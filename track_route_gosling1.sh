@@ -15,6 +15,11 @@
 #   ./track_route_gosling1.sh stop
 #   ./track_route_gosling1.sh tmux    out/gosling1_figure8.csv   # watch panes
 #
+# Visualization: LOAD_VIZ=true adds rerun. Setting VIZ_RECORDING_PATH as well
+# gives the live web viewer AND a .rrd (via tools/rerun_tee.sh); `stop` is what
+# finalizes and compacts that file. VIZ_TEE=false keeps the old recording-only
+# behaviour.
+#
 # Every subcommand returns immediately, so this is drivable from a remote shell.
 #
 # SAFETY: `launch` publishes drive commands to a real car. `check` does not --
@@ -79,26 +84,27 @@ TRACK_MAX_SPEED="${TRACK_MAX_SPEED:-1.0}"
 # Steering cap, DEGREES at the road wheel.
 #
 # Deliberately NOT the platform YAML's 27 deg, which its own comment flags as a
-# guess. The competing number is the servo calibration: MAX_STEERING in 00_env.sh
-# was chosen for (servo = -1.4 * angle + 0.56, servo_max 0.92), so on paper
-# anything beyond (0.92 - 0.56) / 1.4 = 0.257 rad = 14.72 deg clips inside the
-# VESC driver, and a solver allowed more plans turns the servo silently refuses
-# while tracking a predicted yaw rate the car never achieves.
+# guess. It is what the servo can DELIVER, from the recalibration measured on this
+# car 2026-08-07 (gain -1.1448, offset 0.56, servo clamped to [0.08, 0.92]):
 #
-# 23 deg is used anyway, on the evidence of the recordings rather than the
-# calibration constants: the gosling1 drives sit at or near full lock for 23-52%
-# of each route, and reconstructing them needs ~23 deg. Capping at 14.72 makes
-# every one of those corners infeasible by construction -- measured in sim as ~3x
-# worse figure-8 CTE p95 with steering saturated ~55% of the time, against ~5% at
-# 23. If the servo really does clip at 14.72 the run is no worse off than the cap
-# would have made it; if it does not, the cap was throwing away the only steering
-# authority these routes need.
+#   right lock (servo 0.92): (0.56 - 0.92) / 1.1448 = -0.3145 rad = -18.02 deg
+#   left  lock (servo 0.08): (0.56 - 0.08) / 1.1448 = +0.4193 rad = +24.02 deg
 #
-# UNVERIFIED ON THE CAR (2026-08-06): which of the two numbers is real has never
-# been measured. The first hardware run should compare commanded steering against
-# the actuator/odometry response above ~15 deg and settle it -- if the response
-# flattens there, recalibrate the servo before driving these routes for tracking
-# numbers, because the prediction/actual mismatch is silent.
+# The cap is the smaller extreme applied symmetrically. Anything past it on the
+# right clips inside the VESC driver with no error reported, and the solver then
+# tracks a predicted yaw rate the car never achieves. On the 2026-08-08 ground
+# legs the controller commanded past the right-hand bound on ~45% of
+# physically-moving ticks (0% past the left), so this was live, not theoretical.
+#
+# The superseded numbers, so they are not resurrected: 14.72 deg came from an
+# older calibration (gain -1.4) produced on a DIFFERENT F1/10; 23 deg was the
+# conservative pre-recalibration value chosen from the recordings, which sit at or
+# near full lock for 23-52% of each route.
+#
+# PROVISIONAL: gain and offset are measured, but servo_min/servo_max are inherited
+# and servo_min was never reached in any archived bag -- the LEFT extreme has no
+# empirical backing. That is why this is symmetric at the evidence-backed right
+# bound. Recompute from a servo bench sweep once one is published.
 #
 # HOW the cap is applied matters, and the obvious way does not work. In
 # mpc.launch.py the per-platform/per-backend overlays are applied LAST --
@@ -109,14 +115,13 @@ TRACK_MAX_SPEED="${TRACK_MAX_SPEED:-1.0}"
 #
 # The weights overlay is the only lever that outranks the platform file, so the
 # cap travels with WEIGHTS. gosling1_acados_recal is f1tenth_acados plus exactly
-# `max_steer/min_steer: +/-23` (diffed -- the cost matrices are identical), which
-# also makes this the configuration the sim legs were validated against.
+# `max_steer/min_steer: +/-18` (diffed -- the cost matrices are identical).
 #
 # So: change the cap by pointing WEIGHTS at a file that pins it, and verify on
 # the running node (assert_effective_steer_cap below does this automatically).
-# After a real VESC/steering recalibration, update MAX_STEERING in 00_env.sh,
-# config/platforms/f1tenth.yaml and the weights file together.
-TRACK_MAX_STEER_DEG="${TRACK_MAX_STEER_DEG:-23.0}"
+# This variable and config/weights/gosling1_acados_recal.yaml must agree or the
+# assert fails; MAX_STEERING in 00_env.sh is f1tenth's side of the same number.
+TRACK_MAX_STEER_DEG="${TRACK_MAX_STEER_DEG:-18.0}"
 
 # Weights overlay. Defaults per backend to the one carrying the steering cap
 # above; f1tenth_${BACKEND} would leave the platform's 27 deg in force.
@@ -147,7 +152,27 @@ SOLVER_CSV="${SESSION_DIR}/solver_$(date +%H%M%S).csv"
 export ACADOS_SOURCE_DIR="${ACADOS_SOURCE_DIR:-/home/admin/sdks/acados}"
 export LD_LIBRARY_PATH="${ACADOS_SOURCE_DIR}/lib:${LD_LIBRARY_PATH:-}"
 
-alive()    { [[ -n "${1:-}" ]] && kill -0 "$1" 2>/dev/null; }
+# Rerun tee (web viewer + .rrd at once). Ports match what the web viewer URL in
+# the skill/handoff quotes, so a tee run and a plain serve_web run are reached
+# the same way.
+VIZ_TEE_TCP_PORT="${VIZ_TEE_TCP_PORT:-9876}"
+VIZ_TEE_WS_PORT="${VIZ_TEE_WS_PORT:-9877}"
+VIZ_TEE_WEB_PORT="${VIZ_TEE_WEB_PORT:-9090}"
+VIZ_TEE_RUN_DIR="${VIZ_TEE_RUN_DIR:-${SESSION_DIR}/rerun_tee}"
+
+# Existence is NOT enough to call a pid "our controller". The pidfile lives in
+# SESSION_DIR on the shared SSD, so it outlives the container that wrote it, and
+# after a restart the recorded number is routinely recycled by something else --
+# observed 2026-08-10 as the vehicle stack's own base_link->right_front_wheel
+# static_transform_publisher. A bare `kill -0` then both blocks a fresh launch
+# and, through `stop`, SIGINTs a node the vehicle stack needs. So confirm the
+# process is actually the launch we started; anything else is a stale pidfile.
+alive() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'mpc\.launch\.py'
+}
 read_pid() { [[ -s "$1" ]] && cat "$1" || true; }
 
 # ---------------------------------------------------------------- checks ----
@@ -382,6 +407,55 @@ except ValueError: sys.exit(0 if '$got'.strip().lower()=='$3'.strip().lower() el
   grep -iE "spacing|resampl" "$MPC_LOG" | tail -4 || true
 }
 
+# -------------------------------------------------------------- rerun tee ----
+# The tee lives in the package (tools/rerun_tee.sh) while this runner is
+# deployed next to 00_env.sh, so look beside the runner first for a deployed
+# copy and fall back to the repo checkout inside the container.
+find_tee_script() {
+  local c
+  for c in "${RERUN_TEE_SCRIPT:-}" \
+           "./rerun_tee.sh" \
+           "/workspaces/f1tenth/src/trajectory_following_ros2/tools/rerun_tee.sh"; do
+    [[ -n "$c" && -r "$c" ]] && { echo "$c"; return 0; }
+  done
+  return 1
+}
+
+start_rerun_tee() {
+  local out="$1" tee_sh
+  if ! tee_sh="$(find_tee_script)"; then
+    warn "rerun tee script not found (set RERUN_TEE_SCRIPT) — falling back"
+    return 1
+  fi
+  # A previous run's proxy still holding the ports would serve stale data under
+  # a fresh recording, so clear it before starting rather than after failing.
+  TCP_PORT="$VIZ_TEE_TCP_PORT" WS_PORT="$VIZ_TEE_WS_PORT" \
+    WEB_PORT="$VIZ_TEE_WEB_PORT" RUN_DIR="$VIZ_TEE_RUN_DIR" \
+    bash "$tee_sh" stop >/dev/null 2>&1 || true
+  if ! TCP_PORT="$VIZ_TEE_TCP_PORT" WS_PORT="$VIZ_TEE_WS_PORT" \
+       WEB_PORT="$VIZ_TEE_WEB_PORT" RUN_DIR="$VIZ_TEE_RUN_DIR" \
+       bash "$tee_sh" start "$out" > "${SESSION_DIR}/rerun_tee.log" 2>&1; then
+    warn "rerun tee failed to start — falling back. Last lines:"
+    tail -5 "${SESSION_DIR}/rerun_tee.log" >&2
+    return 1
+  fi
+  grep -aE 'http://[0-9]' "${SESSION_DIR}/rerun_tee.log" | sed 's/^/  /' || true
+  return 0
+}
+
+# Always safe to call: a no-op when no tee is running.
+stop_rerun_tee() {
+  local tee_sh
+  find_tee_script >/dev/null || return 0
+  tee_sh="$(find_tee_script)"
+  # This is where the .rrd is flushed and compacted (the CLI saver writes one
+  # chunk per message, ~8x the size the SDK would write), so do not skip it and
+  # do not SIGKILL the tee instead.
+  TCP_PORT="$VIZ_TEE_TCP_PORT" WS_PORT="$VIZ_TEE_WS_PORT" \
+    WEB_PORT="$VIZ_TEE_WEB_PORT" RUN_DIR="$VIZ_TEE_RUN_DIR" \
+    bash "$tee_sh" stop 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------- launch ----
 do_launch() {
   local csv; csv="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
@@ -397,17 +471,27 @@ do_launch() {
 
   banner "launching $BACKEND MPC on /${NS}"
 
-  # Rerun on the car is 0.22.x, which is SINGLE-SINK: asking for both a web
-  # viewer and a .rrd gets you the viewer and a silently dropped recording. So
-  # a recording path forces serve_web off rather than letting the two fight.
-  # The argument is only passed when non-empty -- rcl rejects a bare
+  # Rerun on the car is 0.22.x, whose SDK is SINGLE-SINK: one process cannot
+  # serve the web viewer and write a .rrd, so asking for both used to get the
+  # viewer and a silently dropped recording. tools/rerun_tee.sh lifts that by
+  # chaining two rerun CLI processes (proxy -> saver), which is why a recording
+  # path no longer costs the live view. The tee is preferred whenever a
+  # recording is requested; VIZ_TEE=false forces the old exclusive behaviour,
+  # and a tee that fails to start falls back to it rather than dropping the
+  # recording the operator asked for.
+  # Every viz argument is passed only when non-empty -- rcl rejects a bare
   # `-p name:=` with "Couldn't parse parameter override rule" and takes the
   # whole launch down with it.
   local viz_args=()
   if [[ -n "${VIZ_RECORDING_PATH:-}" ]]; then
     mkdir -p "$(dirname "$VIZ_RECORDING_PATH")"
-    viz_args+=(viz_recording_path:="$VIZ_RECORDING_PATH" viz_serve_web:=false)
-    info "rerun recording -> $VIZ_RECORDING_PATH (web viewer off; 0.22 cannot do both)"
+    if [[ "${VIZ_TEE:-true}" == true ]] && start_rerun_tee "$VIZ_RECORDING_PATH"; then
+      viz_args+=(viz_connect_addr:="127.0.0.1:${VIZ_TEE_TCP_PORT}" viz_serve_web:=false)
+      info "rerun tee: web viewer + recording -> $VIZ_RECORDING_PATH"
+    else
+      viz_args+=(viz_recording_path:="$VIZ_RECORDING_PATH" viz_serve_web:=false)
+      info "rerun recording -> $VIZ_RECORDING_PATH (web viewer off; no tee)"
+    fi
   else
     viz_args+=(viz_serve_web:="${VIZ_SERVE_WEB:-true}")
   fi
@@ -444,6 +528,7 @@ do_launch() {
   pid="$(read_pid "$MPC_PID_F")"
   if ! alive "$pid"; then
     err "controller died within 8 s. Last log lines:"; tail -25 "$MPC_LOG" >&2
+    stop_rerun_tee
     rm -f "$MPC_PID_F"; return 1
   fi
   info "controller running (pid $pid)"
@@ -500,6 +585,9 @@ do_stop() {
   pkill -f "[t]rajectory_following_ros2/lib" 2>/dev/null; sleep 2
   pkill -9 -f "[t]rajectory_following_ros2/lib" 2>/dev/null; sleep 1
   rm -f "$MPC_PID_F"
+
+  # After the controller, so the tee captures everything it logged on the way down.
+  stop_rerun_tee
 
   local orphans; orphans=$(ps -eo args | grep -cE '[t]rajectory_following_ros2/lib')
   if [[ "$orphans" -gt 0 ]]; then

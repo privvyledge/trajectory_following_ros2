@@ -9,14 +9,11 @@
     #       platform:=f1tenth weights:=gosling1_acados_recal mpc_toolbox:=acados \
     #       waypoints_csv:=<repo>/data/gosling1_figure8_odomframe.csv
     #
-    # The 14.32 deg the car runs today is a calibration artifact — the servo
-    # calibration in use was produced on a different F1/10, while this car's
-    # mechanical lock looks closer to 30 deg. 23 deg is the conservative value to
-    # validate against BEFORE recalibrating, so the recalibration is a decision
-    # backed by a simulated result rather than the other way round.
-    # DO NOT run this on hardware until the servo is actually recalibrated: the
-    # driver will clip anything past 14.32 deg silently and the car will simply
-    # under-turn every corner the controller planned.
+    # The servo WAS recalibrated on this car (2026-08-07); the constants below are
+    # from that calibration, so this file is the one to run on hardware. The older
+    # 14.32 deg figure came from a calibration produced on a different F1/10 and no
+    # longer applies. See the max_steer block for the derivation and its one
+    # remaining unverified input.
     # ---------------------------------------------------------------------------
     horizon: 25
     sample_time: 0.05
@@ -32,20 +29,33 @@
     Rd: [10.0, 10.0]
     use_bryson_weights: false
 
-    # The limit the car is under TODAY, not a physical one. It comes from
-    # MAX_STEERING in the robot's live_runs/00_env.sh, whose servo calibration was
-    # produced on a DIFFERENT F1/10; the mechanical lock on this car looks closer
-    # to 30 deg. Commands beyond 0.257 rad (14.71 deg) clip silently inside the
-    # VESC driver, so a controller allowed the platform's 27 deg plans corners this
-    # car will not execute and nothing reports an error.
+    # What the servo can actually DELIVER, not a mechanical lock and not a guess.
+    # From the recalibrated VESC conversion (relayed 2026-08-09, measured on this
+    # car 2026-08-07):
     #
-    # 14.32 deg puts the tightest achievable radius at 0.256 / tan(14.32) = 1.00 m
-    # against a recorded route minimum of ~0.85 m, and the recorded drives sat at
-    # full lock for 23-52% of their length — i.e. the routes were driven with no
-    # steering margin left for tracking error. See gosling1_acados_recal.yaml for
-    # the post-recalibration counterpart.
-    max_steer: 23.0
-    min_steer: -23.0
+    #   servo = -1.1448 * delta + 0.56,  servo clamped to [0.08, 0.92]
+    #     -> right lock (servo 0.92): delta = -0.3145 rad = -18.02 deg
+    #     -> left  lock (servo 0.08): delta = +0.4193 rad = +24.02 deg
+    #
+    # The cap is the SMALLER extreme, applied symmetrically: anything past 18 deg
+    # to the right is clipped inside the driver with no error reported, and on the
+    # 2026-08-08 ground legs the controller commanded past that right-hand bound on
+    # ~45% of physically-moving ticks (0% past the left one). A controller allowed
+    # 23 deg therefore plans right-hand corners this car will not execute.
+    #
+    # 18.0 deg puts the tightest achievable radius at 0.256 / tan(18.0) = 0.79 m
+    # against a recorded route minimum of ~0.85 m — feasible, but with little
+    # margin, so watch right-hand-corner CTE.
+    #
+    # PROVISIONAL in one respect: the gain and offset are measured, but servo_min /
+    # servo_max ([0.08, 0.92]) are inherited from another car and servo_min was
+    # never reached in any archived bag — so the LEFT extreme has no empirical
+    # backing at all. That asymmetry is why this is a symmetric cap at the
+    # evidence-backed (right) bound rather than an asymmetric one. Recompute from
+    # the f1tenth bench sweep when it lands; do not hard-code 18.0 from memory.
+    # Keep in step with TRACK_MAX_STEER_DEG in track_route_gosling1.sh.
+    max_steer: 18.0
+    min_steer: -18.0
 
     # Speed ceiling for a gosling1 route run. Pinned HERE rather than passed as a
     # launch argument for the same reason as max_steer above: platforms/f1tenth.yaml
