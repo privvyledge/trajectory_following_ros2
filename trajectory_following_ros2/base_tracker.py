@@ -777,6 +777,14 @@ class BaseTrajectoryTracker(Node, ABC):
                 'mid-corner, max-speed cruise) is safer to hold through a transient '
                 'failure than to zero.')))
         self.declare_parameter('distance_tolerance', 0.2)
+        self.declare_parameter(
+            'goal_tolerance', 0.0,
+            ParameterDescriptor(description=(
+                'Radius (m) around the final waypoint that counts as "at the goal". '
+                '0.0 (default) reuses distance_tolerance, which is also the reference '
+                'anchor distance -- so the vehicle stops about that far short and '
+                'completion is knife-edge against the same number. Set it larger than '
+                'distance_tolerance to decouple the two.')))
         self.declare_parameter('speed_tolerance', 0.5)
         self.declare_parameter('wheelbase', 0.256)
         self.declare_parameter('min_steer', -27.0)   # degrees
@@ -946,6 +954,7 @@ class BaseTrajectoryTracker(Node, ABC):
                 'solver_failure_mode=hold_last has both hold gates disabled; '
                 'failures will publish zero commands rather than hold without a bound.')
         self.distance_tolerance = self._gp('distance_tolerance')
+        self.goal_tolerance = self._gp('goal_tolerance')
         self.speed_tolerance = self._gp('speed_tolerance')
         self.WHEELBASE = self._gp('wheelbase')
         self.MAX_STEER_ANGLE = math.radians(self._gp('max_steer'))
@@ -2373,7 +2382,11 @@ class BaseTrajectoryTracker(Node, ABC):
         last = len(self.path) - 1
         progressed = last <= 0 or self.current_idx >= 0.9 * last
         return past_grace and progressed and self.trajectory.is_goal_reached(
-            x, y, vel, self.final_goal)
+            x, y, vel, self.final_goal, goal_tolerance=self._goal_radius())
+
+    def _goal_radius(self) -> Optional[float]:
+        """Completion radius, or None to reuse the trajectory's GOAL_DIS (the default)."""
+        return self.goal_tolerance if self.goal_tolerance > 0.0 else None
 
     # ------------------------------------------------------------------
     # Main control loop
@@ -2487,9 +2500,12 @@ class BaseTrajectoryTracker(Node, ABC):
             # spatially close. Hold zero until the contract becomes true.
             dist_to_goal = float(np.hypot(x - self.final_goal[0], y - self.final_goal[1]))
             speed_error = abs(vel - self.final_goal[2])
+            radius = self._goal_radius()
+            radius = self.distance_tolerance if radius is None else radius
             self.get_logger().warn(
                 f'Reference reports end-of-path but the completion contract is not met '
-                f'(goal distance {dist_to_goal:.2f} m, speed error {speed_error:.2f} m/s); '
+                f'(goal distance {dist_to_goal:.2f} m vs tolerance {radius:.2f} m, '
+                f'speed error {speed_error:.2f} m/s); '
                 'not latching the goal — holding zero command.',
                 throttle_duration_sec=2.0)
             self._publish_zero_command()
@@ -2881,10 +2897,23 @@ class BaseTrajectoryTracker(Node, ABC):
             # profile from desired_speed sized to the current path so the assignment below
             # cannot raise a broadcast-shape error.
             v = max(abs(self.desired_speed), 0.1)
-            self.speeds = np.full(len(self.path), v)
+            # Taper the tail to zero at the final waypoint. A recorded profile ends
+            # stopped, and the completion contract reads the last entry as the goal
+            # speed (`final_goal[2]`), so a flat fill demands the vehicle still be
+            # doing cruise speed *at* the goal — a run that correctly decelerates
+            # then never latches and holds zero short of the goal forever. The ramp
+            # is the same braking bound used elsewhere (v <= sqrt(2·a·s_remaining)),
+            # so it is feasible rather than an abrupt terminal zero.
+            remaining = np.asarray(trajectory_utils.cumulative_distance_along_path(
+                self.path[:, :2]), dtype=float)
+            remaining = np.maximum(remaining[-1] - remaining, 0.0)
+            decel = max(abs(float(self.MAX_DECEL)), 1e-6)
+            self.speeds = np.minimum(np.full(len(self.path), v),
+                                     np.sqrt(2.0 * decel * remaining))
             self.get_logger().info(
                 f'No matching speed profile for the current path ({len(self.path)} pts); '
-                f'using constant desired_speed={v:.2f} m/s for trajectory timing.')
+                f'using constant desired_speed={v:.2f} m/s (braking to 0 at the goal) '
+                'for trajectory timing.')
         relative_times, relative_dts = trajectory_utils.calc_path_relative_time(
             self.path, self.speeds, min_dt=1.0)
 
@@ -3234,6 +3263,8 @@ class BaseTrajectoryTracker(Node, ABC):
                 self.global_frame = param.value
             elif param.name == 'distance_tolerance':
                 self.distance_tolerance = param.value
+            elif param.name == 'goal_tolerance':
+                self.goal_tolerance = param.value
             elif param.name == 'speed_tolerance':
                 self.speed_tolerance = param.value
             elif param.name == 'wheelbase':

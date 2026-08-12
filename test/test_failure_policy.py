@@ -141,6 +141,8 @@ def _goal_tracker(**overrides):
     values = {
         'trajectory': trajectory,
         'distance_tolerance': 0.2,
+        # 0.0 = reuse distance_tolerance as the completion radius (the default).
+        'goal_tolerance': 0.0,
         'cumulative_distance': 1.0,
         'final_goal': np.array([0.0, 0.0, 0.0]),
         'path': np.zeros((10, 2)),

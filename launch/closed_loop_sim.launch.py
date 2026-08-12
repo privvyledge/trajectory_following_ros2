@@ -174,6 +174,11 @@ def generate_launch_description():
     rerun_spatial_frequency = LaunchConfiguration('rerun_spatial_frequency')
     vulkan_icd = LaunchConfiguration('vulkan_icd')
 
+    goal_tolerance = LaunchConfiguration('goal_tolerance')
+    load_waypoints = LaunchConfiguration('load_waypoints')
+    path_qos = LaunchConfiguration('path_qos')
+    desired_speed = LaunchConfiguration('desired_speed')
+
     initial_x = LaunchConfiguration('initial_x')
     initial_y = LaunchConfiguration('initial_y')
     initial_yaw = LaunchConfiguration('initial_yaw')
@@ -186,6 +191,25 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'waypoints_csv', default_value=default_waypoints,
             description='Absolute path to the waypoints CSV (in the `map` frame).'),
+        DeclareLaunchArgument(
+            'goal_tolerance', default_value='0.0',
+            description='Radius (m) that counts as "at the goal". 0.0 reuses '
+                        'distance_tolerance, which is also the reference anchor '
+                        'distance, so the vehicle stops about that far short and '
+                        'completion is knife-edge; set it larger to decouple them.'),
+        DeclareLaunchArgument(
+            'load_waypoints', default_value='true',
+            description='Launch waypoint_loader. Set false to drive a path published by '
+                        'an external planner (Nav2 mode) instead of the CSV route.'),
+        DeclareLaunchArgument(
+            'path_qos', default_value='transient_local',
+            description='Controller path-subscription durability: transient_local '
+                        '(latched CSV route) | volatile (live-replanned Nav2 /plan).'),
+        DeclareLaunchArgument(
+            'desired_speed', default_value='0.0',
+            description='Constant speed reference (m/s) used when no speed topic is '
+                        'published. Required in Nav2 mode, where a bare Path carries '
+                        'no speed profile; 0.0 keeps the recorded/loaded profile.'),
         DeclareLaunchArgument(
             'global_frame', default_value='odom',
             description="Controller + simulator global frame."),
@@ -473,6 +497,7 @@ def generate_launch_description():
 
     # ---- 2. Waypoint loader -------------------------------------------------
     waypoint_loader_node = Node(
+        condition=IfCondition(load_waypoints),
         package='trajectory_following_ros2',
         executable='waypoint_loader',
         name='waypoint_loader',
@@ -647,6 +672,7 @@ def generate_launch_description():
             'estimated_delay': ParameterValue(estimated_delay, value_type=float),
             'delay_compensation_method': delay_compensation_method,
             'solver_log_file': solver_log_file,
+            'goal_tolerance': ParameterValue(goal_tolerance, value_type=float),
             'forward_escape_speed': ParameterValue(
                 forward_escape_speed, value_type=float),
         }
@@ -672,9 +698,18 @@ def generate_launch_description():
             'obstacle_topic': obstacle_topic,
         }
 
+        # Path-source wiring (latched CSV route vs a live planner's /plan). Applied
+        # after the overlays for the same reason the feed is: which topic/QoS the
+        # route arrives on is an explicit launch choice, not a tuning value.
+        path_source_params = {
+            'path_qos': path_qos,
+            'desired_speed': ParameterValue(desired_speed, value_type=float),
+        }
+
         def _params(solver_dict, tail_dict):
             return ([params_file, reference_params, solver_dict] + overlays
-                    + [failure_policy_params, obstacle_feed_params, tail_dict])
+                    + [failure_policy_params, obstacle_feed_params,
+                       path_source_params, tail_dict])
 
         return [
             Node(

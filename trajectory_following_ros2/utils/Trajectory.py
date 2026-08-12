@@ -542,7 +542,7 @@ class Trajectory(object):
         self._anchor_advance_budget = 0.0
         self._previous_projection_position = None
 
-    def is_goal_reached(self, x, y, vel, goal=None):
+    def is_goal_reached(self, x, y, vel, goal=None, goal_tolerance=None):
         """True when the vehicle is at the final goal: within goal_tolerance of
         the goal point AND nearly stopped (speed within STOP_SPEED of the goal
         speed).
@@ -556,8 +556,14 @@ class Trajectory(object):
         """
         if goal is None:
             goal = self.goal
+        # GOAL_DIS is also the reference anchor distance (min_search_radius), so the
+        # vehicle systematically runs out of reference and stops about that far short
+        # of the final waypoint -- making completion knife-edge against the very same
+        # number. `goal_tolerance` lets the caller decouple the two; None keeps the
+        # historical behaviour of using GOAL_DIS for both.
+        radius = self.GOAL_DIS if goal_tolerance is None else goal_tolerance
         d = trajectory_utils.get_distance(np.array([x, y]).reshape((1, -1)),
                                           goal[0:2].reshape(1, -1)).item()
-        near_goal = (d <= self.GOAL_DIS)
+        near_goal = (d <= radius)
         stopped = (abs(vel - goal[2]) <= self.STOP_SPEED)
         return near_goal and stopped

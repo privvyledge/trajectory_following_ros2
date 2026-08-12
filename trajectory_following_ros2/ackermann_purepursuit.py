@@ -114,7 +114,8 @@ class AckermannPurePursuit(BaseTrajectoryTracker):
         end_of_path = ref_traj is None
         past_grace = self.cumulative_distance >= 3.0 * self.distance_tolerance
         at_goal = past_grace and self.trajectory.is_goal_reached(
-            self.x, self.y, self.speed, self.final_goal)
+            self.x, self.y, self.speed, self.final_goal,
+            goal_tolerance=self._goal_radius())
         if end_of_path or at_goal:
             self.final_goal_reached = True
             self.get_logger().info('Final goal reached.')
