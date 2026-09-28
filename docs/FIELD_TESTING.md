@@ -80,8 +80,7 @@ into `share/`, not symlinked).
 
 ```bash
 # Core (from the workspace root, against the venv/interpreter you build with)
-python3 -m pip install -c src/trajectory_following_ros2/constraints.txt \
-    casadi scipy numpy pandas
+python3 -m pip install casadi scipy "numpy<2" pandas
 
 # Obstacle avoidance needs derived_object_msgs (a ROS package, install via apt/rosdep):
 sudo apt install ros-humble-derived-object-msgs
@@ -90,12 +89,13 @@ sudo apt install ros-humble-derived-object-msgs
 sudo apt install ros-humble-nav2-common
 
 # Optional: live visualization
-python3 -m pip install -c src/trajectory_following_ros2/constraints.txt rerun-sdk matplotlib
+python3 -m pip install "numpy<2" "rerun-sdk<0.23" matplotlib
 ```
 
-`constraints.txt` pins `numpy<2` and `rerun-sdk<0.23`. Those pins are load-bearing:
-`rerun-sdk >= 0.23` hard-requires `numpy >= 2`, but the MPC backends need numpy 1.x.
-Always install with `-c constraints.txt`.
+Two pins are load-bearing: `numpy<2` and `rerun-sdk<0.23`. `rerun-sdk >= 0.23`
+hard-requires `numpy >= 2`, but the MPC backends need numpy 1.x. A later unpinned install
+can silently upgrade numpy, so keep both lines in a local pip constraints file and pass it
+with `-c` on every install into that environment.
 
 ### 0.3 acados environment
 
@@ -827,7 +827,7 @@ generated OCP → the first run after this update must use `generate_mpc_model:=
 #### Obstacle source: spawn real CARLA actors (preferred)
 
 Spawn the obstacles from the ros-bridge objects definition file (this repo's
-`carla_obstacles.json` is the reference layout for `data/carla_town01_moving.csv`: three
+`data/carla_obstacles.json` is the reference layout for `data/carla_town01_moving.csv`: three
 vehicles, two bikes and a pedestrian, six events ≥30 m of arc apart, difficulty rising
 along the route, ending on the pedestrian — the only mandatory avoidance). The spawn
 points were re-centred on the driven lane (2026-08-02) — the earlier layout put most
