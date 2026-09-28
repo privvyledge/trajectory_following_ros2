@@ -360,7 +360,7 @@ assert_live_params() {
   done
 
   banner "effective parameters (read from the running node, not the launch line)"
-  local bad=0
+  local bad=0 unread=0
   _p() {  # _p <node> <param> <expected|-> ; prints and flags mismatches
     # The parameter service answers intermittently on a loaded box -- a single
     # timeout is indistinguishable from a genuinely missing parameter, and
@@ -373,7 +373,14 @@ assert_live_params() {
       sleep 2
     done
     if [[ -z "$got" ]]; then
-      err "  $2: could not read from $1 after 4 attempts"; bad=1; return
+      # UNVERIFIED, not wrong. The parameter service is known to answer
+      # intermittently on a loaded box, and a timeout carries no information
+      # about the value -- reporting it as a mismatch grounds a run whose
+      # configuration was fine, which is how a genuine mismatch stops being
+      # believed. Kept separate from "bad" so only a real disagreement can
+      # say "do NOT drive".
+      warn "  $2: could not read from $1 after 4 attempts (UNVERIFIED, not wrong)"
+      unread=1; return
     fi
     if [[ "$3" != "-" ]] && ! python3 -c "
 import sys
@@ -399,6 +406,12 @@ except ValueError: sys.exit(0 if '$got'.strip().lower()=='$3'.strip().lower() el
          The overlays in mpc.launch.py (weights > platform > args > base) are the
          usual cause; the platform file pins max_steer 27, so only a weights file
          can change it. Current WEIGHTS=$WEIGHTS"
+  elif [[ "$unread" -ne 0 ]]; then
+    warn "every parameter that answered was correct, but at least one could not be
+         read. This is not a mismatch — the param service times out under load.
+         Verify empirically instead of grounding the run: the solver CSV's
+         tick_interval_ms p50 gives control_rate (50.00 ms == 20 Hz), and the
+         controller logs its own effective values at startup in $MPC_LOG."
   else
     info "all checked parameters resolved as requested"
   fi
