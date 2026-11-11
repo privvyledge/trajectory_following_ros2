@@ -74,10 +74,10 @@ class BaseSimulator(Node, ABC):
         self.declare_parameter('initial_y', 0.0)
         self.declare_parameter('initial_yaw', 0.0)
         self.declare_parameter('initial_speed', 0.0)
-        # Item 7a: first-order lag time constants (s); 0.0 = instantaneous
+        # First-order actuation lag time constants (s); 0.0 = instantaneous
         self.declare_parameter('steering_time_constant', 0.0)
         self.declare_parameter('acceleration_time_constant', 0.0)
-        # Item 7e: Gaussian sensor noise std devs; 0.0 = no noise
+        # Gaussian sensor noise std devs; 0.0 = no noise
         self.declare_parameter('noise_std_x', 0.0)
         self.declare_parameter('noise_std_y', 0.0)
         self.declare_parameter('noise_std_v', 0.0)
@@ -149,7 +149,9 @@ class BaseSimulator(Node, ABC):
         self.uk = np.zeros((self.NU, 1))  # column [accel, delta]
         self.u_prev = np.zeros((self.NU, 1))
 
-        # Item 7a: lag filter state (tracks actual applied actuator value)
+        # Actuator state: the slew-limited steering setpoint, then the
+        # lag-filtered values that actually reach the integrator.
+        self._delta_slewed = 0.0
         self._delta_actual = 0.0
         self._accel_actual = 0.0
 
@@ -195,6 +197,20 @@ class BaseSimulator(Node, ABC):
         self.uk[1, 0] = self.delta_cmd
         self._new_command = True
 
+    def _slew_steering(self, delta_cmd: float) -> float:
+        """Move the steering toward ``delta_cmd`` by at most ``max_steer_rate * dt``.
+
+        The step is measured from the steering applied on the previous simulation
+        step, not from the previous command. Measuring from the command lets a
+        held command jump the whole remaining distance once the next command
+        arrives, and stalls the steering one step short when the simulator runs
+        several steps between commands.
+        """
+        max_step = self.MAX_STEER_RATE * self.sample_time
+        self._delta_slewed += float(np.clip(
+            delta_cmd - self._delta_slewed, -max_step, max_step))
+        return self._delta_slewed
+
     def update_timer_callback(self):
         # Lockstep mode: freeze physics until a fresh command arrives, but keep
         # republishing odom/accel/TF so the controller's stale-odom guard does
@@ -209,12 +225,10 @@ class BaseSimulator(Node, ABC):
         # Zero-order hold: reuses last uk if no new command arrived.
         uk = self.uk.copy()
 
-        # Item 7b: clamp steering rate before applying lag
-        max_delta_step = self.MAX_STEER_RATE * self.sample_time
-        uk[1, 0] = self.u_prev[1, 0] + np.clip(
-            uk[1, 0] - self.u_prev[1, 0], -max_delta_step, max_delta_step)
+        # Steering slew limit, applied before the actuation lag.
+        uk[1, 0] = self._slew_steering(uk[1, 0])
 
-        # Item 7a: first-order actuation lag
+        # First-order actuation lag
         if self._tau_steer > 0.0:
             self._delta_actual += (self.sample_time / self._tau_steer) * (
                 uk[1, 0] - self._delta_actual)
@@ -278,7 +292,7 @@ class BaseSimulator(Node, ABC):
         return float(np.random.normal(0.0, std)) if std > 0.0 else 0.0
 
     def publish_odometry(self):
-        # Item 7e: add optional Gaussian noise before publishing
+        # Add optional Gaussian noise before publishing
         x_pub = self.x + self._noise(self._noise_std_x)
         y_pub = self.y + self._noise(self._noise_std_y)
         v_pub = self.speed + self._noise(self._noise_std_v)
