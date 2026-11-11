@@ -162,9 +162,19 @@ class CasAdiSolverAdapter(BaseSolver):
         acc_cmd = float(sol['u_control'][0])
         delta_cmd = float(sol['u_control'][1])
 
+        # Both formulations return per-step input increments (u_k - u_{k-1}),
+        # while the published Ackermann fields are SI rates (m/s^3, rad/s), so
+        # divide by the step. Opti returns them as (N, nu), the others (nu, N).
         u_rate = sol.get('u_rate')
-        jerk = float(u_rate[0, 0]) if u_rate is not None else None
-        delta_rate = float(u_rate[1, 0]) if u_rate is not None else None
+        jerk = delta_rate = None
+        if u_rate is not None:
+            u_rate = np.asarray(u_rate, dtype=float).reshape(
+                (-1, 2) if self._use_opti else (2, -1))
+            if self._use_opti:
+                u_rate = u_rate.T
+            dt = float(self._controller.Ts)
+            jerk = float(u_rate[0, 0]) / dt
+            delta_rate = float(u_rate[1, 0]) / dt
 
         # A budget-limited solve still returns a usable, warm-started, near-converged
         # iterate — accept it (real-time-iteration style) rather than discarding it and
